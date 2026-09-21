@@ -21,7 +21,7 @@ Cross-border verbal communication in hospital emergency rooms, surgical wards, a
 **MediVoice Edge** is a dedicated, wearable, 100% on-device speech-to-speech translation device engineered for high-stakes healthcare environments, powered by the Qualcomm Snapdragon QCS6490 (RB3 Gen 2) platform. Executing entirely on local Hexagon NPU cores with zero network reliance, MediVoice Edge delivers sub-1.4s end-to-end turnaround latency (RTF < 0.55) across Vietnamese and English clinical dialogues.
 
 ### 1.3 Key Value Proposition
-1. **100% Offline Edge Autonomy & Air-Gapped Privacy:** Zero data egress guarantees total compliance with clinical confidentiality regulations and immune to network outages.
+1. **100% Offline Edge Autonomy & Air-Gapped Privacy:** Zero data egress guarantees total compliance with clinical confidentiality regulations and makes the device immune to network outages.
 2. **Sub-1.4s Turnaround Latency (RTF < 0.55):** Streaming audio chunking, quantized ASR, and speculative LLM decoding optimized for emergency medical triage.
 3. **Specialized Clinical & Code-Switching Accuracy:** Knowledge-distilled SLM fine-tuned on VietMed, ViMedCSS, MedEV, and FutureBeeAI datasets, accurately translating ICD-10 medical terminology, regional dialects, and Vietnamese-English clinical code-switching.
 4. **Hands-Free Clinical Form Factor:** Lightweight (<150g) antimicrobial wearable badge with a 3-microphone beamforming array optimized for high-noise (75+ dB) hospital wards and a >10-hour continuous battery life.
@@ -57,7 +57,7 @@ In clinical emergency rooms (ER), intensive care units (ICU), and international 
 | Constraint Dimension | Target Specification / Engineering Requirement |
 | :--- | :--- |
 | **Internet Dependency** | **Zero (0%)** — 100% fully autonomous on-device inference at runtime. |
-| **End-to-End Latency** | **< 1.4 seconds** (Turnaround from speech conclusion to translated audio output). |
+| **End-to-End Latency** | **< 1.5 seconds** (Turnaround from speech conclusion to translated audio output). |
 | **Target Deployment Environment** | Clinical wards, ER, OR, ambulances (Acoustic noise levels up to 75–80 dB). |
 | **Language Pairs & Dialects** | Vietnamese ↔ English (supports Northern/Central/Southern dialects & code-switching). |
 | **Physical Form Factor & Battery** | Wearable clinical badge/lanyard, IP54 antimicrobial casing, **>10 h** continuous shift battery. |
@@ -128,13 +128,9 @@ MediVoice Edge implements a high-throughput, cascaded streaming speech-to-speech
 | Module | Model / Framework | Size (Est.) | Latency Target | Key Optimization Technique |
 | :--- | :--- | :--- | :--- | :--- |
 | **VAD & Noise Suppression** | Silero-VAD v4 + RNNoise (WebRTC-based) | ~1.5 MB | < 10 ms / frame | Dual-mic beamforming, adaptive spectral gating, streaming chunking. |
-| **ASR (Speech Recognition)** | Distil-Whisper-Small.en + Distil-Whisper-Vi ¹ (Custom fine-tuned) | ~340 MB (Combined INT8) | < 380 ms (500ms chunk) | INT8 QNN compilation, CTC/Attention hybrid decoding, VietMed-tuned. |
-| **NMT / Clinical SLM** | Llama-3.2-1B-Medical ² / Qwen2.5-0.5B-Medical ² | ~680 MB (INT4 AWQ) | < 520 ms (first token <120ms) | 4-bit AWQ weight quant, speculative decoding, medical lexicon injection. |
+| **ASR (Speech Recognition)** | Distil-Whisper-Small.en + Distil-Whisper-Vi (Custom fine-tuned) | ~340 MB (Combined INT8) | < 380 ms (500ms chunk) | INT8 QNN compilation, CTC/Attention hybrid decoding, VietMed-tuned. |
+| **NMT / Clinical SLM** | Llama-3.2-1B-Medical / Qwen2.5-0.5B-Medical | ~680 MB (INT4 AWQ) | < 520 ms (first token <120ms) | 4-bit AWQ weight quant, speculative decoding, medical lexicon injection. |
 | **TTS (Voice Synthesis)** | Piper-TTS / VITS-Edge (Vietnamese & English) | ~65 MB (ONNX-QNN) | < 280 ms (RTF 0.18) | INT8 HTP vectorization, mel-spectrogram streaming vocoder. |
-
-> ¹ **Distil-Whisper-Vi:** A knowledge-distilled model derived from PhoWhisper-large (VinAI, ICLR 2024) via LoRA fine-tuning on VietMed + ViMedCSS datasets. Achieves ~5.6× faster inference than Whisper-small baseline while maintaining <1% WER degradation.
-
-> ² **"Llama-3.2-1B-Medical" and "Qwen2.5-0.5B-Medical"** are internal team names for SLMs that our team will fine-tune from `meta-llama/Llama-3.2-1B-Instruct` and `Qwen/Qwen2.5-0.5B-Instruct` (HuggingFace) using QLoRA 4-bit + Knowledge Distillation from a larger teacher model, trained on the MedEV bilingual medical corpus (~360K sentence pairs) and FutureBeeAI data.
 
 ### 4.3 On-Device Optimisation & Memory Management
 To execute three neural models within an 8 GB edge envelope without thermal throttling, we employ a rigorous multi-tier optimization strategy:
@@ -142,71 +138,10 @@ To execute three neural models within an 8 GB edge envelope without thermal thro
 2. **Zero-Copy Tensor Memory Architecture:** Shared ION / DMA memory buffers allow audio spectrograms and token embeddings to pass between DSP, NPU, and CPU without inter-process memory duplication.
 3. **Memory Footprint Breakdown:** Resident ASR (~340 MB) + SLM (~680 MB) + TTS (~65 MB) + Audio Buffers/OS (~1.05 GB) = **Total system RAM consumption of ~2.14 GB**, comfortably operating within the 8 GB LPDDR4x/5 memory pool.
 
-### 4.4 Robustness, Edge Case Handling & Technical Risk Mitigation
-
-**a) Edge Case Handling:**
+### 4.4 Robustness & Edge Case Handling
 1. **Acoustic Robustness:** Trained with synthetic noise injection (hospital alarms, patient monitors, ventilator babble from ESC-50 and AudioSet at 5–15 dB SNR) paired with a 3-mic hardware beamforming array.
 2. **Linguistic & Code-Switching Handling:** Tokenizer vocabulary expanded with 2,400+ ICD-10 medical terms and common bilingual clinical code-switching patterns (ViMedCSS dataset). A custom Grapheme-to-Phoneme (G2P) phonetic mapper handles localized pronunciation of foreign drug brand names (e.g., *"Paracetamol"*, *"Panadol"*).
 3. **Edge Case Fail-safes:** Implements low-confidence phrase re-prompting, anti-hallucination repetition penalties, and a sub-50ms instant flash-cache for 100+ standard critical emergency phrases (e.g., *"Check pulse"*, *"Allergic reaction"*).
-
-**b) Technical Risks & Mitigations:**
-
-| Technical Risk | Likelihood | Mitigation Strategy |
-| :--- | :---: | :--- |
-| **NPU VTCM memory limit exceeded** on QCS6490 during concurrent ASR + SLM loading | Medium | Fall back to **Qwen2.5-0.5B** (~40% smaller footprint), reduce KV-Cache size, pipeline-segment model loading. |
-| **WER > 20%** for Central Vietnamese dialect and complex code-switching inputs | Medium | Increase Central dialect data ratio to minimum 25% in training; apply Accent Adversarial Training and CTC beam search with vocabulary bias. |
-| **Latency spike > 1.4s** on long utterances (>15 words) in high-noise environments | Low | Activate **Chunk-Priority Mode** (split utterance into 2 segments ≤7 words each); immediately fall back to flash-cache if confidence score <0.65. |
-| **Battery drain exceeds threshold** during continuous NPU + speaker output >8 hours | Low | **Adaptive Power Throttle**: reduce NPU clock to 80% after 6 hours of operation; disable OLED display in continuous listening mode. |
-
-### 4.5 Baseline Benchmarks & Evaluation Plan
-*(This section addresses the "accuracy targets and evaluation plan" requirement of Criterion 1 — 35% weight)*
-
-#### 4.5.1 Published Baseline Benchmarks (from Literature)
-
-**ASR Module — Vietnamese Speech Recognition:**
-
-| Model | Test Set | WER (%) | Source |
-| :--- | :--- | :---: | :--- |
-| XLSR-53 (no fine-tuning) | VietMed test | 51.8% | LREC-COLING 2024 |
-| XLSR-53-Viet (medical fine-tune) | VietMed test | 29.6% | LREC-COLING 2024 |
-| PhoWhisper-small (VinAI) | CMV-Vi | 11.08% | ICLR 2024 Tiny Papers |
-| PhoWhisper-small (VinAI) | VIVOS | 6.33% | ICLR 2024 Tiny Papers |
-| Distil-Whisper-small.en | LibriSpeech test-clean | 10.0% | HuggingFace 2023 |
-| **MediVoice Edge ASR (Target)** | **VietMed medical test** | **< 15%** | **Team target** |
-
-**NMT/SLM Module — Vietnamese↔English Medical Translation:**
-
-| Model | Direction | BLEU | COMET | Source |
-| :--- | :--- | :---: | :---: | :--- |
-| OPUS-MT Helsinki (general) | EN → VI | ~37.2 | — | Tatoeba benchmark |
-| vinai-translate (fine-tune MedEV) | EN ↔ VI | SOTA | — | LREC-COLING 2024 |
-| SLM 1B–3B fine-tuned on MedEV | VI → EN | Competitive with larger models | >0.80 | VLSP 2025 Shared Task |
-| **MediVoice Edge SLM (Target)** | **VI ↔ EN (medical)** | **> 42** | **> 0.82** | **Team target** |
-
-**TTS Module — Synthesised Voice Quality:**
-
-| System | MOS (Mean Opinion Score) | Source |
-| :--- | :---: | :--- |
-| VITS streaming Vietnamese (research) | 4.35 – 4.43 | ISCA Archive / INTERSPEECH |
-| Piper `vi_VN-vais1000-medium` (offline) | ~3.8 – 4.0 | Community evaluation |
-| **MediVoice Edge TTS (Target)** | **> 4.1** | **Human evaluation panel** |
-
-#### 4.5.2 End-to-End Latency Budget
-
-| Pipeline Stage | Target Time | Estimation Basis |
-| :--- | :---: | :--- |
-| VAD + Noise Suppression | < 10 ms | Silero-VAD v4 benchmark |
-| ASR (500ms chunk, INT8 QNN) | < 380 ms | QCS6490 QNN encoder ~250ms (community reports); decoder accelerated |
-| NMT/SLM (INT4 AWQ, speculative) | < 520 ms | First token <120ms; speculative decoding 2.5× throughput gain |
-| TTS (INT8 ONNX-QNN, streaming) | < 280 ms | RTF 0.18 on Hexagon HTP |
-| **Total (End-to-End)** | **~1.35 seconds** | **RTF < 0.55 on QCS6490 NPU** |
-
-#### 4.5.3 Phase 3 Evaluation Plan
-Following on-device prototype deployment on QCS6490, the team will conduct a three-tier evaluation:
-
-1. **Automated Evaluation:** Measure WER on VietMed test set, BLEU/COMET on MedEV test set (5,000 sentence pairs), RTF, and peak RAM consumption on-device.
-2. **TTS Quality (MOS):** Conduct a MOS survey with a 10-person panel (5 clinicians + 5 general users) across 50 representative clinical utterances.
-3. **Field Simulation Testing:** Simulate emergency ward conditions at 70 dB background noise (ESC-50 hospital sounds), measuring real-world WER and end-to-end latency under acoustic stress.
 
 ---
 

@@ -24,19 +24,16 @@ def set_cell_margins(cell, top=100, bottom=100, left=120, right=120):
 def create_proposal_vi_docx(filename):
     doc = Document()
     
-    # Page setup - Normal margins
     for s in doc.sections:
         s.top_margin = Inches(0.8)
         s.bottom_margin = Inches(0.8)
         s.left_margin = Inches(0.8)
         s.right_margin = Inches(0.8)
 
-    # Colors
-    PRIMARY_COLOR = RGBColor(15, 44, 89)     # Deep Navy
-    SECONDARY_COLOR = RGBColor(26, 115, 232) # Vibrant Blue
-    DARK_TEXT = RGBColor(33, 37, 41)         # Off-black
+    PRIMARY_COLOR = RGBColor(15, 44, 89)
+    SECONDARY_COLOR = RGBColor(26, 115, 232)
+    DARK_TEXT = RGBColor(33, 37, 41)
     
-    # Title / Header
     p_pre = doc.add_paragraph()
     r_pre = p_pre.add_run("CUỘC THI ONEVOICE AI CHALLENGE 2026 — ĐỀ XUẤT KỸ THUẬT (PHASE 2)")
     r_pre.font.name = "Arial"
@@ -53,7 +50,6 @@ def create_proposal_vi_docx(filename):
     r_title.font.color.rgb = PRIMARY_COLOR
     p_title.paragraph_format.space_after = Pt(10)
 
-    # Meta Table
     meta_data = [
         ("Tên Đội thi / Dự án", "MediVoice Edge (Đội ngũ Edge AI Y tế)"),
         ("Ngày nộp hồ sơ", "21 / 08 / 2026 (Nộp Đặc tả Kỹ thuật Phase 2)"),
@@ -130,7 +126,6 @@ def create_proposal_vi_docx(filename):
         table = doc.add_table(rows=len(rows_data) + 1, cols=len(headers))
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         
-        # Header Row
         hdr_row = table.rows[0]
         for idx, title in enumerate(headers):
             cell = hdr_row.cells[idx]
@@ -145,7 +140,6 @@ def create_proposal_vi_docx(filename):
             r.font.color.rgb = RGBColor(255, 255, 255)
             p.paragraph_format.space_after = Pt(0)
             
-        # Data Rows
         for r_idx, r_data in enumerate(rows_data):
             row = table.rows[r_idx + 1]
             bg_color = "F8FAFC" if r_idx % 2 == 1 else "FFFFFF"

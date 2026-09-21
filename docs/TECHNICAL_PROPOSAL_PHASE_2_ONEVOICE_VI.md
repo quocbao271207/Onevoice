@@ -57,7 +57,7 @@ Trong phòng cấp cứu, phòng hồi sức tích cực (ICU) và các đoàn c
 | Ràng buộc Kỹ thuật | Chỉ tiêu Kỹ thuật Đích / Yêu cầu Kỹ thuật |
 | :--- | :--- |
 | **Phụ thuộc Internet** | **Bằng Không (0%)** — Hoàn toàn tự chủ On-Device tại thời gian thực (Offline Runtime). |
-| **Độ trễ Dịch thuật Đầu-cuối** | **< 1.4 giây** (Tổng thời gian từ khi ngắt giọng nói đến khi phát âm thanh dịch). |
+| **Độ trễ Dịch thuật Đầu-cuối** | **< 1.5 giây** (Tổng thời gian từ khi ngắt giọng nói đến khi phát âm thanh dịch). |
 | **Môi trường Triển khai** | Phòng cấp cứu, phòng mổ, xe cứu thương (Mức độ ồn âm học từ 65–80 dB). |
 | **Cặp Ngôn ngữ & Phương ngữ** | Tiếng Việt ↔ Tiếng Anh (Xử lý giọng Bắc/Trung/Nam và chèn thuật ngữ tiếng Anh). |
 | **Phần cứng & Năng lượng** | Thiết bị đeo ngực/lanyard rảnh tay, vỏ kháng khuẩn IP54, thời lượng pin **>10 giờ** liên tục. |
@@ -128,84 +128,19 @@ MediVoice Edge áp dụng kiến trúc pipeline nối tiếp dạng phân luồn
 | Module Pipeline | Mô hình / Framework | Kích thước (Ước tính) | Độ trễ Đích | Kỹ thuật Tối ưu Cốt lõi |
 | :--- | :--- | :--- | :--- | :--- |
 | **Khử ồn & VAD** | Silero-VAD v4 + RNNoise (WebRTC DSP) | ~1.5 MB | < 10 ms / frame | Định hướng chùm sóng (Beamforming), phân đoạn âm thanh streaming. |
-| **Nhận diện ASR (Nghe)** | Distil-Whisper-Small.en + Distil-Whisper-Vi ¹ (Fine-tune VietMed) | ~340 MB (Gộp INT8) | < 380 ms (chunk 500ms) | Biên dịch Qualcomm QNN INT8, giải mã lai CTC/Attention, hỗ trợ Code-switching. |
-| **Dịch thuật NMT / SLM** | Llama-3.2-1B-Medical ² / Qwen2.5-0.5B-Medical ² | ~680 MB (INT4 AWQ) | < 520 ms (first token <120ms) | Lượng tử hóa 4-bit AWQ, Speculative Decoding, nhúng từ điển ICD-10. |
+| **Nhận diện ASR (Nghe)** | Distil-Whisper-Small.en + Distil-Whisper-Vi (Fine-tune VietMed) | ~340 MB (Gộp INT8) | < 380 ms (chunk 500ms) | Biên dịch Qualcomm QNN INT8, giải mã lai CTC/Attention, hỗ trợ Code-switching. |
+| **Dịch thuật NMT / SLM** | Llama-3.2-1B-Medical / Qwen2.5-0.5B-Medical | ~680 MB (INT4 AWQ) | < 520 ms (first token <120ms) | Lượng tử hóa 4-bit AWQ, Speculative Decoding, nhúng từ điển ICD-10. |
 | **Tổng hợp TTS (Nói)** | Piper-TTS / VITS-Edge (Tiếng Việt & Tiếng Anh) | ~65 MB (ONNX-QNN) | < 280 ms (RTF 0.18) | Vector hóa INT8 trên HTP, vocoder streaming tái tạo phổ Mel tự nhiên. |
-
-> ¹ **Distil-Whisper-Vi:** Phiên bản chưng cất tri thức (Knowledge Distillation) từ PhoWhisper-large (VinAI, ICLR 2024) do đội tự thực hiện bằng kỹ thuật LoRA fine-tuning trên tập dữ liệu VietMed + ViMedCSS, tốc độ suy luận nhanh hơn ~5.6× so với Whisper-small gốc với WER chênh lệch < 1%.
-
-> ² **"Llama-3.2-1B-Medical" và "Qwen2.5-0.5B-Medical"** là tên nội bộ (internal name) của đội cho các mô hình SLM được đội tự fine-tune từ `meta-llama/Llama-3.2-1B-Instruct` và `Qwen/Qwen2.5-0.5B-Instruct` (HuggingFace) bằng kỹ thuật QLoRA 4-bit + Knowledge Distillation từ teacher model lớn hơn, trên tập ngữ liệu y tế song ngữ MedEV (~360K cặp câu) và FutureBeeAI.
 
 ### 4.3 Tối ưu hóa On-Device & Quản lý Bộ nhớ RAM
 1. **Lượng tử hóa & Biên dịch qua Qualcomm AI Hub:** Tất cả các mô hình được chuyển đổi sang ONNX, áp dụng kỹ thuật Lượng tử hóa sau huấn luyện (PTQ) và QAT xuống INT8 (ASR, TTS) và INT4 AWQ (SLM), sau đó biên dịch thành định dạng Deep Learning Container (`.dlc`) tối ưu cho Qualcomm Hexagon Tensor Processor (HTP).
 2. **Kiến trúc Bộ nhớ Zero-Copy:** Tận dụng vùng đệm chia sẻ ION / DMA giữa CPU, DSP và NPU, giúp truyền tensor âm thanh và embedding văn bản trực tiếp trong RAM mà không cần copy dữ liệu qua lại giữa các tiến trình.
 3. **Phân bổ Bộ nhớ RAM Chi tiết:** ASR thường trú (~340 MB) + SLM (~680 MB) + TTS (~65 MB) + Vùng đệm Audio & Hệ điều hành Linux (~1.05 GB) = **Tổng mức chiếm dụng RAM ~2.14 GB**, hoàn toàn nằm trong giới hạn an toàn của thanh RAM 8 GB LPDDR4x.
 
-### 4.4 Độ bền vững, Xử lý Tình huống Ngoại lệ & Rủi ro Kỹ thuật
-
-**a) Xử lý tình huống ngoại lệ:**
+### 4.4 Độ bền vững & Xử lý Tình huống Ngoại lệ (Robustness & Edge Cases)
 1. **Chống ồn Môi trường Y tế:** Huấn luyện mô hình với kỹ thuật Noise Augmentation (chèn tiếng ồn còi cấp cứu, máy thở, tiếng bước chân từ ESC-50 và AudioSet ở tỉ lệ SNR 5–15 dB) kết hợp thuật toán lọc nhiễu 3 micro.
 2. **Xử lý Code-Switching & Tiếng lóng Y khoa:** Mở rộng Tokenizer với hơn 2,400 thuật ngữ y tế ICD-10 và ngữ liệu ViMedCSS. Sử dụng từ điển chuyển đổi âm vị G2P (Grapheme-to-Phoneme) để chuẩn hóa cách phát âm tên thuốc tiếng Anh theo kiểu người Việt (ví dụ: *"Paracetamol"*, *"Panadol"*, *"Aspirin"*).
 3. **Cơ chế Dự phòng An toàn:** Tích hợp bộ nhớ đệm phản xạ nhanh (Instant Flash-Cache) lưu sẵn hơn 100 câu lệnh cấp cứu tiêu chuẩn (như *"Kiểm tra mạch"*, *"Bệnh nhân sốc phản vệ"*) để phát âm thanh dịch ngay dưới 50ms khi gặp tình huống nguy cấp.
-
-**b) Rủi ro Kỹ thuật & Phương án Giảm thiểu (Technical Risks & Mitigations):**
-
-| Rủi ro Kỹ thuật | Khả năng Xảy ra | Phương án Giảm thiểu (Mitigation) |
-| :--- | :---: | :--- |
-| **Vượt giới hạn VTCM memory NPU** trên QCS6490 khi tải đồng thời ASR + SLM | Trung bình | Chuyển sang mô hình dự phòng **Qwen2.5-0.5B** (gọn hơn ~40%), giảm kích thước KV-Cache, phân tách tải mô hình theo pipeline. |
-| **WER > 20%** với giọng miền Trung và phương ngữ lẫn Code-Switching phức tạp | Trung bình | Tăng tỉ lệ dữ liệu giọng Trung trong tập huấn luyện tối thiểu 25%; áp dụng Accent Adversarial Training và CTC beam search với vocabulary bias. |
-| **Latency spike > 1.4s** khi xử lý câu dài (>15 từ) trong môi trường nhiễu cao | Thấp | Kích hoạt chế độ **Chunk-Priority Mode** (chia nhỏ câu thành 2 đoạn ≤7 từ); fallback phát ngay flash-cache nếu độ tin cậy (confidence score) <0.65. |
-| **Tiêu thụ pin vượt ngưỡng** khi NPU + loa chạy đồng thời liên tục >8 giờ | Thấp | Chế độ **Adaptive Power Throttle**: giảm tần số NPU xuống 80% sau 6 giờ hoạt động, tắt màn hình OLED ở chế độ lắng nghe liên tục. |
-
-### 4.5 Benchmark Cơ Sở & Kế Hoạch Đánh Giá
-*(Phần này đáp ứng yêu cầu "accuracy targets and evaluation plan" của Tiêu chí 1 — Trọng số 35%)*
-
-#### 4.5.1 Benchmark Cơ Sở từ Nghiên cứu (Baseline từ Literature)
-
-**Module ASR — Nhận diện Tiếng nói Tiếng Việt:**
-
-| Mô hình | Tập Kiểm tra | WER (%) | Nguồn |
-| :--- | :--- | :---: | :--- |
-| XLSR-53 (không fine-tune) | VietMed test | 51.8% | LREC-COLING 2024 |
-| XLSR-53-Viet (fine-tune y tế) | VietMed test | 29.6% | LREC-COLING 2024 |
-| PhoWhisper-small (VinAI) | CMV-Vi | 11.08% | ICLR 2024 Tiny Papers |
-| PhoWhisper-small (VinAI) | VIVOS | 6.33% | ICLR 2024 Tiny Papers |
-| Distil-Whisper-small.en | LibriSpeech test-clean | 10.0% | HuggingFace 2023 |
-| **MediVoice Edge ASR (Mục tiêu)** | **VietMed medical test** | **< 15%** | **Đội đặt mục tiêu** |
-
-**Module NMT/SLM — Dịch thuật Y khoa VI ↔ EN:**
-
-| Mô hình | Chiều Dịch | BLEU | COMET | Nguồn |
-| :--- | :--- | :---: | :---: | :--- |
-| OPUS-MT Helsinki (general) | EN → VI | ~37.2 | — | Tatoeba benchmark |
-| vinai-translate (fine-tune MedEV) | EN ↔ VI | SOTA | — | LREC-COLING 2024 |
-| SLM 1B–3B fine-tune MedEV (tham khảo) | VI → EN | Cạnh tranh với model lớn | > 0.80 | VLSP 2025 Shared Task |
-| **MediVoice Edge SLM (Mục tiêu)** | **VI ↔ EN (medical)** | **> 42** | **> 0.82** | **Đội đặt mục tiêu** |
-
-**Module TTS — Chất lượng Giọng Tổng hợp:**
-
-| Hệ thống | MOS (Mean Opinion Score) | Nguồn |
-| :--- | :---: | :--- |
-| VITS streaming Vietnamese (nghiên cứu) | 4.35 – 4.43 | ISCA Archive / INTERSPEECH |
-| Piper `vi_VN-vais1000-medium` (offline) | ~3.8 – 4.0 | Community evaluation |
-| **MediVoice Edge TTS (Mục tiêu)** | **> 4.1** | **Human evaluation panel** |
-
-#### 4.5.2 Phân bổ Ngân sách Độ trễ Đầu-cuối (Latency Budget)
-
-| Giai đoạn Pipeline | Thời gian Đích | Cơ sở Ước tính |
-| :--- | :---: | :--- |
-| VAD + Noise Suppression | < 10 ms | Silero-VAD v4 benchmark |
-| ASR (chunk 500ms, INT8 QNN) | < 380 ms | QCS6490 QNN encoder ~250ms (community), decoder tăng tốc |
-| NMT/SLM (INT4 AWQ, speculative) | < 520 ms | First token < 120ms; speculative decode tăng 2.5× |
-| TTS (INT8 ONNX-QNN, streaming) | < 280 ms | RTF 0.18 trên HTP |
-| **Tổng cộng (Đầu-cuối)** | **~1.35 giây** | **RTF < 0.55 trên QCS6490 NPU** |
-
-#### 4.5.3 Kế hoạch Đánh giá Phase 3 (Evaluation Plan)
-Sau khi triển khai prototype trên thiết bị QCS6490, đội sẽ thực hiện đánh giá theo 3 tầng:
-
-1. **Đánh giá Tự động (Automated):** Đo WER trên VietMed test set, BLEU/COMET trên MedEV test set (5,000 cặp câu), RTF và peak RAM trên thiết bị.
-2. **Đánh giá Giọng nói Tổng hợp (MOS):** Khảo sát MOS với nhóm 10 người đánh giá (5 bác sĩ + 5 người dùng thông thường) trên 50 câu lâm sàng mẫu.
-3. **Kiểm thử Môi trường Thực địa (Field Simulation):** Mô phỏng phòng cấp cứu với tiếng ồn nền 70 dB (ESC-50), đo WER và độ trễ thực tế trong điều kiện nhiễu.
 
 ---
 
