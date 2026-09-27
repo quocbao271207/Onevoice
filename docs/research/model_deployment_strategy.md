@@ -1,5 +1,7 @@
 # Chiến lược Triển khai Mô hình Edge AI (Healthcare Translation)
 
+> **TÀI LIỆU NGHIÊN CỨU LỊCH SỬ — ĐÃ BỊ THAY THẾ.** Các hướng Distil-Whisper-Vi tự tạo, causal LLM/AWQ và distillation trong file này không phải kiến trúc hiện tại. Quyết định đang có hiệu lực là PhoWhisper-small cho ASR Việt, Distil-Whisper-small.en làm English baseline, một NLLB joint EN↔VI và chỉ lượng tử hóa/benchmark thiết bị sau khi có checkpoint thật; xem `project_analysis.md`.
+
 Để đáp ứng tiêu chí **hoàn toàn On-device (0% API Calls)**, độ trễ cực thấp (RTF < 1.0, Turnaround Latency < 2.0s) và chạy trên phần cứng giới hạn (điện thoại hoặc bo mạch), hệ thống không thể sử dụng các mô hình nguyên bản. Dưới đây là chiến lược cấu trúc pipeline, lựa chọn mô hình và các kỹ thuật tối ưu hóa (đặc biệt là Distillation).
 
 ---

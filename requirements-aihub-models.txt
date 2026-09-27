@@ -1,0 +1,3 @@
+# Isolated Qualcomm recipe environment; do not merge into requirements-local.txt.
+# Windows can inspect/fetch recipes, but AIMET-ONNX quantization is Linux/WSL-only.
+qai-hub-models[whisper-small-quantized]==0.63.0

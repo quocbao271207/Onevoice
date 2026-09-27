@@ -1,0 +1,58 @@
+# ============================================================
+# MediVoice Edge — Python Dependencies
+# OneVoice AI Challenge 2026
+# ============================================================
+
+# Core ML Framework
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.36.0
+datasets>=2.16.0
+accelerate>=0.25.0
+
+# Fine-tuning & Distillation
+peft>=0.7.0
+bitsandbytes>=0.41.0
+trl>=0.7.0
+
+# ONNX & Quantization
+onnx>=1.15.0
+onnxruntime>=1.16.0
+optimum>=1.14.0
+# qnn-sdk  # Install separately from Qualcomm
+
+# Audio Processing
+soundfile>=0.12.0
+librosa>=0.10.0
+webrtcvad>=2.0.10
+sounddevice>=0.4.6
+scipy>=1.11.0
+numpy>=1.24.0
+
+# ASR Evaluation
+jiwer>=3.0.0      # Word Error Rate (WER)
+evaluate>=0.4.0
+
+# MT Evaluation
+sacrebleu>=2.3.0   # BLEU score
+# unbabel-comet>=2.2.0  # COMET (install separately, heavy)
+
+# TTS
+piper-tts>=1.2.0
+
+# Noise Augmentation
+audiomentations>=0.34.0
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.66.0
+pandas>=2.1.0
+rich>=13.0.0       # Pretty console output
+click>=8.1.0       # CLI framework
+
+# Document Generation (existing)
+python-docx>=1.0.0
+
+# Demo Server
+flask>=3.0.0
+flask-cors>=4.0.0

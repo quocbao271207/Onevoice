@@ -1,6 +1,8 @@
 # TECHNICAL PROPOSAL: PHASE 2 — TECHNICAL SUBMISSION
 ## ONEVOICE AI CHALLENGE 2026
 
+> **HISTORICAL SUBMISSION — SUPERSEDED 22 SEPTEMBER 2026.** This file is retained only to preserve the Phase 2 submission record. It contains unverified design targets and obsolete assumptions, including a multi-person team, sub-1.4-second latency, device power/battery figures, hardware features, regulatory compliance, model choices, and completed deployment claims. None of those statements are measured results. The current solo-project architecture, evidence, status, and acceptance gates are defined only in [`../../project_analysis.md`](../../project_analysis.md), [`../../DATASET_CARD.md`](../../DATASET_CARD.md), and [`../../GPU_HANDOFF.md`](../../GPU_HANDOFF.md).
+
 ---
 
 | Metadata Field | Project Detail |

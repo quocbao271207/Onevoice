@@ -1,0 +1,35 @@
+version: 1
+reviewed_at: "2026-09-22"
+
+pii_scan:
+  status: reviewed
+  report: data/reports/eda/pii_scan.json
+  report_sha256: 3a4ad23d1bca1dc95181b335132812e70345c5f209f59787a2201e1ddd831b6c
+  scanned_records: 399860
+  candidate_records: 270
+  true_positive_exclusions:
+    - 6acfd860b0aedde2d035a537
+    - 2b920e9821cfa3d3197a8ce4
+    - ded0f376ce1381989966698b
+  retained_reviewed_false_positives: 267
+  retained_categories:
+    - scientific DOI/accession/sequence identifiers mistaken for phone numbers
+    - numeric tables and statistical values mistaken for phone numbers
+    - public research/guideline URLs rather than personal contact data
+    - generic discussion of names/addresses without an identified person
+    - VIVOS scripted sentences mentioning an address/address field without any actual identifying value
+  limitation: "Regex review cannot prove absence of unmarked PII; runtime user audio/transcripts must never be logged by default."
+
+medev_alignment:
+  status: reviewed
+  report: data/reports/eda/medev_alignment.json
+  report_sha256: a4e26ea1ffc3c3062ae983aeeafb77cdcd009cac4b2d9e49530b7712ac97133c
+  fatal_flags_removed:
+    - length_ratio_outlier
+    - very_long_pair
+    - source_language_suspect
+    - target_language_suspect
+    - untranslated_identity
+  retained_review_slices:
+    - number_set_mismatch
+  rationale: "Fatal structural/language flags are removed at merge. Number mismatches are retained as an evaluation slice because decimal punctuation, dates and explanatory translations create many valid mismatches."

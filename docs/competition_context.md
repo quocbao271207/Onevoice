@@ -1,5 +1,7 @@
 # Context Cuộc thi: OneVoice AI Challenge 2026
 
+> **Bối cảnh lịch sử do chủ dự án cung cấp; chưa phải bằng chứng chính thức đã kiểm chứng.** Tên đơn vị tổ chức, tiêu chí và timeline dưới đây cần đối chiếu lại với thể lệ/cuộc thi chính thức trước khi dùng để nộp hồ sơ hoặc cam kết deadline. Các target kỹ thuật không phải kết quả đo của OneVoice.
+
 **Đơn vị tổ chức:** Saigon AI Hub × Qualcomm
 **Mục tiêu cuộc thi:** Xây dựng giải pháp/thiết bị dịch thuật đa ngôn ngữ thời gian thực thế hệ mới, hoạt động **hoàn toàn trên thiết bị (On-device / Edge AI)** mà không cần kết nối Cloud/Internet.
 

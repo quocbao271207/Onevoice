@@ -1,6 +1,8 @@
 # ĐỀ XUẤT KỸ THUẬT: PHASE 2 — TECHNICAL SUBMISSION
 ## CUỘC THI ONEVOICE AI CHALLENGE 2026
 
+> **HỒ SƠ LỊCH SỬ — ĐÃ BỊ THAY THẾ NGÀY 22/09/2026.** File này chỉ được giữ để truy vết bản Phase 2 đã nộp. Nội dung còn các mục tiêu/giả định chưa kiểm chứng như team nhiều người, latency dưới 1,4 giây, điện năng/pin, phần cứng, tuân thủ pháp lý, lựa chọn model và trạng thái triển khai. Không tuyên bố nào trong số đó được coi là kết quả đo. Kiến trúc, bằng chứng, trạng thái và gate hiện tại của dự án một người chỉ lấy từ [`../../project_analysis.md`](../../project_analysis.md), [`../../DATASET_CARD.md`](../../DATASET_CARD.md) và [`../../GPU_HANDOFF.md`](../../GPU_HANDOFF.md).
+
 ---
 
 | Trường Thông Tin | Chi Tiết Dự Án |

@@ -1,0 +1,6 @@
+{
+  "input": {"shape": [1, 128], "dtype": "int64"},
+  "input_lengths": {"shape": [1], "dtype": "int64"},
+  "scales": {"shape": [3], "dtype": "float32"},
+  "sid": {"shape": [1], "dtype": "int64"}
+}

@@ -1,0 +1,109 @@
+version: 2
+decision_date: "2026-09-22"
+
+principles:
+  owner_count: 1
+  training_compute: rented_cloud_gpu
+  deployment_target: Qualcomm QCS6490
+  notes:
+    - "Tat ca model phai co baseline truoc fine-tune va benchmark sau quantization."
+    - "Khong cong bo WER/BLEU/latency neu chua co artifact benchmark."
+    - "Khong dung evaluation-only dataset de train."
+
+asr_vi:
+  selected_base: vinai/PhoWhisper-small
+  reason: "Whisper multilingual da duoc fine-tune 844h tieng Viet da dang accent; distil-small.en chi ho tro English."
+  alternative_for_edge: vinai/PhoWhisper-base
+  train_manifest: data/processed/manifests/asr--train-local.jsonl
+  validation_manifest: data/processed/manifests/asr--validation-local.jsonl
+  locked_test_manifest: data/processed/manifests/asr--test-local.jsonl
+  fine_tune:
+    method: lora_then_full
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    clinical_oversample_factor: 2
+    learning_rate: 1.0e-5
+    epochs: 5
+    batch_size_per_device: 8
+    gradient_accumulation: 4
+    gradient_checkpointing: true
+    precision: fp16
+    early_stopping_patience: 2
+    augmentation:
+      on_the_fly: true
+      speed_probability: 0.35
+      speed_range: [0.90, 1.10]
+      gain_probability: 0.80
+      gain_db_range: [-4.0, 4.0]
+      noise_probability: 0.30
+      noise_snr_db_range: [12.0, 35.0]
+      noise_types: [white, pink, mains_hum]
+      reverb_probability: 0.12
+      telephone_probability: 0.10
+      codec_probability: 0.10
+  report_slices: [source, accent, role, gender, recording_condition, code_switch, noise_snr]
+
+asr_en:
+  selected_base: distil-whisper/distil-small.en
+  training_status: deferred
+  evaluation_dataset: ekacare/eka-medical-asr-evaluation-dataset
+  rule: "Eka en/test la locked benchmark, khong fine-tune. Chi train khi tim duoc train corpus co license va speaker split."
+
+mt:
+  selected_base: facebook/nllb-200-distilled-600M
+  reason: "Encoder-decoder translation model; gon va de kiem thu hon causal chat LLM."
+  license: cc-by-nc-4.0
+  license_constraint: "Phu hop prototype/nghien cuu phi thuong mai; phai thay model neu san pham thuong mai."
+  train_manifest: data/processed/manifests/mt--train.jsonl
+  validation_manifest: data/processed/manifests/mt--validation.jsonl
+  locked_test_manifest: data/processed/manifests/mt--test.jsonl
+  directions: [eng_Latn_to_vie_Latn, vie_Latn_to_eng_Latn]
+  output_dir: models/mt/nllb-medical
+  joint_checkpoint: true
+  fine_tune:
+    method: lora_then_full
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    clinical_oversample_factor: 2
+    learning_rate: 2.0e-5
+    epochs: 1
+    batch_size_per_device: 8
+    gradient_accumulation: 4
+    precision: fp16
+    max_source_length: 256
+    max_target_length: 256
+  distillation:
+    enabled: false
+    rationale: "Chi them sau baseline; khong luu chain-of-thought. Synthetic output phai qua clinical terminology QA."
+
+tts:
+  vi:
+    engine: piper
+    voice: vi_VN-vivos-x_low
+    candidate_voice_for_human_ab: vi_VN-vais1000-medium
+    medical_aliases_enabled: false
+    medical_aliases_note: "Chi bật từng alias sau khi human listening xác nhận; không transliterate thuốc một cách mù quáng."
+    fine_tune_needed: false
+    acceptance: "Human AB/MOS + danh sach thuoc/so lieu; khong gia dinh MOS dat truoc khi test."
+  en:
+    engine: piper
+    voice: en_US-lessac-medium
+    fine_tune_needed: false
+
+deployment:
+  qcs6490:
+    asr_precision: int8
+    mt_precision: int8
+    tts_precision: int8
+    constraints:
+      - "QCS6490 HTP v68 can calibration INT8; validate every graph on the physical board."
+      - "Qualcomm Whisper-Small-Quantized w8a16 has a QCS6490 reference artifact; PhoWhisper still requires BYOM parity and profile evidence."
+      - "INT4/AWQ and .dlc size/latency claims are hypotheses until measured."
+    required_artifacts:
+      - float_baseline.json
+      - quantized_accuracy.json
+      - qnn_compile_log.txt
+      - on_device_latency.json
+      - memory_power_report.json

@@ -1,5 +1,7 @@
 # Đánh giá & Tổng hợp Dataset cho Dự án Dịch thuật Y tế (Vie ↔ Eng)
 
+> **TÀI LIỆU NGHIÊN CỨU LỊCH SỬ — ĐÃ BỊ THAY THẾ.** Các đề xuất teammate, FutureBee/chat-as-translation và dùng Eka để fine-tune không còn hợp lệ. Chỉ `configs/datasets.yaml`, `DATA_LICENSES.md`, `DATASET_CARD.md` và `project_analysis.md` được dùng để quyết định dữ liệu.
+
 Để xây dựng một thiết bị dịch thuật Edge AI hoàn chỉnh, bạn không chỉ cần 2 bộ dữ liệu (Tiếng Anh và Tiếng Việt), mà thực tế hệ thống của bạn sẽ được chia thành 3 module chính. Mỗi module cần các bộ dataset đặc thù tập trung vào lĩnh vực Y tế (Healthcare):
 
 1. **ASR (Automatic Speech Recognition - Nhận diện giọng nói):** Cần dữ liệu Audio Y tế Tiếng Việt và Tiếng Anh.

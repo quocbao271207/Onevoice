@@ -1,0 +1,62 @@
+# ============================================================
+# MediVoice Edge — .gitignore
+# ============================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+env/
+.venv/
+.venv-aihub-models/
+
+# Data & Models (large files — do NOT commit)
+data/raw/
+data/processed/
+data/augmented/
+data/reports/
+data/review/
+models/asr/
+models/mt/
+models/tts/
+models/dlc/
+*.bin
+*.pt
+*.pth
+*.onnx
+*.dlc
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & Outputs
+logs/
+*.log
+wandb/
+runs/
+outputs/
+.cache/
+.backups/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Misc
+*.tar.gz
+*.zip

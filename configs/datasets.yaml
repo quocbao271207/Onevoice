@@ -1,0 +1,212 @@
+version: 1
+seed: 20260922
+
+# EDA is a hard gate: no source is allowed into a merged manifest until its
+# audit JSON exists and reports status=pass or status=reviewed.
+quality_gate:
+  min_duration_s: 0.5
+  max_duration_s: 30.0
+  min_chars: 2
+  max_chars_per_second: 35.0
+  max_exact_duplicate_rate: 0.08
+  require_license_review: true
+  require_split_leakage_check: true
+  human_review_samples_per_source: 12
+
+datasets:
+  vietmed:
+    repo_id: leduckhai/VietMed
+    config: default
+    task: asr
+    language: vi
+    domain: medical
+    license: mit
+    priority: 100
+    enabled: true
+    train_splits: [train]
+    validation_splits: [dev]
+    test_splits: [test]
+    # VietMed cv shares speakers with train; retain it only for calibration/debug,
+    # never for a headline held-out score.
+    calibration_splits: [cv]
+    text_column: text
+    audio_column: audio
+    duration_column: duration
+    speaker_column: speaker_name
+    group_column: audio_name
+    accent_column: accent
+    metadata_columns: [utterance_id, role, gender, icd10_code, rec_condition, seq_name]
+
+  vimedcss:
+    repo_id: tensorxt/ViMedCSS
+    config: default
+    task: asr
+    language: vi-code-switch
+    domain: medical-code-switch
+    license: cc-by-4.0
+    license_note: "Xac minh quyen tai phan phoi audio YouTube truoc khi public derivative dataset."
+    priority: 95
+    enabled: true
+    train_splits: [train]
+    validation_splits: [validation]
+    test_splits: [test, hard]
+    text_column: segment_text
+    audio_column: audio
+    duration_column: duration_seconds
+    id_column: segment_id
+    group_column: original_video_link
+    metadata_columns: [cs_terms_list, cs_terms_count, topic, original_video_title, start_time, end_time]
+    split_policy: group_hash_repartition
+    repartition_splits: [train, validation, test]
+    locked_test_splits: [hard]
+    repartition_ratios:
+      train: 0.85
+      validation: 0.075
+      test: 0.075
+    repartition_seed: 20260922
+
+  medev:
+    repo_id: nhuvo/MedEV
+    config: default
+    task: mt
+    language: en-vi
+    domain: medical
+    license: unknown
+    license_note: "Chi dung nghien cuu cho den khi license duoc xac nhan bang van ban."
+    priority: 100
+    enabled: true
+    train_splits: [train]
+    validation_splits: [validation]
+    test_splits: [test]
+    storage_layout: parallel_halves_en_then_vi
+    text_column: text
+
+  eka_medical_en:
+    repo_id: ekacare/eka-medical-asr-evaluation-dataset
+    config: en
+    task: asr
+    language: en
+    domain: medical
+    license: mit
+    priority: 100
+    enabled: true
+    evaluation_only: true
+    train_splits: []
+    validation_splits: []
+    test_splits: [test]
+    text_column: text
+    audio_column: audio
+    duration_column: duration
+    speaker_column: session_id
+    id_column: md5_audio
+    metadata_columns: [md5_text, speaker, type_concept, recording_context, medical_entities]
+    # Short entity prompts intentionally repeat; exact audio hash must still be unique.
+    max_exact_duplicate_rate: 0.09
+
+  vivos:
+    # Public HF mirror of the official AILAB/VNUHCM VIVOS v1.0 corpus.
+    repo_id: duymanh1606/vietnamese_asr
+    config: default
+    task: asr
+    language: vi
+    domain: general
+    license: cc-by-nc-sa-4.0
+    license_note: "Chi dung nghien cuu/thi phi thuong mai; ShareAlike ap dung cho derivative data."
+    priority: 50
+    enabled: true
+    train_splits: [train]
+    validation_splits: []
+    test_splits: []
+    calibration_splits: [test]
+    text_column: sentence
+    audio_column: audio
+    speaker_column: speaker_id
+    group_column: speaker_id
+    id_column: path
+    # General read speech is replay only. Cap each speaker so it cannot dilute
+    # the medical/code-switch objective or let prolific speakers dominate.
+    max_train_per_group: 80
+    # Scripted prompts are repeated across disjoint speakers by design.
+    max_exact_duplicate_rate: 0.12
+    sampling_seed: 20260922
+    reason_enabled: "Speaker-balanced general Vietnamese replay; calibration split is never a medical headline test."
+
+  viet_bud500:
+    repo_id: linhtran92/viet_bud500
+    config: default
+    task: asr
+    language: vi
+    domain: general-multi-accent
+    license: cc-by-nc-sa-4.0
+    priority: 45
+    enabled: false
+    gated: true
+    reason_disabled: "Nguon bo sung 500h co Bac/Trung/Nam; chi sample co kiem soat de tranh lan at data y khoa."
+
+  vietspeech:
+    repo_id: NhutP/VietSpeech
+    config: default
+    task: asr
+    language: vi
+    domain: general-social-multi-accent
+    license: apache-2.0
+    priority: 40
+    enabled: false
+    gated: true
+    reason_disabled: "Nguon 1,100h rat lon; chi can neu accent coverage cua core data khong dat."
+
+  fptu_vovinam:
+    repo_id: minhtien2405/fptu-vovinam-dataset
+    config: default
+    task: asr
+    language: vi
+    domain: general-martial-arts-multi-accent
+    license: mit
+    priority: 35
+    enabled: false
+    gated: false
+    reason_disabled: "Metadata audit 2026-09-22: 13,596/14,048 train rows are repeated-text rows; 94.9% train is Central; published roles leak 323 train-validation and 312 train-test speakers. Personal mirror provenance/recording consent and AAC decode path need written verification before any speaker-repartitioned replay sample."
+
+  vivoice34_preview:
+    repo_id: anonymous-vivoice34/ViVoice34
+    config: default
+    task: asr
+    language: vi
+    domain: general-multi-province-preview
+    license: cc-by-4.0
+    priority: 30
+    enabled: false
+    reason_disabled: "Only 381 preview rows with 57 transcript classes and 20-113 second clips; anonymous publisher and a separate 29.9 GB package require provenance/segmentation review."
+
+  govvox_100h:
+    repo_id: vnpost-ai/govvox-100h-v3
+    config: default
+    task: asr
+    language: vi
+    domain: government-speech-multi-accent
+    license: other
+    priority: 40
+    enabled: false
+    gated: true
+    reason_disabled: "Manual access approval and non-standard license; do not depend on it until the solo owner receives access and acceptable written terms."
+
+  futurebee_medical:
+    repo_id: FutureBeeAI/english-vietnamese-medical
+    config: default
+    task: mt
+    language: en-vi
+    domain: medical
+    license: unknown
+    enabled: false
+    blocked: true
+    reason_disabled: "Hub API tra 401 tai ngay 2026-09-22; khong coi la nguon san sang neu chua co token/quyen."
+
+  vietnamese_medical_chat:
+    repo_id: hungsvdut2k2/vietnamese-medical-chat-data
+    config: default
+    task: dialogue
+    language: vi
+    domain: medical-chat
+    license: unknown
+    enabled: false
+    reason_disabled: "Day la hoi thoai don ngu, khong phai parallel translation; co rui ro clinical hallucination."

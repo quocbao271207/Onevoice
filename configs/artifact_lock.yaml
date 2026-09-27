@@ -1,0 +1,39 @@
+version: 1
+locked_at: "2026-09-22T18:09:03+07:00"
+purpose: "Reproducible pre-GPU data/model inputs for OneVoice research prototype"
+
+datasets:
+  leduckhai/VietMed: cc7980cd1392d2d85cf1c692b1d96e8581fc7eec
+  tensorxt/ViMedCSS: b6959a18a08739464733930a872e7125c03e6558
+  nhuvo/MedEV: 6afaf6b48c016020a99f4358ece419c697aa3ca9
+  ekacare/eka-medical-asr-evaluation-dataset: 433e66037c8aebb8f396b938624a5ab6afc4ca36
+  duymanh1606/vietnamese_asr: 851c7ed399625a22da0ddf4037c76fed830c30fe
+
+base_models:
+  vinai/PhoWhisper-small: a86b604c346caf7148c37512eafe783a16420adb
+  distil-whisper/distil-small.en: 9e4a67ca4569c30be43a3fe7fba1621e504f0093
+  facebook/nllb-200-distilled-600M: f8d333a098d19b4fd9a8b18f94170487ad3f821d
+
+manifests:
+  validation_report: data/reports/manifests/validation.json
+  strict_validation_report: data/reports/manifests/validation_strict_official.json
+  mt_train_sha256: 8a33607e5fce90b92c92abb987501913ba1f6db2ece6531efe64eec0f44ea612
+  mt_validation_sha256: 39f19af7e4ca5f5c8ad926589996b3288547990281e8e8a5af6631877bd0db7e
+  mt_test_sha256: 50b4dba76bce75455f9f3ec1d5be8a020f10747443642207134f4ecd29cbfaf2
+  mt_token_length_report_sha256: 9e86847f749a31a14a72f3e128700219d7d5bd9063f9c012c068c99f0b0b5c21
+  asr_train_local_sha256: 0be3b56d093a85a58f4e6d50933b9684c8d92fc2e94fba9b74ac81e801ca0ab6
+  asr_validation_local_sha256: 57e5877a5a733cbebdf2222a2146bf5b2bb77c449ba86a66f4fe627a8be973a8
+  asr_test_local_sha256: bb228399764d8725cb6de2686c448a5e0176ffee6dbbde0081b781951b9d17d5
+  audio_inventory_sha256: 279c1014060d644d2b7811246422330b8cff1e6e2b104882d089d66567e1c4c9
+  note: "Regenerate all checksums after any exclusion/QC change."
+
+evaluation:
+  medical_safety_mt: data/eval/medical_safety_mt.jsonl
+  medical_safety_mt_sha256: 68493af1858de00caa37b0e3f125e61cdba8618337520295316aef2be34ef408
+  rule: "Locked safety evaluation only; never train or select checkpoints on this suite."
+
+constraints:
+  commercial_use: false
+  redistribute_medev: false
+  redistribute_vimedcss_audio: false
+  redistribute_vivos_derivatives_without_sharealike_review: false

@@ -1,0 +1,58 @@
+version: 1
+decision_date: "2026-09-27"
+
+objective:
+  primary: "Improve ASR and MT accuracy without allowing aggregate metrics to hide clinical corruption."
+  rule: "A checkpoint cannot ship when a critical safety slice regresses, even if WER/BLEU improves."
+
+locked_baseline:
+  asr_vi_wer: 0.20871143375680581
+  asr_en_wer: 0.25539568345323743
+  mt_sacrebleu: 23.76298963007295
+  mt_chrf2: 44.96255092200735
+
+training:
+  seed: 20260922
+  asr:
+    method: lora_then_full
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    clinical_oversample_factor: 2
+    selection_metric: wer
+  mt:
+    method: lora_then_full
+    lora_rank: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    clinical_oversample_factor: 2
+    selection_metric: eval_loss
+  cpu_smoke:
+    purpose: "Verify the real training path on a CPU-only workstation; never promote its checkpoint."
+    max_steps: 1
+    train_examples: 2
+    validation_examples: 1
+
+release_gates:
+  aggregate:
+    asr_vi_wer_max: 0.19
+    asr_en_wer_max: 0.23
+    mt_sacrebleu_min: 25.0
+    mt_chrf2_min: 46.0
+  slices:
+    asr_code_switch_wer_max: 0.21
+    max_relative_regression: 0.02
+  clinical_safety:
+    drug_name_failure_rate_max: 0.0
+    dose_failure_rate_max: 0.0
+    number_failure_rate_max: 0.0
+    unit_failure_rate_max: 0.0
+    negation_failure_rate_max: 0.0
+    terminology_failure_rate_max: 0.0
+    policy: "Fail closed and route unsafe output for correction/human review."
+
+evaluation:
+  locked_mt_safety_suite: data/eval/medical_safety_mt.jsonl
+  required_slices: [drug_name, dose, number, unit, negation, terminology, code_switch]
+  forbid_train_overlap: true
+  report_bootstrap_confidence_intervals: true

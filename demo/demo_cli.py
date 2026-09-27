@@ -1,0 +1,231 @@
+"""
+MediVoice Edge — CLI Demo
+Command-line demonstration of the complete speech-to-speech translation pipeline.
+
+Usage:
+    # Interactive microphone mode
+    python demo/demo_cli.py --mode interactive
+
+    # Translate an audio file
+    python demo/demo_cli.py --mode file --input test_audio.wav
+
+    # Text-only translation (no ASR/TTS)
+    python demo/demo_cli.py --mode text --text "Bệnh nhân sốc phản vệ" --lang vi
+
+    # Benchmark mode
+    python demo/demo_cli.py --mode benchmark
+"""
+
+import argparse
+import logging
+import sys
+import time
+import numpy as np
+from pathlib import Path
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("MediVoice")
+
+
+BANNER = r"""
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║    __  __          _ _ __     __    _            _____     _  ║
+║   |  \/  | ___  __| (_) \   / /__ (_) ___ ___  | ____|__| | ║
+║   | |\/| |/ _ \/ _` | |\ \ / / _ \| |/ __/ _ \ |  _| / _` | ║
+║   | |  | |  __/ (_| | | \ V / (_) | | (_|  __/ | |__| (_| | ║
+║   |_|  |_|\___|\__,_|_|  \_/ \___/|_|\___\___| |_____\__,_| ║
+║                                                              ║
+║   Medical Voice Translation — Offline-First Prototype        ║
+║   OneVoice AI Challenge 2026                                 ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+
+def run_interactive(pipeline):
+    """Run interactive microphone-based translation."""
+    print("\n🎤 Interactive Mode — Speak into the microphone")
+    print("   Supported: Vietnamese ↔ English")
+    print("   Press Ctrl+C to stop\n")
+
+    try:
+        pipeline.run_interactive()
+    except KeyboardInterrupt:
+        print("\n\n👋 Goodbye!")
+
+
+def run_file_translation(pipeline, input_path: str, source_lang: str = None):
+    """Translate an audio file."""
+    import soundfile as sf
+
+    print(f"\n📂 Translating file: {input_path}")
+
+    audio, sr = sf.read(input_path)
+    if audio.ndim > 1:
+        audio = audio[:, 0]  # Take first channel
+    audio = audio.astype(np.float32)
+
+    print(f"   Duration: {len(audio)/sr:.2f}s | Sample Rate: {sr} Hz\n")
+
+    result = pipeline.translate_speech(
+        audio,
+        source_lang=source_lang,
+        sample_rate=sr,
+    )
+
+    print(f"\n{'─'*60}")
+    print(f"  🎤 Input ({result.asr_language.upper()}): {result.asr_text}")
+    print(f"  🌐 Output ({result.target_language.upper()}): {result.translated_text}")
+    print(f"  ⏱️  Latency: {result.total_latency_ms:.0f}ms (RTF={result.overall_rtf:.2f})")
+    print(f"  📊 Confidence: {result.asr_confidence:.2%}")
+    print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
+    print(f"{'─'*60}\n")
+
+    # Play audio if available
+    if result.output_audio is not None:
+        play = input("🔊 Play translated audio? (y/n): ").strip().lower()
+        if play == 'y':
+            pipeline.play(result)
+
+
+def run_text_translation(pipeline, text: str, source_lang: str):
+    """Text-only translation (no ASR/TTS)."""
+    print(f"\n📝 Text Translation Mode")
+    print(f"   Input ({source_lang.upper()}): {text}\n")
+
+    result = pipeline.translate_text(text, source_lang)
+
+    target_lang = "EN" if source_lang == "vi" else "VI"
+    print(f"  🌐 Output ({target_lang}): {result.translated_text}")
+    print(f"  ⏱️  Latency: {result.latency_ms:.0f}ms")
+    print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
+
+
+def run_benchmark(pipeline, num_samples: int = 10):
+    """Run quick benchmark with synthetic test data."""
+    print(f"\n📊 Benchmark Mode — {num_samples} samples\n")
+
+    # Test phrases for both directions
+    test_phrases_vi = [
+        "Bệnh nhân sốc phản vệ cần tiêm epinephrine ngay",
+        "Kiểm tra huyết áp và nhịp tim",
+        "Bệnh nhân đau ngực bên trái lan xuống cánh tay",
+        "Chuẩn bị phòng mổ cho ca phẫu thuật cấp cứu",
+        "Truyền dịch natri clorua 0.9 phần trăm",
+    ]
+
+    test_phrases_en = [
+        "Patient is in anaphylactic shock requires immediate epinephrine",
+        "Check blood pressure and heart rate",
+        "Patient reports chest pain radiating to left arm",
+        "Prepare the operating room for emergency surgery",
+        "Start normal saline IV drip at 150 milliliters per hour",
+    ]
+
+    latencies = []
+
+    # Test VI → EN
+    print("  Testing Vietnamese → English:")
+    for phrase in test_phrases_vi[:num_samples // 2]:
+        result = pipeline.translate_text(phrase, "vi")
+        latencies.append(result.latency_ms)
+        cache_tag = "⚡" if result.from_cache else "🧠"
+        print(f"    {cache_tag} [{result.latency_ms:6.0f}ms] {phrase[:40]}... → {result.translated_text[:40]}...")
+
+    # Test EN → VI
+    print("\n  Testing English → Vietnamese:")
+    for phrase in test_phrases_en[:num_samples // 2]:
+        result = pipeline.translate_text(phrase, "en")
+        latencies.append(result.latency_ms)
+        cache_tag = "⚡" if result.from_cache else "🧠"
+        print(f"    {cache_tag} [{result.latency_ms:6.0f}ms] {phrase[:40]}... → {result.translated_text[:40]}...")
+
+    # Summary
+    if latencies:
+        print(f"\n{'─'*60}")
+        print(f"  📊 Benchmark Results:")
+        print(f"     Samples: {len(latencies)}")
+        print(f"     Avg Latency: {np.mean(latencies):.0f}ms")
+        print(f"     Min Latency: {np.min(latencies):.0f}ms")
+        print(f"     Max Latency: {np.max(latencies):.0f}ms")
+        print(f"     P95 Latency: {np.percentile(latencies, 95):.0f}ms")
+        print(f"{'─'*60}")
+
+    stats = pipeline.get_performance_stats()
+    print(f"\n  Pipeline Stats: {stats}")
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(
+        description="MediVoice Edge — CLI Demo",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="OneVoice AI Challenge 2026"
+    )
+    parser.add_argument(
+        "--mode", type=str, default="text",
+        choices=["interactive", "file", "text", "benchmark"],
+        help="Demo mode (default: text)"
+    )
+    parser.add_argument(
+        "--input", type=str, default=None,
+        help="Input audio file path (for file mode)"
+    )
+    parser.add_argument(
+        "--text", type=str, default="Bệnh nhân sốc phản vệ",
+        help="Input text (for text mode)"
+    )
+    parser.add_argument(
+        "--lang", type=str, default="vi",
+        choices=["vi", "en"],
+        help="Source language (default: vi)"
+    )
+    parser.add_argument(
+        "--config", type=str, default="configs/pipeline_config.yaml",
+        help="Pipeline config file path"
+    )
+    parser.add_argument(
+        "--num-samples", type=int, default=10,
+        help="Number of benchmark samples"
+    )
+
+    args = parser.parse_args()
+
+    print(BANNER)
+
+    # Initialize pipeline
+    from src.pipeline.orchestrator import MediVoicePipeline
+
+    print("⏳ Loading pipeline components...\n")
+    pipeline = MediVoicePipeline(config_path=args.config)
+    pipeline.load()
+    print()
+
+    # Run selected mode
+    if args.mode == "interactive":
+        run_interactive(pipeline)
+    elif args.mode == "file":
+        if not args.input:
+            print("❌ Error: --input required for file mode")
+            return
+        run_file_translation(pipeline, args.input, args.lang)
+    elif args.mode == "text":
+        run_text_translation(pipeline, args.text, args.lang)
+    elif args.mode == "benchmark":
+        run_benchmark(pipeline, args.num_samples)
+
+
+if __name__ == "__main__":
+    main()

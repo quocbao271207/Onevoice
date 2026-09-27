@@ -1,0 +1,56 @@
+version: 1
+updated: 2026-09-22
+policy: "Exclude only evidence-backed corrupt/alignment/PII records; retain false-positive scientific identifiers."
+
+exclusions:
+  - id: 9e62e47bd2243335638ab503
+    source: eka_medical_en
+    reason: "audio_transcript_alignment_impossible: 0.48s audio for a long sentence"
+  - id: 30677070dc89e6d304e497e5
+    source: vietmed
+    reason: "audio_transcript_alignment_risk: 1.0s and high characters/second"
+  - id: 6acfd860b0aedde2d035a537
+    source: eka_medical_en
+    reason: "explicit_patient_name_in_transcript"
+  - id: 2b920e9821cfa3d3197a8ce4
+    source: medev
+    reason: "personal_phone_and_email_in_parallel_pair"
+  - id: ded0f376ce1381989966698b
+    source: medev
+    reason: "contact_email_in_parallel_pair"
+  - id: 9d81cd019643881dfaf2080e
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 74c111461b2055b1deb8e8f2
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 438d2ccbae311baf8db7e112
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 3406ea1bfc29d2417bb90924
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 3940d390af4954b52ba70709
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 096a7c0981c5e4920d50c5bb
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 03db1b6e88727923b6f59a2a
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 563ce00a89af8a3657c27844
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: 9476c7cead94a215959bd89c
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: cd483a3fac938a12370aa564
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: c99e761e6fcc823aea0b8fd4
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"
+  - id: c9936220829b0e09db052c1a
+    source: vimedcss
+    reason: "upstream_audio_asset_empty_after_four_download_attempts"

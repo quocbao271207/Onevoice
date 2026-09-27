@@ -1,3 +1,5 @@
+> **TÀI LIỆU NGHIÊN CỨU LỊCH SỬ — KHÔNG DÙNG ĐỂ MERGE/TRAIN.** Báo cáo này có giả định team nhiều người, EDA cũ và đề xuất nguồn dữ liệu đã bị thay thế. Registry, license, split và số liệu được phép dùng hiện tại nằm trong `configs/datasets.yaml`, `DATA_LICENSES.md`, `DATASET_CARD.md` và `project_analysis.md`.
+
 <div align="center">
   <h1>🏥 Báo cáo Hệ sinh thái Dataset Y tế (OneVoice Project)</h1>
   <p><i>Phân tích, Đánh giá, Khám phá dữ liệu (EDA) và Chiến lược Merge</i></p>

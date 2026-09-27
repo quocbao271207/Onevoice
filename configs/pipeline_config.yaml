@@ -1,0 +1,80 @@
+# ============================================================
+# MediVoice Edge — Pipeline Configuration
+# OneVoice AI Challenge 2026
+# ============================================================
+
+pipeline:
+  mode: "cascaded"          # cascaded (ASR → MT → TTS) vs end-to-end
+  streaming: false          # VAD segments microphone input; ASR/MT/TTS are still utterance-level
+  language_pairs:
+    - source: "vi"
+      target: "en"
+    - source: "en"
+      target: "vi"
+
+runtime:
+  # Needed only before the first fine-tuned checkpoints exist. Set false after
+  # GPU outputs are synced so a missing checkpoint can never masquerade as it.
+  allow_base_model_fallback: true
+
+audio:
+  sample_rate: 16000        # 16 kHz
+  bit_depth: 16             # 16-bit PCM
+  channels: 1               # Mono
+  chunk_duration_ms: 1000   # Frontend frame; Whisper still needs contextual windows
+  vad_threshold: 0.5        # Silero-VAD confidence threshold
+  silence_duration_ms: 800  # Silence before end-of-speech detection
+
+asr:
+  vi:
+    model_name: "phowhisper-small-medical"
+    model_path: "models/asr/phowhisper-small-medical"
+    quantization: "int8"
+    max_length: 448
+    language: "vi"
+    task: "transcribe"
+  en:
+    model_name: "distil-whisper-small-en-base"
+    model_path: "distil-whisper/distil-small.en"
+    quantization: "int8"
+    max_length: 448
+    language: "en"
+    task: "transcribe"
+
+mt:
+  model_name: "nllb-200-distilled-600m-medical"
+  model_path: "models/mt/nllb-medical"
+  quantization: "int8"
+  max_new_tokens: 256
+  num_beams: 1             # Selected on locked validation; beam-4 was slower and less accurate
+  speculative_decoding: false
+  medical_lexicon_path: null # Built-in reviewed critical terms; no missing-file placeholder
+  temperature: 0.1          # Low temp for deterministic medical translation
+
+tts:
+  vi:
+    engine: "piper"
+    model_path: "models/tts/vi_VN-vivos-x_low.onnx"
+    speaker_id: 0
+    sample_rate: 22050
+  en:
+    engine: "piper"
+    model_path: "models/tts/en_US-lessac-medium.onnx"
+    speaker_id: 0
+    sample_rate: 22050
+
+flash_cache:
+  enabled: true
+  cache_path: "configs/emergency_phrases.json"
+  fuzzy_matching: false     # Exact intent only; avoid unsafe substring cache hits
+  max_response_ms: 50       # Target < 50ms for cached phrases
+
+performance_targets:
+  status: "targets_not_measurements"
+  total_latency_ms: 2000
+  rtf: 1.0
+  asr_wer_vi: 0.15
+  mt_bleu: 35.0
+  mt_comet: 0.80
+  tts_mos: 4.0
+  required_reporting: [mean, p50, p95, cold_start, warm_start, device_temperature, power_watts]
