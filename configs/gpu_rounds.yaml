@@ -50,6 +50,18 @@ tasks:
         lora_rank: 32
         lora_alpha: 64
         lora_dropout: 0.10
+      - name: final-r8-lr1e4-full
+        max_steps: -1
+        epochs: 1.0
+        learning_rate: 1.0e-4
+        lora_rank: 8
+        lora_alpha: 16
+        lora_dropout: 0.05
+        limit_train: 0
+        limit_validation: 1024
+        eval_steps: 500
+        save_steps: 500
+        logging_steps: 25
 
   asr:
     module: src.training.finetune_whisper_vi

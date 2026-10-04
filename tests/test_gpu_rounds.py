@@ -54,3 +54,11 @@ def test_gpu_pilots_bound_preprocessing_without_shrinking_final_run_policy():
 def test_gpu_rounds_can_select_one_named_round_for_immediate_download():
     task = {"rounds": [{"name": "one"}, {"name": "two"}]}
     assert configured_rounds(task, round_name="two") == [{"name": "two"}]
+
+
+def test_mt_full_round_uses_selected_pilot_and_all_training_rows():
+    config = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))
+    final = next(item for item in config["tasks"]["mt"]["rounds"] if item["name"] == "final-r8-lr1e4-full")
+    assert final["lora_rank"] == 8
+    assert final["learning_rate"] == 1.0e-4
+    assert final["limit_train"] == 0
