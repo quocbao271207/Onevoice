@@ -13,12 +13,14 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/materialize_audio.py` — tải audio sau khi EDA được duyệt
 - `scripts/qc_local_audio.py` — decode, chuẩn hóa FLAC mono 16 kHz và loại near-silence/CPS bất khả thi
 - `scripts/run_baseline_benchmarks.py` — baseline ASR VI/EN và MT trên tập khóa
+- `scripts/run_asr_candidate_suite.py` — chấm LoRA ASR Việt trên full test, code-switch và clinical audio suite, fail-closed
 - `scripts/run_mt_candidate_suite.py` — chấm LoRA MT trên full locked test + clinical suite, fail-closed và tạo archive checksum
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board
 - `docs/ACCURACY_IMPROVEMENT_PLAN.md` — kế hoạch accuracy, fine-tune hai giai đoạn và gate lâm sàng
 - `configs/accuracy_program.yaml` — ngưỡng release máy đọc được
+- `data/eval/medical_safety_asr_vi.jsonl` — 16 audio test khóa cho thuốc/liều/số/đơn vị/phủ định/thuật ngữ/code-switch
 - `data/eval/medical_safety_mt.jsonl` — tập test khóa riêng cho thuốc/liều/số/đơn vị/phủ định
 - `docs/proposals/` — bản Markdown Phase 2 lịch sử; hai DOCX gốc vẫn nằm nguyên vẹn dưới `docs/`
 

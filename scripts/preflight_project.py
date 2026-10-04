@@ -191,6 +191,7 @@ def main() -> int:
         artifact_lock = yaml.safe_load(lock_path.read_text(encoding="utf-8")) if lock_path.is_file() else {}
         locked_hashes = artifact_lock.get("manifests", {})
         locked_models = artifact_lock.get("base_models", {})
+        locked_evaluation = artifact_lock.get("evaluation", {})
         for label, model_name, revision in (
             ("asr", ASRTrainingConfig.base_model, ASRTrainingConfig.base_model_revision),
             ("mt", MTTrainingConfig.base_model, MTTrainingConfig.base_model_revision),
@@ -232,6 +233,20 @@ def main() -> int:
                         f"rows={rows} unique_ids={unique_ids} missing_audio={missing}",
                     )
                 )
+        for filename, lock_key in {
+            "medical_safety_asr_vi.jsonl": "medical_safety_asr_vi_sha256",
+            "medical_safety_mt.jsonl": "medical_safety_mt_sha256",
+        }.items():
+            path = ROOT / "data" / "eval" / filename
+            actual = sha256(path) if path.is_file() else None
+            expected = locked_evaluation.get(lock_key)
+            checks.append(
+                check(
+                    actual is not None and actual == expected,
+                    f"evaluation:{filename}",
+                    f"sha256={actual} expected={expected}",
+                )
+            )
         for name, path in {
             "manifest_validation": ROOT / "data" / "reports" / "manifests" / "validation.json",
             "audio_qc": ROOT / "data" / "reports" / "audio_qc.json",

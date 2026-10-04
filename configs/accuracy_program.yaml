@@ -52,6 +52,7 @@ release_gates:
     policy: "Fail closed and route unsafe output for correction/human review."
 
 evaluation:
+  locked_asr_safety_suite: data/eval/medical_safety_asr_vi.jsonl
   locked_mt_safety_suite: data/eval/medical_safety_mt.jsonl
   required_slices: [drug_name, dose, number, unit, negation, terminology, code_switch]
   forbid_train_overlap: true

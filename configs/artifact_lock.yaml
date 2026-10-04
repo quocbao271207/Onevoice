@@ -28,6 +28,8 @@ manifests:
   note: "Regenerate all checksums after any exclusion/QC change."
 
 evaluation:
+  medical_safety_asr_vi: data/eval/medical_safety_asr_vi.jsonl
+  medical_safety_asr_vi_sha256: 4c0cf6ae761a73940edfe29517c55a3f4aee4a1b32c287d11ed50cd6aaffe6a9
   medical_safety_mt: data/eval/medical_safety_mt.jsonl
   medical_safety_mt_sha256: 68493af1858de00caa37b0e3f125e61cdba8618337520295316aef2be34ef408
   rule: "Locked safety evaluation only; never train or select checkpoints on this suite."

@@ -25,6 +25,77 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+ASR_CRITICAL_CATEGORIES = {
+    "drug_name",
+    "dose",
+    "number",
+    "unit",
+    "negation",
+    "terminology",
+    "code_switch",
+}
+
+
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    normalized_text = f" {normalize_for_wer(text)} "
+    normalized_phrase = normalize_for_wer(phrase)
+    return bool(normalized_phrase) and f" {normalized_phrase} " in normalized_text
+
+
+def score_asr_safety(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Score explicit token/phrase preservation expectations for locked ASR audio."""
+    by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        for category in row.get("categories", []):
+            by_category[str(category)].append(row)
+
+    category_reports: dict[str, dict[str, Any]] = {}
+    for category, group in sorted(by_category.items()):
+        failures = []
+        for row in group:
+            expectations = row.get("safety_expectations", {}).get(category)
+            if not isinstance(expectations, list) or not expectations:
+                missing_groups = [["<missing expectation>"]]
+            else:
+                missing_groups = []
+                for alternatives in expectations:
+                    if not isinstance(alternatives, list) or not alternatives:
+                        missing_groups.append(["<invalid expectation>"])
+                        continue
+                    if not any(
+                        _contains_normalized_phrase(row["hypothesis"], str(alternative))
+                        for alternative in alternatives
+                    ):
+                        missing_groups.append([str(value) for value in alternatives])
+            if missing_groups:
+                failures.append(
+                    {
+                        "id": row.get("id"),
+                        "missing_any_of": missing_groups,
+                        "reference": row.get("reference"),
+                        "hypothesis": row.get("hypothesis"),
+                    }
+                )
+        category_reports[category] = {
+            "samples": len(group),
+            "failures": len(failures),
+            "safety_failure_rate": len(failures) / max(1, len(group)),
+            "failure_examples": failures[:20],
+        }
+
+    evaluated = ASR_CRITICAL_CATEGORIES & set(category_reports)
+    return {
+        "categories": category_reports,
+        "clinical_safety_gate": {
+            "pass": evaluated == ASR_CRITICAL_CATEGORIES
+            and all(category_reports[name]["safety_failure_rate"] == 0.0 for name in evaluated),
+            "required_categories": sorted(ASR_CRITICAL_CATEGORIES),
+            "evaluated_categories": sorted(evaluated),
+            "policy": "zero detected critical transcription-preservation failures",
+        },
+    }
+
+
 def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def score(group: list[dict[str, Any]]) -> dict[str, float]:
         refs = [normalize_for_wer(row["reference"]) for row in group]
@@ -53,7 +124,7 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if row.get(key) not in (None, ""):
                 slices[key][str(row[key])].append(row)
     overall = score(rows)
-    return {
+    report = {
         "task": "asr",
         "normalizer": NORMALIZER_VERSION,
         "samples": len(rows),
@@ -64,6 +135,9 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for key, groups in slices.items()
         },
     }
+    if any(row.get("categories") or row.get("safety_expectations") for row in rows):
+        report.update(score_asr_safety(rows))
+    return report
 
 
 def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:

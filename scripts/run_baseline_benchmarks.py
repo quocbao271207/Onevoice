@@ -182,6 +182,8 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                         "role": row.get("metadata", {}).get("role"),
                         "recording_condition": row.get("metadata", {}).get("rec_condition"),
                         "code_switch": row.get("language") == "vi-code-switch",
+                        "categories": row.get("categories", []),
+                        "safety_expectations": row.get("safety_expectations", {}),
                     }
                 )
             print(f"[ASR] {len(predictions)}/{len(rows)}", flush=True)

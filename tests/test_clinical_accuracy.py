@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from scripts.evaluate_benchmarks import score_mt
+from scripts.evaluate_benchmarks import score_asr, score_mt
 from src.pipeline.safety_guard import extract_quantities, negation_count, validate_translation
 from src.training.clinical_sampling import (
     clinical_risk_tags,
@@ -17,6 +17,7 @@ from src.training.clinical_sampling import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SAFETY_SUITE = ROOT / "data" / "eval" / "medical_safety_mt.jsonl"
+ASR_SAFETY_SUITE = ROOT / "data" / "eval" / "medical_safety_asr_vi.jsonl"
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -114,6 +115,55 @@ def test_locked_safety_suite_checksum_matches_artifact_lock():
     assert hashlib.sha256(SAFETY_SUITE.read_bytes()).hexdigest() == lock["evaluation"][
         "medical_safety_mt_sha256"
     ]
+
+
+def test_locked_asr_safety_suite_is_complete_and_checksum_locked():
+    rows = read_jsonl(ASR_SAFETY_SUITE)
+    required = {"drug_name", "dose", "number", "unit", "negation", "terminology", "code_switch"}
+    categories = {category for row in rows for category in row["categories"]}
+    assert required <= categories
+    assert len(rows) >= 16
+    assert len({row["id"] for row in rows}) == len(rows)
+    assert all(set(row["categories"]) == set(row["safety_expectations"]) for row in rows)
+    lock = yaml.safe_load((ROOT / "configs" / "artifact_lock.yaml").read_text(encoding="utf-8"))
+    assert hashlib.sha256(ASR_SAFETY_SUITE.read_bytes()).hexdigest() == lock["evaluation"][
+        "medical_safety_asr_vi_sha256"
+    ]
+
+
+def test_locked_asr_safety_suite_is_exact_subset_of_locked_test():
+    test_rows = {
+        row["id"]: row
+        for row in read_jsonl(ROOT / "data" / "processed" / "manifests" / "asr--test-local.jsonl")
+    }
+    for row in read_jsonl(ASR_SAFETY_SUITE):
+        source = test_rows[row["id"]]
+        assert row["text"] == source["text"]
+        assert row["audio_path"] == source["audio_path"]
+        assert row["language"] == source["language"]
+
+
+def test_asr_safety_scoring_preserves_explicit_alternatives_and_fails_missing_values():
+    perfect = {
+        "id": "safe",
+        "reference": "Kali clorid 0,15 g.",
+        "hypothesis": "Kali clorid 0 15 g",
+        "categories": ["drug_name", "dose", "number", "unit"],
+        "safety_expectations": {
+            "drug_name": [["kali clorid"]],
+            "dose": [["0,15 g"]],
+            "number": [["0,15"]],
+            "unit": [["g"]],
+        },
+    }
+    failed = {
+        **perfect,
+        "id": "failed",
+        "hypothesis": "Kali clorid",
+    }
+    report = score_asr([perfect, failed])
+    assert report["categories"]["drug_name"]["safety_failure_rate"] == 0.0
+    assert report["categories"]["dose"]["safety_failure_rate"] == 0.5
 
 
 def test_locked_safety_suite_has_no_exact_pair_overlap_with_training_manifest():

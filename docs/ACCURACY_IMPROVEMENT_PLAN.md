@@ -38,12 +38,13 @@ Các ngưỡng máy đọc được nằm ở `configs/accuracy_program.yaml`. M
 
 # Sau full-run: chấm adapter trên toàn bộ test khóa + toàn bộ suite lâm sàng,
 # điều tiết GPU theo cùng lịch 38%/75%, rồi đóng gói report có SHA-256.
+.venv\Scripts\python.exe scripts/run_asr_candidate_suite.py --adapter gpu-runs/asr-YYYYMMDD-HHMMSS/NN-final-selected/model --device cuda --precision bf16 --batch-size 4 --num-beams 1
 .venv\Scripts\python.exe scripts/run_mt_candidate_suite.py --adapter gpu-runs/mt-YYYYMMDD-HHMMSS/01-final-r8-lr1e4-full/model --device cuda --precision bf16 --batch-size 8 --num-beams 4
 ```
 
 CPU smoke ghi `promotion_allowed=false` trong `training_run.json`. Chỉ checkpoint full-run trên GPU, vượt locked validation/test và suite lâm sàng mới được thay đường dẫn production.
 
-`--samples 0` trong `run_baseline_benchmarks.py` có nghĩa là chấm toàn bộ manifest. Khi có `--adapter`, benchmark nạp PEFT/LoRA lên model nền đã pin revision; mặc định cũ vẫn là CPU/fp32. `run_mt_candidate_suite.py` xác minh checksum của suite trước khi suy luận, fail-closed nếu thiếu bất kỳ slice bắt buộc nào, lưu predictions/report/log/resource monitor, rồi tạo `tar.gz` và sidecar `.sha256`. Kết quả fine-tune tốt nhưng gate lâm sàng fail vẫn không được promotion.
+`--samples 0` trong `run_baseline_benchmarks.py` có nghĩa là chấm toàn bộ manifest. Khi có `--adapter`, benchmark nạp PEFT/LoRA lên model nền đã pin revision; mặc định cũ vẫn là CPU/fp32. `run_asr_candidate_suite.py` xác minh cả full ASR test và `medical_safety_asr_vi.jsonl`, đồng thời chứng minh 16 audio safety là bản sao nguyên trạng của locked test trước khi suy luận. Bộ này chấm bảo toàn cụm từ đã duyệt cho tên thuốc, liều, số, đơn vị, phủ định, thuật ngữ và code-switch; full WER, code-switch WER hoặc một slice bất kỳ không đạt đều khóa promotion. `run_mt_candidate_suite.py` áp dụng cùng nguyên tắc cho MT. Hai script lưu predictions/report/log/resource monitor, rồi tạo `tar.gz` và sidecar `.sha256`. Kết quả fine-tune tốt nhưng gate lâm sàng fail vẫn không được promotion; 0 lỗi phát hiện được cũng không phải chứng minh an toàn.
 
 ## Điều phối GPU theo giờ
 

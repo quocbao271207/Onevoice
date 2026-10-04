@@ -13,7 +13,8 @@ from scripts.run_baseline_benchmarks import (
     resolve_device,
     source_balanced_sample,
 )
-from scripts.run_mt_candidate_suite import candidate_checks
+from scripts.run_asr_candidate_suite import candidate_checks as asr_candidate_checks
+from scripts.run_mt_candidate_suite import candidate_checks as mt_candidate_checks
 
 
 def test_explicit_benchmark_device_is_preserved():
@@ -60,9 +61,27 @@ def test_candidate_gate_requires_every_clinical_slice():
         },
         "evaluation": {"required_slices": ["drug_name", "dose"]},
     }
-    checks = candidate_checks(
+    checks = mt_candidate_checks(
         config,
         {"sacrebleu": 30.0, "chrf2": 50.0},
-        {"categories": {"drug_name": {"safety_failure_rate": 0.0}}},
+        {"categories": {"drug_name": {"samples": 1, "safety_failure_rate": 0.0}}},
     )
     assert any(check["name"] == "clinical_dose" and not check["pass"] for check in checks)
+
+
+def test_asr_candidate_gate_requires_code_switch_and_every_clinical_slice():
+    config = {
+        "release_gates": {
+            "aggregate": {"asr_vi_wer_max": 0.19},
+            "slices": {"asr_code_switch_wer_max": 0.21},
+            "clinical_safety": {"terminology_failure_rate_max": 0.0},
+        },
+        "evaluation": {"required_slices": ["drug_name", "dose"]},
+    }
+    checks = asr_candidate_checks(
+        config,
+        {"wer": 0.18, "slices": {"code_switch": {"True": {"wer": 0.20}}}},
+        {"categories": {"drug_name": {"samples": 1, "safety_failure_rate": 0.0}}},
+    )
+    assert any(check["name"] == "clinical_dose" and not check["pass"] for check in checks)
+    assert all(check["pass"] for check in checks if check["name"] != "clinical_dose")

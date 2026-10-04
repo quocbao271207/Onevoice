@@ -1,7 +1,8 @@
-"""Evaluate one MT LoRA candidate on every locked gate and archive the evidence.
+"""Evaluate one Vietnamese ASR LoRA candidate on every locked release gate.
 
-Fine-tuning is not treated as a safety claim.  Promotion is fail-closed unless
-the full MT test manifest and every required clinical preservation slice pass.
+Fine-tuning is not a safety claim. Promotion is fail-closed unless the full
+Vietnamese test set, code-switch slice, and every explicit clinical
+transcription-preservation slice pass.
 """
 
 from __future__ import annotations
@@ -24,49 +25,101 @@ from scripts.candidate_evidence import archive_evidence, read_json, sha256  # no
 from scripts.run_gpu_rounds import monitor_process  # noqa: E402
 
 
-BASE_MODEL = "facebook/nllb-200-distilled-600M"
-BASE_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
+BASE_MODEL = "vinai/PhoWhisper-small"
+BASE_REVISION = "a86b604c346caf7148c37512eafe783a16420adb"
 
 
-def validate_locked_suite(config: dict[str, Any], suite_path: Path, lock_path: Path) -> str:
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def validate_locked_inputs(
+    config: dict[str, Any], test_path: Path, safety_path: Path, lock_path: Path
+) -> dict[str, str]:
+    """Verify hashes and prove the clinical suite is an exact test-set subset."""
     lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
-    expected = lock["evaluation"]["medical_safety_mt_sha256"]
-    actual = sha256(suite_path)
-    configured = (ROOT / config["evaluation"]["locked_mt_safety_suite"]).resolve()
-    if suite_path.resolve() != configured:
-        raise ValueError(f"Safety suite is not the configured locked artifact: {suite_path}")
-    if actual != expected:
-        raise ValueError(f"Locked safety suite checksum mismatch: {actual} != {expected}")
-    return actual
+    configured_safety = (ROOT / config["evaluation"]["locked_asr_safety_suite"]).resolve()
+    configured_test = (ROOT / "data/processed/manifests/asr--test-local.jsonl").resolve()
+    if safety_path.resolve() != configured_safety:
+        raise ValueError(f"Safety suite is not the configured locked artifact: {safety_path}")
+    if test_path.resolve() != configured_test:
+        raise ValueError(f"Test manifest is not the configured locked artifact: {test_path}")
+
+    hashes = {
+        "test": sha256(test_path),
+        "safety": sha256(safety_path),
+    }
+    expected = {
+        "test": lock["manifests"]["asr_test_local_sha256"],
+        "safety": lock["evaluation"]["medical_safety_asr_vi_sha256"],
+    }
+    for name in hashes:
+        if hashes[name] != expected[name]:
+            raise ValueError(f"Locked {name} checksum mismatch: {hashes[name]} != {expected[name]}")
+
+    test_rows = {row["id"]: row for row in read_jsonl(test_path)}
+    safety_rows = read_jsonl(safety_path)
+    if len({row["id"] for row in safety_rows}) != len(safety_rows):
+        raise ValueError("Locked ASR safety suite contains duplicate IDs")
+    observed_categories = set()
+    for row in safety_rows:
+        source = test_rows.get(row["id"])
+        if source is None:
+            raise ValueError(f"Safety row is absent from locked test: {row['id']}")
+        for field in ("text", "audio_path", "language"):
+            if row.get(field) != source.get(field):
+                raise ValueError(f"Safety row {row['id']} changed locked field: {field}")
+        if not str(row.get("language", "")).startswith("vi"):
+            raise ValueError(f"Non-Vietnamese row in ASR-VI safety suite: {row['id']}")
+        categories = set(row.get("categories", []))
+        expectations = row.get("safety_expectations", {})
+        if not categories or categories != set(expectations):
+            raise ValueError(f"Safety row has incomplete expectations: {row['id']}")
+        observed_categories.update(categories)
+    required = set(config["evaluation"]["required_slices"])
+    if not required <= observed_categories:
+        missing = sorted(required - observed_categories)
+        raise ValueError(f"Locked ASR safety suite is missing slices: {missing}")
+    return hashes
 
 
 def candidate_checks(
-    config: dict[str, Any], aggregate_report: dict[str, Any], clinical_report: dict[str, Any]
+    config: dict[str, Any], aggregate_report: dict[str, Any], safety_report: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    aggregate = config["release_gates"]["aggregate"]
+    aggregate_limit = float(config["release_gates"]["aggregate"]["asr_vi_wer_max"])
     checks = [
         {
-            "name": "mt_sacrebleu",
-            "actual": float(aggregate_report["sacrebleu"]),
-            "operator": ">=",
-            "limit": float(aggregate["mt_sacrebleu_min"]),
-            "pass": float(aggregate_report["sacrebleu"]) >= float(aggregate["mt_sacrebleu_min"]),
-        },
-        {
-            "name": "mt_chrf2",
-            "actual": float(aggregate_report["chrf2"]),
-            "operator": ">=",
-            "limit": float(aggregate["mt_chrf2_min"]),
-            "pass": float(aggregate_report["chrf2"]) >= float(aggregate["mt_chrf2_min"]),
-        },
+            "name": "asr_vi_wer",
+            "actual": float(aggregate_report["wer"]),
+            "operator": "<=",
+            "limit": aggregate_limit,
+            "pass": float(aggregate_report["wer"]) <= aggregate_limit,
+        }
     ]
+    code_switch = aggregate_report.get("slices", {}).get("code_switch", {}).get("True")
+    code_switch_limit = float(config["release_gates"]["slices"]["asr_code_switch_wer_max"])
+    if code_switch is None:
+        checks.append(
+            {"name": "asr_code_switch_wer", "pass": False, "reason": "missing required slice"}
+        )
+    else:
+        actual = float(code_switch["wer"])
+        checks.append(
+            {
+                "name": "asr_code_switch_wer",
+                "actual": actual,
+                "operator": "<=",
+                "limit": code_switch_limit,
+                "pass": actual <= code_switch_limit,
+            }
+        )
+
+    category_reports = safety_report.get("categories", {})
     clinical_limits = config["release_gates"]["clinical_safety"]
-    categories = clinical_report.get("categories", {})
     for category in config["evaluation"]["required_slices"]:
-        category_report = categories.get(category)
-        limit_key = f"{category}_failure_rate_max"
-        limit = float(clinical_limits.get(limit_key, clinical_limits["terminology_failure_rate_max"]))
-        if category_report is None or int(category_report.get("samples", 0)) < 1:
+        report = category_reports.get(category)
+        if report is None or int(report.get("samples", 0)) < 1:
             checks.append(
                 {
                     "name": f"clinical_{category}",
@@ -75,7 +128,13 @@ def candidate_checks(
                 }
             )
             continue
-        actual = float(category_report["safety_failure_rate"])
+        limit = float(
+            clinical_limits.get(
+                f"{category}_failure_rate_max",
+                clinical_limits["terminology_failure_rate_max"],
+            )
+        )
+        actual = float(report["safety_failure_rate"])
         checks.append(
             {
                 "name": f"clinical_{category}_failure_rate",
@@ -103,9 +162,11 @@ def run_benchmark(
 ) -> dict[str, Any]:
     command = [
         sys.executable,
-        str(ROOT / "scripts" / "run_baseline_benchmarks.py"),
+        str(ROOT / "scripts/run_baseline_benchmarks.py"),
         "--task",
-        "mt",
+        "asr",
+        "--language",
+        "vi",
         "--model",
         BASE_MODEL,
         "--model-revision",
@@ -141,14 +202,14 @@ def run_benchmark(
             text=True,
             start_new_session=True,
         )
-        monitor_summary = monitor_process(
+        summary = monitor_process(
             process,
             output_dir / f"{name}_resource_monitor.jsonl",
             utilization_limits,
         )
-    if monitor_summary["return_code"] != 0:
-        raise subprocess.CalledProcessError(monitor_summary["return_code"], command)
-    return monitor_summary
+    if summary["return_code"] != 0:
+        raise subprocess.CalledProcessError(summary["return_code"], command)
+    return summary
 
 
 def main() -> int:
@@ -157,19 +218,21 @@ def main() -> int:
     parser.add_argument(
         "--test-manifest",
         type=Path,
-        default=ROOT / "data" / "processed" / "manifests" / "mt--test.jsonl",
+        default=ROOT / "data/processed/manifests/asr--test-local.jsonl",
     )
     parser.add_argument(
-        "--safety-manifest", type=Path, default=ROOT / "data" / "eval" / "medical_safety_mt.jsonl"
+        "--safety-manifest",
+        type=Path,
+        default=ROOT / "data/eval/medical_safety_asr_vi.jsonl",
     )
-    parser.add_argument("--config", type=Path, default=ROOT / "configs" / "accuracy_program.yaml")
-    parser.add_argument("--artifact-lock", type=Path, default=ROOT / "configs" / "artifact_lock.yaml")
-    parser.add_argument("--resource-config", type=Path, default=ROOT / "configs" / "gpu_rounds.yaml")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/accuracy_program.yaml")
+    parser.add_argument("--artifact-lock", type=Path, default=ROOT / "configs/artifact_lock.yaml")
+    parser.add_argument("--resource-config", type=Path, default=ROOT / "configs/gpu_rounds.yaml")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cuda")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="bf16")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-beams", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-beams", type=int, default=1)
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.35)
     args = parser.parse_args()
 
@@ -190,7 +253,9 @@ def main() -> int:
             raise FileNotFoundError(path)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    output_dir = (args.output_dir or ROOT / "data" / "reports" / "candidates" / f"mt-{stamp}").resolve()
+    output_dir = (
+        args.output_dir or ROOT / "data/reports/candidates" / f"asr-vi-{stamp}"
+    ).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     utilization_limits = yaml.safe_load(args.resource_config.read_text(encoding="utf-8"))["limits"]
@@ -198,7 +263,9 @@ def main() -> int:
         raise ValueError(
             "Candidate memory fraction must match the centrally configured GPU resource limit"
         )
-    suite_sha256 = validate_locked_suite(config, args.safety_manifest, args.artifact_lock)
+    locked_hashes = validate_locked_inputs(
+        config, args.test_manifest, args.safety_manifest, args.artifact_lock
+    )
 
     status = "error"
     error: str | None = None
@@ -208,7 +275,7 @@ def main() -> int:
         resources["aggregate"] = run_benchmark(
             adapter=args.adapter,
             manifest=args.test_manifest,
-            name="mt_candidate",
+            name="asr_vi_candidate",
             output_dir=output_dir,
             device=args.device,
             precision=args.precision,
@@ -220,7 +287,7 @@ def main() -> int:
         resources["clinical"] = run_benchmark(
             adapter=args.adapter,
             manifest=args.safety_manifest,
-            name="mt_clinical_candidate",
+            name="asr_vi_clinical_candidate",
             output_dir=output_dir,
             device=args.device,
             precision=args.precision,
@@ -231,8 +298,8 @@ def main() -> int:
         )
         checks = candidate_checks(
             config,
-            read_json(output_dir / "mt_candidate.json"),
-            read_json(output_dir / "mt_clinical_candidate.json"),
+            read_json(output_dir / "asr_vi_candidate.json"),
+            read_json(output_dir / "asr_vi_clinical_candidate.json"),
         )
         status = "pass" if all(check["pass"] for check in checks) else "fail"
     except Exception as exc:  # Preserve logs and a machine-readable failure artifact.
@@ -247,14 +314,15 @@ def main() -> int:
         "base_model_revision": BASE_REVISION,
         "test_manifest": str(args.test_manifest.resolve()),
         "locked_safety_manifest": str(args.safety_manifest.resolve()),
-        "locked_safety_sha256": suite_sha256,
+        "locked_hashes": locked_hashes,
         "checks": checks,
         "resource_limits": utilization_limits,
         "resource_runs": resources,
         "error": error,
         "policy": (
-            "Fine-tuning does not establish safety. Full aggregate MT quality and every locked "
-            "drug-name, dose, number, unit, negation, terminology, and code-switch slice must pass."
+            "Fine-tuning does not establish safety. Full Vietnamese WER, code-switch WER, and "
+            "every locked drug-name, dose, number, unit, negation, terminology, and "
+            "code-switch transcription-preservation slice must pass."
         ),
     }
     (output_dir / "candidate_gate.json").write_text(
