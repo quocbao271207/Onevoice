@@ -29,3 +29,14 @@ Ba archive đã được tải về `test/` ở máy local và xác minh lại S
 ## Hậu kiểm đã chuẩn bị
 
 `scripts/run_mt_candidate_suite.py` sẽ chạy ngay sau full-run. Script nạp adapter LoRA trên đúng NLLB revision đã pin, chấm toàn bộ `mt--test.jsonl` theo cả hai chiều, sau đó chấm riêng suite `medical_safety_mt.jsonl` đã xác minh checksum. Candidate chỉ pass khi BLEU/chrF đạt ngưỡng và đủ cả bảy slice `drug_name`, `dose`, `number`, `unit`, `negation`, `terminology`, `code_switch` với failure rate theo policy. Predictions, report, log và resource trace được đóng gói thành tar.gz kèm SHA-256 để tải về local ngay.
+
+## Full-run đang chạy
+
+Run `mt-20261004-172023/01-final-r8-lr1e4-full` dùng toàn bộ 339.028 cặp train, hai chiều và oversample lâm sàng hệ số 2, tổng 33.521 optimizer steps. Watcher checkpoint nguyên tử được bổ sung giữa run và đã chứng minh bắt được checkpoint mới, không chỉ xử lý checkpoint tồn tại sẵn.
+
+| Checkpoint | Eval loss trên 2.048 mẫu hai chiều | Archive bytes | SHA-256 |
+|---:|---:|---:|---|
+| 500 | 1.8476485013961792 | 18.777.533 | `3a483c3d8f0e57c6dc6ec94469c89da0ad23478797fb7d61625a0318fa492021` |
+| 1000 | **1.7338323593139648** | 18.755.502 | `3bfca366b1a8be5262aecb51bf8676e413e8bfd1ad22bd8aae947cdb83a8a66b` |
+
+Hai archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Eval loss sớm đang giảm nhưng chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn; promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.
