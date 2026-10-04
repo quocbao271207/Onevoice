@@ -40,6 +40,7 @@ class MTTrainingConfig:
     bf16: bool = False
     max_steps: int = -1
     resume_from_checkpoint: str | bool | None = None
+    initial_adapter: str | None = None
     limit_train_examples: int = 0
     limit_validation_examples: int = 0
     method: str = "full"
@@ -53,6 +54,7 @@ class MTTrainingConfig:
     eval_steps: int = 0
     save_steps: int = 0
     logging_steps: int = 50
+    early_stopping_patience: int = 4
 
 
 def direction_fields(direction: str) -> tuple[str, str, str, str]:
@@ -116,12 +118,14 @@ def preflight(config: MTTrainingConfig) -> dict[str, Any]:
             "effective_train_batch": config.per_device_train_batch_size * config.gradient_accumulation_steps,
         },
         "max_steps": config.max_steps,
+        "initial_adapter": config.initial_adapter,
         "method": config.method,
         "clinical_oversample_factor": config.clinical_oversample_factor,
         "cpu_smoke": config.cpu_smoke,
         "gpu_memory_fraction": config.gpu_memory_fraction,
         "eval_steps": config.eval_steps,
         "save_steps": config.save_steps,
+        "early_stopping_patience": config.early_stopping_patience,
         "dry_run_limits": {
             "train": config.limit_train_examples,
             "validation": config.limit_validation_examples,
@@ -136,6 +140,7 @@ def train(config: MTTrainingConfig) -> None:
         AutoModelForSeq2SeqLM,
         AutoTokenizer,
         DataCollatorForSeq2Seq,
+        EarlyStoppingCallback,
         Seq2SeqTrainer,
         Seq2SeqTrainingArguments,
         set_seed,
@@ -171,18 +176,27 @@ def train(config: MTTrainingConfig) -> None:
         local_files_only=config.local_files_only,
     )
     if config.method == "lora":
-        from peft import LoraConfig, TaskType, get_peft_model
+        if config.initial_adapter:
+            from peft import PeftModel
 
-        model = get_peft_model(
-            model,
-            LoraConfig(
-                task_type=TaskType.SEQ_2_SEQ_LM,
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                lora_dropout=config.lora_dropout,
-                target_modules=["q_proj", "v_proj"],
-            ),
-        )
+            model = PeftModel.from_pretrained(
+                model,
+                config.initial_adapter,
+                is_trainable=True,
+            )
+        else:
+            from peft import LoraConfig, TaskType, get_peft_model
+
+            model = get_peft_model(
+                model,
+                LoraConfig(
+                    task_type=TaskType.SEQ_2_SEQ_LM,
+                    r=config.lora_rank,
+                    lora_alpha=config.lora_alpha,
+                    lora_dropout=config.lora_dropout,
+                    target_modules=["q_proj", "v_proj"],
+                ),
+            )
         model.print_trainable_parameters()
 
     def tokenized_direction(rows: list[dict[str, Any]], direction: str) -> Dataset:
@@ -270,6 +284,7 @@ def train(config: MTTrainingConfig) -> None:
         eval_dataset=validation_dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model),
         processing_class=tokenizer,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)],
     )
     train_result = trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
     trainer.save_model(config.output_dir)
@@ -319,6 +334,7 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=-1, help="Use 100 for a billed GPU dry-run; -1 trains by epochs.")
     parser.add_argument("--precision", choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest")
+    parser.add_argument("--initial-adapter")
     parser.add_argument("--limit-train", type=int, default=0, help="Dry-run only; 0 uses the locked full manifest.")
     parser.add_argument("--limit-validation", type=int, default=0, help="Dry-run only; 0 uses the locked full manifest.")
     parser.add_argument("--preflight", action="store_true")
@@ -333,6 +349,7 @@ def main() -> int:
     parser.add_argument("--eval-steps", type=int, default=0)
     parser.add_argument("--save-steps", type=int, default=0)
     parser.add_argument("--logging-steps", type=int, default=50)
+    parser.add_argument("--early-stopping-patience", type=int, default=4)
     args = parser.parse_args()
     if min(args.batch_size, args.eval_batch_size, args.gradient_accumulation_steps) < 1:
         parser.error("batch sizes and gradient accumulation must be at least 1")
@@ -344,10 +361,18 @@ def main() -> int:
         parser.error("--lora-dropout must be in [0, 1)")
     if args.cpu_smoke and args.method != "lora":
         parser.error("--cpu-smoke requires --method lora")
+    if args.initial_adapter and args.method != "lora":
+        parser.error("--initial-adapter requires --method lora")
+    if args.initial_adapter and not (
+        Path(args.initial_adapter) / "adapter_config.json"
+    ).is_file():
+        parser.error("--initial-adapter must contain adapter_config.json")
     if not 0.0 < args.gpu_memory_fraction <= 0.40:
         parser.error("--gpu-memory-fraction must be in (0, 0.40]")
     if min(args.eval_steps, args.save_steps, args.logging_steps) < 0 or args.logging_steps == 0:
         parser.error("step intervals must be non-negative and logging steps must be positive")
+    if args.early_stopping_patience < 1:
+        parser.error("--early-stopping-patience must be positive")
     config = MTTrainingConfig(
         base_model=args.base_model,
         base_model_revision=args.base_model_revision,
@@ -365,6 +390,7 @@ def main() -> int:
         fp16=args.precision == "fp16",
         bf16=args.precision == "bf16",
         resume_from_checkpoint=(True if args.resume_from_checkpoint == "latest" else args.resume_from_checkpoint),
+        initial_adapter=args.initial_adapter,
         limit_train_examples=args.limit_train,
         limit_validation_examples=args.limit_validation,
         method=args.method,
@@ -378,6 +404,7 @@ def main() -> int:
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
+        early_stopping_patience=args.early_stopping_patience,
     )
     if args.preflight:
         print(json.dumps(preflight(config), ensure_ascii=False, indent=2))

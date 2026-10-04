@@ -5,10 +5,13 @@ from pathlib import Path
 import pytest
 
 from scripts.run_gpu_program import (
+    latest_checkpoint,
     newest_complete_run,
     read_complete_run,
     run_stage,
     selected_adapter,
+    should_extend_mt,
+    validation_history,
     write_state,
 )
 
@@ -70,3 +73,40 @@ def test_run_stage_accepts_candidate_gate_failure_as_evidence(tmp_path: Path):
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     assert persisted["stages"]["candidate"]["status"] == "complete"
     assert persisted["stages"]["candidate"]["return_code"] == 2
+
+
+def test_mt_extension_uses_recent_validation_trend_only(tmp_path: Path):
+    model = tmp_path / "model"
+    checkpoint = model / "checkpoint-3500"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "log_history": [
+                    {"step": 2000, "eval_loss": 1.66},
+                    {"step": 2500, "eval_loss": 1.64},
+                    {"step": 3000, "eval_loss": 1.62},
+                    {"step": 3500, "eval_loss": 1.60},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert latest_checkpoint(model) == checkpoint
+    extend, evidence = should_extend_mt(validation_history(checkpoint))
+    assert extend is True
+    assert evidence["best_is_latest"] is True
+    assert evidence["monotonic"] is True
+
+
+def test_mt_extension_stops_on_validation_plateau():
+    extend, evidence = should_extend_mt(
+        [
+            {"step": 2000.0, "metric": 1.60},
+            {"step": 2500.0, "metric": 1.59},
+            {"step": 3000.0, "metric": 1.591},
+            {"step": 3500.0, "metric": 1.5905},
+        ]
+    )
+    assert extend is False
+    assert evidence["reason"] == "validation_plateau_or_regression"

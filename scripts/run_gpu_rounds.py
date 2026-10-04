@@ -168,6 +168,51 @@ def configured_rounds(
     return rounds[: max_rounds or None]
 
 
+def apply_round_overrides(
+    rounds: list[dict[str, Any]],
+    *,
+    round_name: str | None,
+    resume_from_checkpoint: Path | None,
+    initial_adapter: Path | None,
+    epochs: float | None,
+    learning_rate: float | None,
+) -> list[dict[str, Any]]:
+    if (
+        resume_from_checkpoint is None
+        and initial_adapter is None
+        and epochs is None
+        and learning_rate is None
+    ):
+        return rounds
+    if not round_name or len(rounds) != 1:
+        raise ValueError("continuation overrides require --round-name")
+    if resume_from_checkpoint and not (resume_from_checkpoint / "trainer_state.json").is_file():
+        raise ValueError("--resume-from-checkpoint must contain trainer_state.json")
+    if initial_adapter and not (initial_adapter / "adapter_config.json").is_file():
+        raise ValueError("--initial-adapter must contain adapter_config.json")
+    if epochs is not None and epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if learning_rate is not None and learning_rate <= 0:
+        raise ValueError("--learning-rate must be positive")
+    return [
+        {
+            **rounds[0],
+            **(
+                {"resume_from_checkpoint": str(resume_from_checkpoint.resolve())}
+                if resume_from_checkpoint
+                else {}
+            ),
+            **(
+                {"initial_adapter": str(initial_adapter.resolve())}
+                if initial_adapter
+                else {}
+            ),
+            **({"epochs": epochs} if epochs is not None else {}),
+            **({"learning_rate": learning_rate} if learning_rate is not None else {}),
+        }
+    ]
+
+
 def select_completed_round(
     results: list[dict[str, Any]],
     greater_is_better: bool,
@@ -315,6 +360,26 @@ def main() -> int:
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--max-rounds", type=int, default=0, help="0 runs every configured round.")
     parser.add_argument("--round-name", help="Run exactly one named round so its archive can be downloaded immediately.")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=Path,
+        help="Resume one explicitly selected round from a completed Trainer checkpoint.",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=float,
+        help="Override epochs for one explicitly selected round, for validation-driven continuation.",
+    )
+    parser.add_argument(
+        "--initial-adapter",
+        type=Path,
+        help="Warm-start one selected LoRA round with a completed adapter and fresh optimizer.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        help="Override learning rate for one explicitly selected round.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -329,6 +394,14 @@ def main() -> int:
         raise ValueError("boosted utilization must be above daytime limit and at most 100")
     task = config["tasks"][args.task]
     rounds = configured_rounds(task, args.max_rounds, args.round_name)
+    rounds = apply_round_overrides(
+        rounds,
+        round_name=args.round_name,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        initial_adapter=args.initial_adapter,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+    )
     adaptive_spec = (
         task.get("adaptive_final") if not args.round_name and args.max_rounds == 0 else None
     )

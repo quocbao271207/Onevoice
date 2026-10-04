@@ -77,6 +77,63 @@ def selected_adapter(run_root: Path, summary: dict[str, Any]) -> Path:
     return adapter
 
 
+def checkpoint_step(path: Path) -> int:
+    try:
+        return int(path.name.rsplit("-", 1)[1])
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f"invalid checkpoint directory name: {path}") from exc
+
+
+def latest_checkpoint(model_dir: Path) -> Path:
+    checkpoints = [
+        path
+        for path in model_dir.glob("checkpoint-*")
+        if path.is_dir() and (path / "trainer_state.json").is_file()
+    ]
+    if not checkpoints:
+        raise FileNotFoundError(f"no resumable checkpoint under {model_dir}")
+    return max(checkpoints, key=checkpoint_step)
+
+
+def validation_history(checkpoint: Path, metric_name: str = "eval_loss") -> list[dict[str, float]]:
+    trainer_state = json.loads((checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
+    history = [
+        {"step": float(item["step"]), "metric": float(item[metric_name])}
+        for item in trainer_state.get("log_history", [])
+        if item.get("step") is not None and item.get(metric_name) is not None
+    ]
+    return sorted(history, key=lambda item: item["step"])
+
+
+def should_extend_mt(
+    history: list[dict[str, float]],
+    *,
+    recent_points: int = 4,
+    minimum_relative_gain: float = 0.003,
+) -> tuple[bool, dict[str, Any]]:
+    """Continue only when recent validation—not locked test—still improves."""
+    if len(history) < recent_points:
+        return False, {"reason": "insufficient_validation_points", "points": len(history)}
+    recent = history[-recent_points:]
+    start = recent[0]["metric"]
+    end = recent[-1]["metric"]
+    relative_gain = (start - end) / max(abs(start), 1e-12)
+    best_is_latest = end == min(item["metric"] for item in history)
+    monotonic = all(
+        current["metric"] < previous["metric"]
+        for previous, current in zip(recent, recent[1:])
+    )
+    decision = best_is_latest and monotonic and relative_gain >= minimum_relative_gain
+    return decision, {
+        "reason": "recent_validation_improving" if decision else "validation_plateau_or_regression",
+        "recent": recent,
+        "relative_gain": relative_gain,
+        "minimum_relative_gain": minimum_relative_gain,
+        "best_is_latest": best_is_latest,
+        "monotonic": monotonic,
+    }
+
+
 def run_stage(
     *,
     name: str,
@@ -135,6 +192,11 @@ def main() -> int:
     parser.add_argument("--wait-pid", type=int)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume only a previously recorded waiting_for_mt state.",
+    )
     args = parser.parse_args()
 
     if args.poll_seconds <= 0:
@@ -144,19 +206,30 @@ def main() -> int:
 
     state_dir = args.state_dir.resolve()
     mt_run = args.mt_run.resolve()
-    state_dir.mkdir(parents=True, exist_ok=False)
     state_path = state_dir / "program_state.json"
-    state: dict[str, Any] = {
-        "created_at": utc_now(),
-        "execution_status": "running",
-        "promotion_allowed": False,
-        "mt_run": str(mt_run),
-        "resource_policy": (
-            "One GPU child at a time; every trainer/evaluator enforces the central 35% allocation, "
-            "40% hard memory stop, and scheduled utilization limits."
-        ),
-        "stages": {},
-    }
+    if args.resume:
+        if not state_path.is_file():
+            raise FileNotFoundError(f"cannot resume without {state_path}")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if Path(state.get("mt_run", "")).resolve() != mt_run:
+            raise ValueError("resume --mt-run does not match recorded state")
+        if state.get("stage") != "waiting_for_mt" or state.get("stages"):
+            raise ValueError("automatic resume is only safe from an idle waiting_for_mt state")
+        state["execution_status"] = "running"
+        state.pop("error", None)
+    else:
+        state_dir.mkdir(parents=True, exist_ok=False)
+        state = {
+            "created_at": utc_now(),
+            "execution_status": "running",
+            "promotion_allowed": False,
+            "mt_run": str(mt_run),
+            "resource_policy": (
+                "One GPU child at a time; every trainer/evaluator enforces the central 35% allocation, "
+                "40% hard memory stop, and scheduled utilization limits."
+            ),
+            "stages": {},
+        }
     write_state(state_path, state)
 
     try:
@@ -165,6 +238,47 @@ def main() -> int:
 
         mt_summary = read_complete_run(mt_run, "mt")
         mt_adapter = selected_adapter(mt_run, mt_summary)
+        resume_checkpoint = latest_checkpoint(mt_adapter)
+        extend_mt, extension_evidence = should_extend_mt(
+            validation_history(resume_checkpoint)
+        )
+        state["mt_extension_decision"] = {
+            "extend": extend_mt,
+            "evidence_checkpoint": str(resume_checkpoint),
+            "initial_adapter": str(mt_adapter),
+            **extension_evidence,
+        }
+        if extend_mt:
+            extension_output_root = state_dir / "mt-extension-runs"
+            extension_output_root.mkdir()
+            run_stage(
+                name="mt_validation_extension",
+                command=[
+                    args.python,
+                    str(ROOT / "scripts" / "run_gpu_rounds.py"),
+                    "--task",
+                    "mt",
+                    "--config",
+                    str(ROOT / "configs" / "gpu_rounds.yaml"),
+                    "--output-root",
+                    str(extension_output_root),
+                    "--round-name",
+                    "final-r8-lr1e4-full",
+                    "--initial-adapter",
+                    str(mt_adapter),
+                    "--epochs",
+                    "2",
+                    "--learning-rate",
+                    "5e-5",
+                ],
+                log_path=state_dir / "mt_validation_extension_stage.log",
+                state_path=state_path,
+                state=state,
+                accepted_codes={0},
+            )
+            extension_run, extension_summary = newest_complete_run(extension_output_root, "mt")
+            mt_adapter = selected_adapter(extension_run, extension_summary)
+            state["mt_extension_run"] = str(extension_run)
         state["mt_adapter"] = str(mt_adapter)
         write_state(state_path, state)
 

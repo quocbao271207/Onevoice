@@ -9,6 +9,7 @@ import yaml
 
 from scripts.run_gpu_rounds import (
     active_utilization_limits,
+    apply_round_overrides,
     checkpoint_watcher_command,
     cli_args,
     configured_rounds,
@@ -62,6 +63,45 @@ def test_gpu_pilots_bound_preprocessing_without_shrinking_final_run_policy():
 def test_gpu_rounds_can_select_one_named_round_for_immediate_download():
     task = {"rounds": [{"name": "one"}, {"name": "two"}]}
     assert configured_rounds(task, round_name="two") == [{"name": "two"}]
+
+
+def test_gpu_round_can_resume_selected_round_with_extended_epoch_budget(tmp_path: Path):
+    checkpoint = tmp_path / "checkpoint-100"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text("{}", encoding="utf-8")
+    result = apply_round_overrides(
+        [{"name": "final", "epochs": 1.0, "max_steps": -1}],
+        round_name="final",
+        resume_from_checkpoint=checkpoint,
+        initial_adapter=None,
+        epochs=3.0,
+        learning_rate=None,
+    )
+    assert result == [
+        {
+            "name": "final",
+            "epochs": 3.0,
+            "max_steps": -1,
+            "resume_from_checkpoint": str(checkpoint.resolve()),
+        }
+    ]
+
+
+def test_gpu_round_can_warm_start_adapter_with_fresh_lower_learning_rate(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    result = apply_round_overrides(
+        [{"name": "final", "epochs": 1.0, "learning_rate": 1e-4}],
+        round_name="final",
+        resume_from_checkpoint=None,
+        initial_adapter=adapter,
+        epochs=2.0,
+        learning_rate=5e-5,
+    )
+    assert result[0]["initial_adapter"] == str(adapter.resolve())
+    assert result[0]["epochs"] == 2.0
+    assert result[0]["learning_rate"] == 5e-5
 
 
 def test_mt_full_round_uses_selected_pilot_and_all_training_rows():
