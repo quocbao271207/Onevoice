@@ -118,6 +118,7 @@ def test_adaptive_selection_ignores_failed_and_out_of_scope_rounds():
 
 def test_asr_adaptive_final_preserves_effective_batch_and_uses_full_train():
     config = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))
+    assert config["tasks"]["asr"]["common_args"]["limit_validation"] == 512
     adaptive = config["tasks"]["asr"]["adaptive_final"]
     overrides = adaptive["overrides"]
     assert overrides["limit_train"] == 0

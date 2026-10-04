@@ -79,7 +79,7 @@ tasks:
       gradient_accumulation_steps: 32
       clinical_oversample_factor: 2
       limit_train: 6144
-      limit_validation: 64
+      limit_validation: 512
       eval_steps: 50
       save_steps: 50
       logging_steps: 10
