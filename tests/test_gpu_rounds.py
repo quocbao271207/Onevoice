@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -128,6 +129,15 @@ def test_asr_adaptive_final_preserves_effective_batch_and_uses_full_train():
         "pilot-r16-lr5e5",
         "pilot-r32-lr2e5",
     }
+
+
+def test_asr_pilot_validation_window_covers_medical_and_code_switch_sources():
+    manifest = ROOT / "data" / "processed" / "manifests" / "asr--validation-local.jsonl"
+    with manifest.open(encoding="utf-8") as handle:
+        rows = [json.loads(next(handle)) for _ in range(512)]
+    assert {row["source"] for row in rows} == {"vietmed", "vimedcss"}
+    assert {row["language"] for row in rows} == {"vi", "vi-code-switch"}
+    assert sum(row["language"] == "vi-code-switch" for row in rows) >= 128
 
 
 def test_gpu_round_starts_checkpoint_watcher_for_the_training_pid(tmp_path: Path):
