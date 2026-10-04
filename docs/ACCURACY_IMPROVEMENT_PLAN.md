@@ -41,7 +41,7 @@ CPU smoke ghi `promotion_allowed=false` trong `training_run.json`. Chỉ checkpo
 
 ## Điều phối GPU theo giờ
 
-`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp.
+`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Pilot chỉ tokenize tập ưu tiên lâm sàng đủ lớn cho số bước cấu hình (MT 8.192, ASR 6.144) để tránh lãng phí CPU; full-run được chọn sau pilot vẫn dùng toàn bộ dữ liệu khóa. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp.
 
 ## Backup và phục hồi
 

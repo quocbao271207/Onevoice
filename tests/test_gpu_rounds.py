@@ -43,3 +43,9 @@ def test_gpu_round_cli_args_preserve_false_and_skip_none():
         "lora",
         "--enabled",
     ]
+
+
+def test_gpu_pilots_bound_preprocessing_without_shrinking_final_run_policy():
+    config = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))
+    assert config["tasks"]["mt"]["common_args"]["limit_train"] == 8192
+    assert config["tasks"]["asr"]["common_args"]["limit_train"] == 6144

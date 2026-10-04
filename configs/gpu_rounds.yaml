@@ -26,6 +26,7 @@ tasks:
       eval_batch_size: 2
       gradient_accumulation_steps: 16
       clinical_oversample_factor: 2
+      limit_train: 8192
       limit_validation: 256
       eval_steps: 50
       save_steps: 50
@@ -61,6 +62,7 @@ tasks:
       eval_batch_size: 1
       gradient_accumulation_steps: 32
       clinical_oversample_factor: 2
+      limit_train: 6144
       limit_validation: 64
       eval_steps: 50
       save_steps: 50
