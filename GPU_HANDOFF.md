@@ -111,7 +111,7 @@ The ASR command runs the three configured pilots, selects the lowest completed v
 When an MT full-run is already active, schedule the remaining program once instead of launching later stages by hand:
 
 ```bash
-nohup .venv-onevoice/bin/python scripts/run_gpu_program.py \
+nohup ../.venv-onevoice/bin/python scripts/run_gpu_program.py \
   --state-dir gpu-runs/program-YYYYMMDD-HHMMSS \
   --mt-run gpu-runs/mt-YYYYMMDD-HHMMSS \
   --wait-pid MT_CONTROLLER_PID \
