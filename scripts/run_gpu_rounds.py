@@ -106,6 +106,27 @@ def cli_args(values: dict[str, Any]) -> list[str]:
     return output
 
 
+def checkpoint_watcher_command(
+    python: str,
+    model_dir: Path,
+    archive_dir: Path,
+    training_pid: int,
+    poll_seconds: float,
+) -> list[str]:
+    return [
+        python,
+        str(ROOT / "scripts" / "watch_checkpoints.py"),
+        "--model-dir",
+        str(model_dir),
+        "--archive-dir",
+        str(archive_dir),
+        "--watch-pid",
+        str(training_pid),
+        "--poll-seconds",
+        str(poll_seconds),
+    ]
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -258,6 +279,7 @@ def main() -> int:
         round_dir = run_root / f"{index:02d}-{name}"
         model_dir = round_dir / "model"
         round_dir.mkdir(parents=True)
+        model_dir.mkdir()
         values = {
             **task.get("common_args", {}),
             **{key: value for key, value in round_config.items() if key != "name"},
@@ -273,6 +295,8 @@ def main() -> int:
             continue
         log_path = round_dir / "training.log"
         monitor_path = round_dir / "resource_monitor.jsonl"
+        checkpoint_archive_dir = run_root / "checkpoint-archives" / round_dir.name
+        watcher_log_path = round_dir / "checkpoint_watcher.log"
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
                 command,
@@ -282,23 +306,58 @@ def main() -> int:
                 text=True,
                 start_new_session=True,
             )
-            monitor_summary = monitor_process(process, monitor_path, limits)
+            watcher_command = checkpoint_watcher_command(
+                args.python,
+                model_dir,
+                checkpoint_archive_dir,
+                process.pid,
+                float(limits.get("checkpoint_archive_poll_seconds", 15.0)),
+            )
+            with watcher_log_path.open("w", encoding="utf-8") as watcher_log:
+                watcher = subprocess.Popen(
+                    watcher_command,
+                    cwd=ROOT,
+                    stdout=watcher_log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                try:
+                    monitor_summary = monitor_process(process, monitor_path, limits)
+                finally:
+                    try:
+                        watcher.wait(timeout=90)
+                    except subprocess.TimeoutExpired:
+                        watcher.terminate()
+                        try:
+                            watcher.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            watcher.kill()
+                            watcher.wait(timeout=10)
+            watcher_summary = {
+                "return_code": watcher.returncode,
+                "archive_dir": str(checkpoint_archive_dir),
+                "manifest": str(checkpoint_archive_dir / "checkpoint_archives.json"),
+                "log": str(watcher_log_path),
+            }
         report_path = model_dir / "training_run.json"
         report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+        training_complete = monitor_summary["return_code"] == 0
+        watcher_complete = watcher_summary["return_code"] == 0
         result = {
             "name": name,
-            "status": "complete" if monitor_summary["return_code"] == 0 else "failed",
+            "status": "complete" if training_complete and watcher_complete else "failed",
             "monitor": monitor_summary,
+            "checkpoint_watcher": watcher_summary,
             "metric": metric_from_report(report, task["selection_metric"]),
             "metric_name": task["selection_metric"],
         }
-        if monitor_summary["return_code"] == 0:
+        if training_complete:
             result["archive"] = archive_round(round_dir)
         summary["rounds"].append(result)
         (run_root / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        if monitor_summary["return_code"] != 0:
+        if not training_complete or not watcher_complete:
             break
 
     completed = [item for item in summary["rounds"] if item.get("status") == "complete" and item.get("metric") is not None]

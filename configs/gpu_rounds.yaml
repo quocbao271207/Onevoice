@@ -6,6 +6,7 @@ limits:
   resume_percent: 24.0
   sample_seconds: 2.0
   rolling_samples: 10
+  checkpoint_archive_poll_seconds: 15.0
   boosted_window:
     timezone: Asia/Bangkok
     start_hour: 2

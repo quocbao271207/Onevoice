@@ -6,7 +6,12 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from scripts.run_gpu_rounds import active_utilization_limits, cli_args, configured_rounds
+from scripts.run_gpu_rounds import (
+    active_utilization_limits,
+    checkpoint_watcher_command,
+    cli_args,
+    configured_rounds,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,3 +68,15 @@ def test_mt_full_round_uses_selected_pilot_and_all_training_rows():
     assert final["learning_rate"] == 1.0e-4
     assert final["limit_train"] == 0
     assert final["batch_size"] * final["gradient_accumulation_steps"] == 32
+
+
+def test_gpu_round_starts_checkpoint_watcher_for_the_training_pid(tmp_path: Path):
+    command = checkpoint_watcher_command(
+        "python",
+        tmp_path / "model",
+        tmp_path / "archives",
+        training_pid=123,
+        poll_seconds=15.0,
+    )
+    assert command[-4:] == ["--watch-pid", "123", "--poll-seconds", "15.0"]
+    assert Path(command[1]).name == "watch_checkpoints.py"
