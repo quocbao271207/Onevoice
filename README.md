@@ -15,6 +15,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/run_baseline_benchmarks.py` — baseline ASR VI/EN và MT trên tập khóa
 - `scripts/run_asr_candidate_suite.py` — chấm LoRA ASR Việt trên full test, code-switch và clinical audio suite, fail-closed
 - `scripts/run_mt_candidate_suite.py` — chấm LoRA MT trên full locked test + clinical suite, fail-closed và tạo archive checksum
+- `scripts/run_gpu_program.py` — nối tuần tự MT gate → ASR pilots/full-data → ASR gate, lưu state nguyên tử và không chạy hai GPU child đồng thời
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board

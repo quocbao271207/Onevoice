@@ -108,6 +108,18 @@ python scripts/run_gpu_rounds.py --task asr --config configs/gpu_rounds.yaml --o
 
 The ASR command runs the three configured pilots, selects the lowest completed validation WER, inherits its learning rate and LoRA parameters, then appends `final-selected-full` automatically. That final candidate uses all training rows, 512 validation rows, three epochs and effective batch 32. It is a full-data LoRA fine-tune, not a full-parameter fine-tune. Every checkpoint and completed round is archived with SHA-256 evidence before the next model may start.
 
+When an MT full-run is already active, schedule the remaining program once instead of launching later stages by hand:
+
+```bash
+nohup .venv-onevoice/bin/python scripts/run_gpu_program.py \
+  --state-dir gpu-runs/program-YYYYMMDD-HHMMSS \
+  --mt-run gpu-runs/mt-YYYYMMDD-HHMMSS \
+  --wait-pid MT_CONTROLLER_PID \
+  > gpu-runs/program-YYYYMMDD-HHMMSS.launcher.log 2>&1 &
+```
+
+The orchestrator waits without using the GPU, verifies the completed MT summary and selected adapter, runs the full locked MT candidate suite, then runs ASR pilots → automatically selected full-data ASR → full locked ASR candidate suite. Candidate exit code 2 is recorded as a valid gate failure and does not prevent the independent ASR training from running; infrastructure/training errors stop the chain fail-closed. `program_state.json` is written atomically before and after every stage. Completion of the chain is not the same as promotion: `promotion_allowed` is true only when both candidate suites pass.
+
 ## Legacy manual 100-step billed dry-runs
 
 The limits avoid preprocessing all data merely to test VRAM and throughput.
