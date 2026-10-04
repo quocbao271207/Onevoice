@@ -52,5 +52,6 @@ Run `mt-20261004-172023/01-final-r8-lr1e4-full` dùng toàn bộ 339.028 cặp t
 | 6500 | **1.5568325519561768** | 18.747.633 | `13ff488d5cc47d5937f7c4e0aede7570c597cb90659cae3b30eec3b0eafd9d96` |
 | 7000 | **1.549607276916504** | 18.748.176 | `24c0172be85ce911a4a0a6e50404646918da325a64cb7b9213d9d0aafa5188e3` |
 | 7500 | **1.5457360744476318** | 18.750.238 | `dedbd421ed532caadfb22661dbfa49e070fef45260432dc125af8bad8b95b79e` |
+| 8000 | **1.541010856628418** | 18.751.843 | `da3a1ce2ca998bfa19f019fd770ae2ec87ef00d9e12005b7d5893a4eeddddfdc` |
 
-Mười lăm archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Các checkpoint mới còn được đọc lại cấu trúc để xác nhận có adapter, optimizer, scheduler, RNG và trainer state. Eval loss sớm đang giảm nhưng chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn; promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.
+Mười sáu archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Các checkpoint mới còn được đọc lại cấu trúc để xác nhận có adapter, optimizer, scheduler, RNG và trainer state. Eval loss sớm đang giảm nhưng chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn; promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.
