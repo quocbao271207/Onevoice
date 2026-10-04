@@ -62,3 +62,4 @@ def test_mt_full_round_uses_selected_pilot_and_all_training_rows():
     assert final["lora_rank"] == 8
     assert final["learning_rate"] == 1.0e-4
     assert final["limit_train"] == 0
+    assert final["batch_size"] * final["gradient_accumulation_steps"] == 32

@@ -22,6 +22,6 @@ Model nền: `facebook/nllb-200-distilled-600M@f8d333a098d19b4fd9a8b18f94170487a
 
 ## Quyết định
 
-Chọn `r8/α16, lr=1e-4` cho full-run vì có validation loss thấp nhất, adapter nhỏ nhất và chi phí thấp nhất. `configs/gpu_rounds.yaml` có round `final-r8-lr1e4-full`: dùng toàn bộ train, một epoch, validation giữa kỳ 1.024 hàng để kiểm soát thời gian. Sau huấn luyện phải chạy locked validation/test đầy đủ và suite lâm sàng riêng cho tên thuốc, liều lượng, số, đơn vị, phủ định và code-switch. Fine-tune không phải bằng chứng an toàn và checkpoint không được promotion nếu các gate này chưa đạt.
+Chọn `r8/α16, lr=1e-4` cho full-run vì có validation loss thấp nhất, adapter nhỏ nhất và chi phí thấp nhất. `configs/gpu_rounds.yaml` có round `final-r8-lr1e4-full`: dùng toàn bộ train, một epoch, batch/device 4 và accumulation 8 (effective batch vẫn 32), validation giữa kỳ 1.024 hàng để kiểm soát thời gian. Cấu hình 4×8 thay thế 2×16 sau probe đầu full-run vì 2×16 chỉ dùng khoảng 15–23% GPU và tạo ETA hơn 30 giờ. Sau huấn luyện phải chạy locked validation/test đầy đủ và suite lâm sàng riêng cho tên thuốc, liều lượng, số, đơn vị, phủ định và code-switch. Fine-tune không phải bằng chứng an toàn và checkpoint không được promotion nếu các gate này chưa đạt.
 
 Ba archive đã được tải về `test/` ở máy local và xác minh lại SHA-256.

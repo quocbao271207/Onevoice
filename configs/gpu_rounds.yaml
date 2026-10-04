@@ -54,6 +54,9 @@ tasks:
         max_steps: -1
         epochs: 1.0
         learning_rate: 1.0e-4
+        batch_size: 4
+        eval_batch_size: 4
+        gradient_accumulation_steps: 8
         lora_rank: 8
         lora_alpha: 16
         lora_dropout: 0.05
