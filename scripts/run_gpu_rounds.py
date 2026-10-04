@@ -134,6 +134,19 @@ def metric_from_report(report: dict[str, Any], name: str) -> float | None:
     return None
 
 
+def configured_rounds(
+    task: dict[str, Any], max_rounds: int = 0, round_name: str | None = None
+) -> list[dict[str, Any]]:
+    rounds = list(task["rounds"])
+    if round_name:
+        selected = [item for item in rounds if item["name"] == round_name]
+        if not selected:
+            available = ", ".join(str(item["name"]) for item in rounds)
+            raise ValueError(f"Unknown round {round_name!r}; available rounds: {available}")
+        return selected
+    return rounds[: max_rounds or None]
+
+
 def monitor_process(
     process: subprocess.Popen[str],
     monitor_path: Path,
@@ -215,6 +228,7 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, default=ROOT / "gpu-runs")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--max-rounds", type=int, default=0, help="0 runs every configured round.")
+    parser.add_argument("--round-name", help="Run exactly one named round so its archive can be downloaded immediately.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -228,7 +242,7 @@ def main() -> int:
     if boosted and not float(limits["utilization_percent"]) < float(boosted["utilization_percent"]) <= 100.0:
         raise ValueError("boosted utilization must be above daytime limit and at most 100")
     task = config["tasks"][args.task]
-    rounds = task["rounds"][: args.max_rounds or None]
+    rounds = configured_rounds(task, args.max_rounds, args.round_name)
     run_root = args.output_root.resolve() / f"{args.task}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     run_root.mkdir(parents=True, exist_ok=False)
     summary: dict[str, Any] = {

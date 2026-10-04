@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from scripts.run_gpu_rounds import active_utilization_limits, cli_args
+from scripts.run_gpu_rounds import active_utilization_limits, cli_args, configured_rounds
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,3 +49,8 @@ def test_gpu_pilots_bound_preprocessing_without_shrinking_final_run_policy():
     config = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))
     assert config["tasks"]["mt"]["common_args"]["limit_train"] == 8192
     assert config["tasks"]["asr"]["common_args"]["limit_train"] == 6144
+
+
+def test_gpu_rounds_can_select_one_named_round_for_immediate_download():
+    task = {"rounds": [{"name": "one"}, {"name": "two"}]}
+    assert configured_rounds(task, round_name="two") == [{"name": "two"}]
