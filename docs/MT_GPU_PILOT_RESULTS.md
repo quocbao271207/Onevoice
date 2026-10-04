@@ -10,6 +10,7 @@ Model nền: `facebook/nllb-200-distilled-600M@f8d333a098d19b4fd9a8b18f94170487a
 - 8.192 hàng train ưu tiên lâm sàng, oversample risk factor 2, hai chiều EN↔VI.
 - 256 hàng validation, 200 optimizer steps, eval/save mỗi 50 steps.
 - Process CUDA giới hạn 35% VRAM; rolling utilization ban ngày 38%, 02:00–09:00 Asia/Bangkok 75%.
+- Runtime monitor đã tự chuyển `active_utilization_limit_percent` từ 38 sang 75 và `boosted_window` từ false sang true lúc `2026-10-05T02:00:13+07:00`, không restart trainer.
 - Cả ba vòng có 0 lần throttle và không vượt giới hạn đã cấu hình.
 
 ## So sánh
