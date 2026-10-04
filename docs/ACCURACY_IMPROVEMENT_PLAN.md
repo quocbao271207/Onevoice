@@ -12,9 +12,9 @@ Baseline đang dùng làm mốc: ASR Việt WER 20,87%, ASR Anh WER 25,54%, MT B
 
 1. Khóa dữ liệu và leakage: giữ test/clinical suite ngoài train, checksum manifest, speaker/recording/audio-hash split cho ASR và exact-pair split cho MT.
 2. Nâng dữ liệu train: ưu tiên có kiểm soát các hàng chứa thuốc, liều, số, đơn vị, phủ định, thuật ngữ chuyên khoa và code-switch; chỉ oversample train với hệ số 2, không nhân validation/test.
-3. ASR Việt: chạy LoRA để tìm learning rate/batch/augmentation rẻ hơn, sau đó full fine-tune PhoWhisper-small từ cấu hình tốt nhất; chọn checkpoint theo WER validation và theo slice code-switch/clinical token preservation.
+3. ASR Việt: chạy ba pilot LoRA để chọn learning rate/rank theo WER validation, sau đó tự động chạy LoRA full-data ba epoch từ cấu hình tốt nhất; chỉ thử full-parameter fine-tune như một candidate riêng nếu tài nguyên và locked evaluation chứng minh có lợi. Chọn checkpoint cuối theo WER validation và các slice code-switch/clinical token preservation, không theo test.
 4. ASR Anh: không train trên Eka test. Chỉ fine-tune khi có corpus train y tế tiếng Anh có license và speaker split; trước đó dùng distil-small.en và theo dõi WER riêng.
-5. MT: LoRA joint EN↔VI để tìm cấu hình, sau đó full fine-tune NLLB trên MedEV train; giữ greedy nếu validation tiếp tục tốt hơn beam. Không dùng test để chọn checkpoint.
+5. MT: LoRA joint EN↔VI để tìm cấu hình, sau đó chạy candidate full-data NLLB trên MedEV train; giữ greedy nếu validation tiếp tục tốt hơn beam. Không dùng test để chọn checkpoint và không gọi LoRA full-data là full-parameter fine-tune.
 6. Chạy suite lâm sàng khóa hai chiều. Bất kỳ lỗi thuốc/liều/số/đơn vị/phủ định/thuật ngữ nào đều chặn release và được định tuyến fail-closed.
 7. Chạy parity sau quantization, sau đó benchmark QCS6490 thật. Không suy ra accuracy/latency on-device từ CPU hoặc cloud profile.
 
@@ -48,7 +48,7 @@ CPU smoke ghi `promotion_allowed=false` trong `training_run.json`. Chỉ checkpo
 
 ## Điều phối GPU theo giờ
 
-`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Pilot chỉ tokenize tập ưu tiên lâm sàng đủ lớn cho số bước cấu hình (MT 8.192, ASR 6.144) để tránh lãng phí CPU; full-run được chọn sau pilot vẫn dùng toàn bộ dữ liệu khóa. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp. `scripts/watch_checkpoints.py` chạy cạnh từng round, chỉ nhận checkpoint khi `trainer_state.global_step` khớp tên thư mục và đủ model/optimizer/scheduler/RNG, sau đó tạo tar.gz nguyên tử, đọc lại cấu trúc và sinh sidecar SHA-256. Hậu kiểm candidate dùng lại chính bộ điều tiết GPU này, nên việc tăng công suất ban đêm không bỏ qua giới hạn tài nguyên.
+`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Pilot chỉ tokenize tập ưu tiên lâm sàng đủ lớn cho số bước cấu hình (MT 8.192, ASR 6.144) để tránh lãng phí CPU. Với ASR, controller chọn pilot có `eval_wer` thấp nhất, kế thừa learning rate/rank/alpha/dropout rồi tự nối vòng `final-selected-full`: toàn bộ train, 512 validation, ba epoch, effective batch 32. MT full-data dùng cấu hình đã khóa riêng. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp. `scripts/watch_checkpoints.py` chạy cạnh từng round, chỉ nhận checkpoint khi `trainer_state.global_step` khớp tên thư mục và đủ model/optimizer/scheduler/RNG, sau đó tạo tar.gz nguyên tử, đọc lại cấu trúc và sinh sidecar SHA-256. Hậu kiểm candidate dùng lại chính bộ điều tiết GPU này, nên việc tăng công suất ban đêm không bỏ qua giới hạn tài nguyên.
 
 ## Backup và phục hồi
 

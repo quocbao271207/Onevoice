@@ -102,3 +102,18 @@ tasks:
         lora_rank: 32
         lora_alpha: 64
         lora_dropout: 0.10
+    adaptive_final:
+      name: final-selected-full
+      source_rounds: [pilot-r8-lr1e4, pilot-r16-lr5e5, pilot-r32-lr2e5]
+      inherit: [learning_rate, lora_rank, lora_alpha, lora_dropout]
+      overrides:
+        max_steps: -1
+        epochs: 3.0
+        batch_size: 2
+        eval_batch_size: 2
+        gradient_accumulation_steps: 16
+        limit_train: 0
+        limit_validation: 512
+        eval_steps: 250
+        save_steps: 250
+        logging_steps: 25

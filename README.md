@@ -1,6 +1,6 @@
 # OneVoice — MediVoice Edge (Healthcare Voice AI)
 
-Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-device trên Qualcomm QCS6490. Đây là dự án do **một người** phát triển; GPU fine-tune sẽ thuê theo phiên sau khi dữ liệu vượt qua EDA/QA gate.
+Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-device trên Qualcomm QCS6490. Đây là dự án do **một người** phát triển; dữ liệu đã vượt EDA/QA gate và GPU fine-tune theo phiên đang được điều phối, lưu checkpoint và kiểm chứng độc lập.
 
 > Trạng thái kiểm tra lại 27/09/2026: **data/GPU-ready; local LoRA training path đã smoke pass; release gate đang khóa**. EDA, merge chống leakage, materialize, signal QC, human QA 48/48 và GPU preflight đều pass. Hai fine-tune CPU smoke một bước đã tạo adapter thật nhưng đều ghi `promotion_allowed=false`. Baseline chưa đạt WER/BLEU target; suite lâm sàng 32 chiều còn fail phủ định, thuật ngữ và code-switch dù giữ đúng thuốc/liều/số/đơn vị trong mẫu này. Whisper Small w8a16 tham chiếu đã profile thành công trên NPU; PhoWhisper, Piper và NLLB vẫn còn các BYOM/QNN blocker nêu trong `project_analysis.md`. Latency toàn tuyến trên board vật lý chưa đo.
 
@@ -41,6 +41,6 @@ Kết quả regression gần nhất được ghi trong `project_analysis.md`; kh
 
 1. Chạy specialized AIMET recipe trên Linux cho PhoWhisper weights; encoder handoff đã có, decoder còn phải tạo teacher-forced token/KV-cache calibration thật. Không retry generic cloud-PTQ graph.
 2. Giữ Piper CPU fallback cho đến khi có source exporter loại được `NonZero/ReduceMax→Range`; graph mới phải qua local QNN gate trước khi upload. Sau đó mới export NLLB base theo encoder/decoder/KV-cache tĩnh.
-3. Thuê một GPU theo `GPU_HANDOFF.md` sau khi kiến trúc vượt gate, chạy cloud preflight và hai dry-run 100 step riêng biệt.
-4. Fine-tune ASR rồi MT, đồng bộ checkpoint ra persistent storage; không chạy đồng thời trên một GPU.
-5. Chọn checkpoint bằng locked validation, chạy INT8 parity/QNN compile, rồi mới benchmark toàn tuyến trên board QCS6490 thật.
+3. Hoàn tất candidate MT full-data đang chạy, tải ngay checkpoint/report/checksum về local và chấm locked MT suite.
+4. Chạy ba pilot ASR rồi để controller tự chọn cấu hình cho vòng ASR full-data; không chạy ASR và MT đồng thời trên một GPU.
+5. Chỉ promotion candidate vượt cả metric tổng thể và locked clinical suite; sau đó chạy INT8 parity/QNN compile rồi mới benchmark toàn tuyến trên board QCS6490 thật.

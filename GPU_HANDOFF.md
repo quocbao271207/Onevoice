@@ -97,7 +97,18 @@ On Linux, first use a small `--limit 2 --decoder-steps-per-row 2` smoke. Only
 increase the sample count after both component checkpoints are created and the
 evidence reports `sensitive_calibration_tensors_persisted: false`.
 
-## Mandatory 100-step billed dry-runs
+## GPU rounds under the resource controller
+
+The authoritative entry point runs one model at a time, enforces the 35% per-process VRAM allocation and 40% hard VRAM stop, keeps rolling utilization below 38% outside 02:00–09:00 Asia/Bangkok, and automatically raises that utilization ceiling to 75% during the approved early-morning window:
+
+```bash
+python scripts/run_gpu_rounds.py --task mt --config configs/gpu_rounds.yaml --output-root gpu-runs
+python scripts/run_gpu_rounds.py --task asr --config configs/gpu_rounds.yaml --output-root gpu-runs
+```
+
+The ASR command runs the three configured pilots, selects the lowest completed validation WER, inherits its learning rate and LoRA parameters, then appends `final-selected-full` automatically. That final candidate uses all training rows, 512 validation rows, three epochs and effective batch 32. It is a full-data LoRA fine-tune, not a full-parameter fine-tune. Every checkpoint and completed round is archived with SHA-256 evidence before the next model may start.
+
+## Legacy manual 100-step billed dry-runs
 
 The limits avoid preprocessing all data merely to test VRAM and throughput.
 
@@ -119,7 +130,7 @@ For a 24 GB card, change both batch sizes to 2 and gradient accumulation to 16. 
 
 Capture elapsed seconds, peak VRAM (`nvidia-smi --query-compute-apps=used_memory --format=csv`), examples/second and loss trend. Extrapolate total cost from the measured steps/second, then decide whether to continue. Do not silently truncate data or sequence length.
 
-## Full fine-tunes
+## Legacy manual fine-tunes
 
 ASR uses true on-the-fly speed/gain/noise augmentation only for train batches. Validation audio is untouched.
 
@@ -162,4 +173,4 @@ running the base model.
 5. Run at least 100 human-reviewed medical translations and the TTS medication/number pronunciation suite before any demo claim.
 6. Keep the safety guard fail-closed: unsafe output is displayed for confirmation and is not spoken automatically.
 
-The project intentionally stops before the first billed GPU dry-run so the owner can choose/provider-fund the GPU.
+GPU execution has started under the controller above. Do not launch these legacy manual commands concurrently with the managed MT/ASR sequence; use them only for isolated diagnosis after confirming no controller-owned trainer is active.

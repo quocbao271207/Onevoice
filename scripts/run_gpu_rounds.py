@@ -168,6 +168,71 @@ def configured_rounds(
     return rounds[: max_rounds or None]
 
 
+def select_completed_round(
+    results: list[dict[str, Any]],
+    greater_is_better: bool,
+    allowed_names: set[str] | None = None,
+) -> dict[str, Any] | None:
+    candidates = [
+        item
+        for item in results
+        if item.get("status") == "complete"
+        and item.get("metric") is not None
+        and (allowed_names is None or item.get("name") in allowed_names)
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: float(item["metric"]), reverse=greater_is_better)[0]
+
+
+def resolve_adaptive_final(
+    task: dict[str, Any], results: list[dict[str, Any]]
+) -> tuple[dict[str, Any], str]:
+    """Build a full-data round from the best completed pilot."""
+    spec = task.get("adaptive_final")
+    if not isinstance(spec, dict):
+        raise ValueError("adaptive_final must be a mapping")
+    source_names = [str(name) for name in spec.get("source_rounds", [])]
+    if not source_names:
+        raise ValueError("adaptive_final.source_rounds must not be empty")
+    round_by_name = {str(item["name"]): item for item in task.get("rounds", [])}
+    missing_sources = sorted(set(source_names) - set(round_by_name))
+    if missing_sources:
+        raise ValueError(f"adaptive final references unknown source rounds: {missing_sources}")
+    selected = select_completed_round(
+        results,
+        bool(task["greater_is_better"]),
+        set(source_names),
+    )
+    if selected is None:
+        raise ValueError("adaptive final has no completed source round with a selection metric")
+
+    final_name = str(spec.get("name") or "")
+    if not final_name:
+        raise ValueError("adaptive_final.name must not be empty")
+    if final_name in round_by_name:
+        raise ValueError(f"adaptive final name conflicts with a configured round: {final_name}")
+    inherit = [str(name) for name in spec.get("inherit", [])]
+    if not inherit:
+        raise ValueError("adaptive_final.inherit must not be empty")
+    source = round_by_name[str(selected["name"])]
+    missing_values = sorted(name for name in inherit if name not in source)
+    if missing_values:
+        raise ValueError(f"selected source round is missing inherited values: {missing_values}")
+    overrides = spec.get("overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("adaptive_final.overrides must be a mapping")
+    forbidden = {"name", "source_rounds", "inherit", "overrides"} & set(overrides)
+    if forbidden:
+        raise ValueError(f"adaptive final overrides contain reserved keys: {sorted(forbidden)}")
+    resolved = {
+        "name": final_name,
+        **{name: source[name] for name in inherit},
+        **overrides,
+    }
+    return resolved, str(selected["name"])
+
+
 def monitor_process(
     process: subprocess.Popen[str],
     monitor_path: Path,
@@ -264,6 +329,11 @@ def main() -> int:
         raise ValueError("boosted utilization must be above daytime limit and at most 100")
     task = config["tasks"][args.task]
     rounds = configured_rounds(task, args.max_rounds, args.round_name)
+    adaptive_spec = (
+        task.get("adaptive_final") if not args.round_name and args.max_rounds == 0 else None
+    )
+    initial_round_count = len(rounds)
+    adaptive_appended = False
     run_root = args.output_root.resolve() / f"{args.task}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     run_root.mkdir(parents=True, exist_ok=False)
     summary: dict[str, Any] = {
@@ -354,19 +424,72 @@ def main() -> int:
         if training_complete:
             result["archive"] = archive_round(round_dir)
         summary["rounds"].append(result)
+        if adaptive_spec and name == str(adaptive_spec.get("name")):
+            adaptive_status = (
+                "complete"
+                if result["status"] == "complete" and result["metric"] is not None
+                else "failed"
+            )
+            summary["adaptive_final"].update(
+                {
+                    "status": adaptive_status,
+                    "metric": result["metric"],
+                    **(
+                        {"error": "adaptive final completed without a selection metric"}
+                        if result["status"] == "complete" and result["metric"] is None
+                        else {}
+                    ),
+                }
+            )
         (run_root / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         if not training_complete or not watcher_complete:
             break
+        if adaptive_spec and not adaptive_appended and index == initial_round_count:
+            try:
+                adaptive_round, source_round = resolve_adaptive_final(task, summary["rounds"])
+            except ValueError as exc:
+                summary["adaptive_final"] = {
+                    "status": "failed",
+                    "error": str(exc),
+                }
+                break
+            rounds.append(adaptive_round)
+            adaptive_appended = True
+            summary["adaptive_final"] = {
+                "status": "scheduled",
+                "source_round": source_round,
+                "round_name": adaptive_round["name"],
+                "resolved_config": adaptive_round,
+            }
+            summary["pilot_selected_round"] = source_round
+            (run_root / "summary.json").write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
-    completed = [item for item in summary["rounds"] if item.get("status") == "complete" and item.get("metric") is not None]
-    if completed:
-        reverse = bool(task["greater_is_better"])
-        summary["selected_round"] = sorted(completed, key=lambda item: item["metric"], reverse=reverse)[0]["name"]
-    summary["status"] = "complete" if len(summary["rounds"]) == len(rounds) and all(
+    if adaptive_spec and args.dry_run:
+        summary["adaptive_final"] = {
+            "status": "pending_selection",
+            "template": adaptive_spec,
+        }
+    selected = select_completed_round(
+        summary["rounds"],
+        bool(task["greater_is_better"]),
+    )
+    if selected:
+        summary["selected_round"] = selected["name"]
+    if adaptive_spec and summary.get("adaptive_final", {}).get("status") == "complete":
+        summary["selected_round"] = summary["adaptive_final"]["round_name"]
+    rounds_complete = len(summary["rounds"]) == len(rounds) and all(
         item["status"] in {"complete", "dry_run"} for item in summary["rounds"]
-    ) else "failed"
+    )
+    adaptive_complete = (
+        not adaptive_spec
+        or args.dry_run
+        or summary.get("adaptive_final", {}).get("status") == "complete"
+    )
+    summary["status"] = "complete" if rounds_complete and adaptive_complete else "failed"
     (run_root / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
