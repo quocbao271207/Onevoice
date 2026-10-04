@@ -1,0 +1,86 @@
+version: 1
+
+limits:
+  gpu_memory_fraction: 0.35
+  utilization_percent: 38.0
+  resume_percent: 24.0
+  sample_seconds: 2.0
+  rolling_samples: 10
+  boosted_window:
+    timezone: Asia/Bangkok
+    start_hour: 2
+    end_hour: 9
+    utilization_percent: 75.0
+    resume_percent: 55.0
+
+tasks:
+  mt:
+    module: src.training.finetune_mt_medical
+    selection_metric: eval_loss
+    greater_is_better: false
+    common_args:
+      method: lora
+      direction: joint
+      precision: bf16
+      batch_size: 2
+      eval_batch_size: 2
+      gradient_accumulation_steps: 16
+      clinical_oversample_factor: 2
+      limit_validation: 256
+      eval_steps: 50
+      save_steps: 50
+      logging_steps: 10
+    rounds:
+      - name: pilot-r8-lr1e4
+        max_steps: 200
+        learning_rate: 1.0e-4
+        lora_rank: 8
+        lora_alpha: 16
+        lora_dropout: 0.05
+      - name: pilot-r16-lr5e5
+        max_steps: 200
+        learning_rate: 5.0e-5
+        lora_rank: 16
+        lora_alpha: 32
+        lora_dropout: 0.05
+      - name: pilot-r32-lr2e5
+        max_steps: 200
+        learning_rate: 2.0e-5
+        lora_rank: 32
+        lora_alpha: 64
+        lora_dropout: 0.10
+
+  asr:
+    module: src.training.finetune_whisper_vi
+    selection_metric: eval_wer
+    greater_is_better: false
+    common_args:
+      method: lora
+      precision: bf16
+      batch_size: 1
+      eval_batch_size: 1
+      gradient_accumulation_steps: 32
+      clinical_oversample_factor: 2
+      limit_validation: 64
+      eval_steps: 50
+      save_steps: 50
+      logging_steps: 10
+    rounds:
+      - name: pilot-r8-lr1e4
+        max_steps: 150
+        learning_rate: 1.0e-4
+        lora_rank: 8
+        lora_alpha: 16
+        lora_dropout: 0.05
+      - name: pilot-r16-lr5e5
+        max_steps: 150
+        learning_rate: 5.0e-5
+        lora_rank: 16
+        lora_alpha: 32
+        lora_dropout: 0.05
+      - name: pilot-r32-lr2e5
+        max_steps: 150
+        learning_rate: 2.0e-5
+        lora_rank: 32
+        lora_alpha: 64
+        lora_dropout: 0.10

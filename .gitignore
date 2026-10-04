@@ -51,6 +51,8 @@ logs/
 wandb/
 runs/
 outputs/
+gpu-runs/
+test/
 .cache/
 .backups/
 

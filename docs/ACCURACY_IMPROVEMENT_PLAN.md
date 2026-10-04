@@ -39,6 +39,10 @@ Các ngưỡng máy đọc được nằm ở `configs/accuracy_program.yaml`. M
 
 CPU smoke ghi `promotion_allowed=false` trong `training_run.json`. Chỉ checkpoint full-run trên GPU, vượt locked validation/test và suite lâm sàng mới được thay đường dẫn production.
 
+## Điều phối GPU theo giờ
+
+`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp.
+
 ## Backup và phục hồi
 
 `scripts/create_verified_backup.py` tạo ba tar độc lập cho data (không lặp reports), models và reports, sinh `SHA256SUMS.txt`, rồi đọc lại toàn bộ archive để xác minh checksum và số file. Backup nằm trong `.backups/`, không push lên Git vì chứa dữ liệu/model lớn và có ràng buộc license.

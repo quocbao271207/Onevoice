@@ -49,6 +49,10 @@ class MTTrainingConfig:
     clinical_oversample_factor: int = 1
     cpu_smoke: bool = False
     local_files_only: bool = False
+    gpu_memory_fraction: float = 0.35
+    eval_steps: int = 0
+    save_steps: int = 0
+    logging_steps: int = 50
 
 
 def direction_fields(direction: str) -> tuple[str, str, str, str]:
@@ -115,6 +119,9 @@ def preflight(config: MTTrainingConfig) -> dict[str, Any]:
         "method": config.method,
         "clinical_oversample_factor": config.clinical_oversample_factor,
         "cpu_smoke": config.cpu_smoke,
+        "gpu_memory_fraction": config.gpu_memory_fraction,
+        "eval_steps": config.eval_steps,
+        "save_steps": config.save_steps,
         "dry_run_limits": {
             "train": config.limit_train_examples,
             "validation": config.limit_validation_examples,
@@ -136,6 +143,10 @@ def train(config: MTTrainingConfig) -> None:
 
     if not torch.cuda.is_available() and not config.cpu_smoke:
         raise RuntimeError("CUDA GPU is required for production MT fine-tuning. Use --cpu-smoke only to verify the local path.")
+    if not 0.0 < config.gpu_memory_fraction <= 0.40:
+        raise ValueError("gpu_memory_fraction must be in (0, 0.40]")
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(config.gpu_memory_fraction)
     if config.cpu_smoke and (
         config.max_steps < 1
         or config.max_steps > 5
@@ -221,6 +232,11 @@ def train(config: MTTrainingConfig) -> None:
         [tokenized_direction(validation_rows, direction) for direction in directions]
     )
 
+    step_evaluation = config.cpu_smoke or config.eval_steps > 0
+    evaluation_steps = 1 if config.cpu_smoke else (config.eval_steps or None)
+    checkpoint_steps = 1 if config.cpu_smoke else (config.save_steps or config.eval_steps or 500)
+    if step_evaluation and checkpoint_steps % int(evaluation_steps) != 0:
+        raise ValueError("save_steps must be a multiple of eval_steps when step evaluation is enabled")
     args = Seq2SeqTrainingArguments(
         output_dir=config.output_dir,
         learning_rate=config.learning_rate,
@@ -232,11 +248,11 @@ def train(config: MTTrainingConfig) -> None:
         fp16=config.fp16 and torch.cuda.is_available(),
         bf16=config.bf16 and torch.cuda.is_available(),
         max_steps=config.max_steps,
-        eval_strategy="steps" if config.cpu_smoke else "epoch",
-        save_strategy="steps" if config.cpu_smoke else "epoch",
-        eval_steps=1 if config.cpu_smoke else None,
-        save_steps=1 if config.cpu_smoke else 500,
-        logging_steps=1 if config.cpu_smoke else 50,
+        eval_strategy="steps" if step_evaluation else "epoch",
+        save_strategy="steps" if step_evaluation else "epoch",
+        eval_steps=evaluation_steps,
+        save_steps=checkpoint_steps,
+        logging_steps=1 if config.cpu_smoke else config.logging_steps,
         # Joint EN↔VI validation uses target-language tokens embedded in labels.
         # Generation is benchmarked separately because forced BOS differs by row.
         predict_with_generate=False,
@@ -255,7 +271,7 @@ def train(config: MTTrainingConfig) -> None:
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model),
         processing_class=tokenizer,
     )
-    trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+    train_result = trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
     run_report = {
@@ -264,6 +280,17 @@ def train(config: MTTrainingConfig) -> None:
         "promotion_allowed": not config.cpu_smoke,
         "train_rows_after_oversampling": len(train_rows),
         "validation_rows": len(validation_rows),
+        "global_step": trainer.state.global_step,
+        "best_metric": trainer.state.best_metric,
+        "best_model_checkpoint": trainer.state.best_model_checkpoint,
+        "train_metrics": train_result.metrics,
+        "log_history": trainer.state.log_history,
+        "gpu_peak_memory_allocated_bytes": (
+            torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+        ),
+        "gpu_peak_memory_reserved_bytes": (
+            torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
+        ),
     }
     Path(config.output_dir, "training_run.json").write_text(
         json.dumps(run_report, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -279,6 +306,8 @@ def main() -> int:
     parser.add_argument("--output-dir", default=MTTrainingConfig.output_dir)
     parser.add_argument("--direction", choices=["joint", "en_to_vi", "vi_to_en"], default="joint")
     parser.add_argument("--epochs", type=float, default=1.0)
+    parser.add_argument("--learning-rate", type=float, default=MTTrainingConfig.learning_rate)
+    parser.add_argument("--warmup-ratio", type=float, default=MTTrainingConfig.warmup_ratio)
     parser.add_argument("--batch-size", type=int, default=8, help="Per-device training batch size.")
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Per-device validation batch size.")
     parser.add_argument(
@@ -300,13 +329,25 @@ def main() -> int:
     parser.add_argument("--clinical-oversample-factor", type=int, default=1)
     parser.add_argument("--cpu-smoke", action="store_true", help="Run a bounded real LoRA training step on CPU; never a release checkpoint.")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.35)
+    parser.add_argument("--eval-steps", type=int, default=0)
+    parser.add_argument("--save-steps", type=int, default=0)
+    parser.add_argument("--logging-steps", type=int, default=50)
     args = parser.parse_args()
     if min(args.batch_size, args.eval_batch_size, args.gradient_accumulation_steps) < 1:
         parser.error("batch sizes and gradient accumulation must be at least 1")
     if args.clinical_oversample_factor < 1 or args.lora_rank < 1 or args.lora_alpha < 1:
         parser.error("LoRA dimensions and clinical oversampling must be at least 1")
+    if args.learning_rate <= 0 or not 0.0 <= args.warmup_ratio < 1.0:
+        parser.error("learning rate must be positive and warmup ratio must be in [0, 1)")
+    if not 0.0 <= args.lora_dropout < 1.0:
+        parser.error("--lora-dropout must be in [0, 1)")
     if args.cpu_smoke and args.method != "lora":
         parser.error("--cpu-smoke requires --method lora")
+    if not 0.0 < args.gpu_memory_fraction <= 0.40:
+        parser.error("--gpu-memory-fraction must be in (0, 0.40]")
+    if min(args.eval_steps, args.save_steps, args.logging_steps) < 0 or args.logging_steps == 0:
+        parser.error("step intervals must be non-negative and logging steps must be positive")
     config = MTTrainingConfig(
         base_model=args.base_model,
         base_model_revision=args.base_model_revision,
@@ -314,6 +355,8 @@ def main() -> int:
         validation_manifest=args.validation_manifest,
         output_dir=args.output_dir,
         direction=args.direction,
+        learning_rate=args.learning_rate,
+        warmup_ratio=args.warmup_ratio,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
@@ -331,6 +374,10 @@ def main() -> int:
         clinical_oversample_factor=args.clinical_oversample_factor,
         cpu_smoke=args.cpu_smoke,
         local_files_only=args.local_files_only,
+        gpu_memory_fraction=args.gpu_memory_fraction,
+        eval_steps=args.eval_steps,
+        save_steps=args.save_steps,
+        logging_steps=args.logging_steps,
     )
     if args.preflight:
         print(json.dumps(preflight(config), ensure_ascii=False, indent=2))
