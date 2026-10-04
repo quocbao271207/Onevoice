@@ -35,13 +35,19 @@ Các ngưỡng máy đọc được nằm ở `configs/accuracy_program.yaml`. M
 # Benchmark safety và gate tổng hợp
 .venv\Scripts\python.exe scripts/run_baseline_benchmarks.py --task mt --manifest data/eval/medical_safety_mt.jsonl --samples 32 --batch-size 2 --num-beams 1 --name mt_clinical_base --output-dir data/reports/accuracy
 .venv\Scripts\python.exe scripts/run_accuracy_gates.py
+
+# Sau full-run: chấm adapter trên toàn bộ test khóa + toàn bộ suite lâm sàng,
+# điều tiết GPU theo cùng lịch 38%/75%, rồi đóng gói report có SHA-256.
+.venv\Scripts\python.exe scripts/run_mt_candidate_suite.py --adapter gpu-runs/mt-YYYYMMDD-HHMMSS/01-final-r8-lr1e4-full/model --device cuda --precision bf16 --batch-size 8 --num-beams 4
 ```
 
 CPU smoke ghi `promotion_allowed=false` trong `training_run.json`. Chỉ checkpoint full-run trên GPU, vượt locked validation/test và suite lâm sàng mới được thay đường dẫn production.
 
+`--samples 0` trong `run_baseline_benchmarks.py` có nghĩa là chấm toàn bộ manifest. Khi có `--adapter`, benchmark nạp PEFT/LoRA lên model nền đã pin revision; mặc định cũ vẫn là CPU/fp32. `run_mt_candidate_suite.py` xác minh checksum của suite trước khi suy luận, fail-closed nếu thiếu bất kỳ slice bắt buộc nào, lưu predictions/report/log/resource monitor, rồi tạo `tar.gz` và sidecar `.sha256`. Kết quả fine-tune tốt nhưng gate lâm sàng fail vẫn không được promotion.
+
 ## Điều phối GPU theo giờ
 
-`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Pilot chỉ tokenize tập ưu tiên lâm sàng đủ lớn cho số bước cấu hình (MT 8.192, ASR 6.144) để tránh lãng phí CPU; full-run được chọn sau pilot vẫn dùng toàn bộ dữ liệu khóa. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp.
+`scripts/run_gpu_rounds.py` chạy tuần tự các vòng LoRA trong `configs/gpu_rounds.yaml`, giới hạn process ở 35% VRAM và điều tiết bằng `SIGSTOP/SIGCONT`. Ngoài 02:00–09:00 Asia/Bangkok, rolling GPU utilization bị giữ dưới 38%. Trong 02:00–09:00, ngưỡng được nâng tự động lên 75%; giới hạn VRAM không đổi. Pilot chỉ tokenize tập ưu tiên lâm sàng đủ lớn cho số bước cấu hình (MT 8.192, ASR 6.144) để tránh lãng phí CPU; full-run được chọn sau pilot vẫn dùng toàn bộ dữ liệu khóa. Mỗi vòng sinh log tài nguyên, `training_run.json`, tar.gz và SHA-256 để tải về ngay trước vòng kế tiếp. Hậu kiểm candidate dùng lại chính bộ điều tiết này, nên việc tăng công suất ban đêm không bỏ qua giới hạn tài nguyên.
 
 ## Backup và phục hồi
 

@@ -13,6 +13,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/materialize_audio.py` — tải audio sau khi EDA được duyệt
 - `scripts/qc_local_audio.py` — decode, chuẩn hóa FLAC mono 16 kHz và loại near-silence/CPS bất khả thi
 - `scripts/run_baseline_benchmarks.py` — baseline ASR VI/EN và MT trên tập khóa
+- `scripts/run_mt_candidate_suite.py` — chấm LoRA MT trên full locked test + clinical suite, fail-closed và tạo archive checksum
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board

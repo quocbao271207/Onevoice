@@ -1,4 +1,9 @@
-"""Run small, reproducible CPU baselines on locked ASR or MT test manifests."""
+"""Run reproducible ASR or MT benchmarks on locked manifests.
+
+The default remains a CPU baseline.  Candidate LoRA adapters can be evaluated
+on CUDA with the same scoring path so a fine-tuned checkpoint is never judged
+with a different metric implementation from its locked baseline.
+"""
 
 from __future__ import annotations
 
@@ -66,21 +71,68 @@ def batches(rows: list[Any], size: int):
         yield rows[offset : offset + size]
 
 
+def resolve_device(requested: str) -> str:
+    """Resolve ``auto`` lazily so importing this module stays CPU-test friendly."""
+    if requested != "auto":
+        return requested
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def model_load_kwargs(device: str, precision: str) -> dict[str, Any]:
+    if device == "cpu":
+        if precision != "fp32":
+            raise ValueError("CPU benchmarking supports only fp32 precision")
+        return {}
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA benchmarking requested but CUDA is unavailable")
+    dtype = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[precision]
+    return {"torch_dtype": dtype}
+
+
+def attach_adapter(model: Any, adapter: Path | None) -> Any:
+    if adapter is None:
+        return model
+    if not adapter.is_dir():
+        raise FileNotFoundError(f"Missing adapter directory: {adapter}")
+    from peft import PeftModel
+
+    return PeftModel.from_pretrained(model, str(adapter))
+
+
+def prepare_runtime(args: argparse.Namespace) -> str:
+    device = resolve_device(args.device)
+    if not 0.0 < args.gpu_memory_fraction <= 0.40:
+        raise ValueError("gpu_memory_fraction must be in (0, 0.40]")
+    if device == "cuda":
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
+    return device
+
+
 def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     eligible = [row for row in read_jsonl(args.manifest) if str(row.get("language") or "").startswith(args.language)]
-    rows = source_balanced_sample(eligible, args.samples, args.seed)
+    rows = eligible if args.samples == 0 else source_balanced_sample(eligible, args.samples, args.seed)
+    processor_source = str(args.adapter) if args.adapter else args.model
+    processor_revision = None if args.adapter else args.model_revision
     if args.language == "vi":
         processor = WhisperProcessor.from_pretrained(
-            args.model, revision=args.model_revision, language="vi", task="transcribe"
+            processor_source, revision=processor_revision, language="vi", task="transcribe"
         )
     else:
         # English-only Distil-Whisper has no multilingual lang_to_id mapping.
-        processor = WhisperProcessor.from_pretrained(args.model, revision=args.model_revision)
+        processor = WhisperProcessor.from_pretrained(processor_source, revision=processor_revision)
+    device = prepare_runtime(args)
     model = WhisperForConditionalGeneration.from_pretrained(
-        args.model, revision=args.model_revision
-    ).to("cpu").eval()
+        args.model,
+        revision=args.model_revision,
+        **model_load_kwargs(device, args.precision),
+    )
+    model = attach_adapter(model, args.adapter).to(device).eval()
     if args.language == "vi":
         model.generation_config.language = "vi"
         model.generation_config.task = "transcribe"
@@ -88,7 +140,7 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
     predictions = []
     prompt_ids = None
     if args.asr_prompt:
-        prompt_ids = processor.get_prompt_ids(args.asr_prompt, return_tensors="pt")
+        prompt_ids = processor.get_prompt_ids(args.asr_prompt, return_tensors="pt").to(device)
     generation_started = time.perf_counter()
     with torch.inference_mode():
         for chunk in batches(rows, args.batch_size):
@@ -110,14 +162,14 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                 return_tensors="pt",
             )
             generation_kwargs = {
-                "attention_mask": features.attention_mask,
+                "attention_mask": features.attention_mask.to(device),
                 "max_new_tokens": 225,
                 "num_beams": args.num_beams,
                 "do_sample": False,
             }
             if prompt_ids is not None:
                 generation_kwargs["prompt_ids"] = prompt_ids
-            generated = model.generate(features.input_features, **generation_kwargs)
+            generated = model.generate(features.input_features.to(device), **generation_kwargs)
             hypotheses = processor.tokenizer.batch_decode(generated, skip_special_tokens=True)
             for row, hypothesis in zip(chunk, hypotheses):
                 predictions.append(
@@ -147,11 +199,16 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
 def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    pair_count = max(1, args.samples // 2)
-    rows = source_balanced_sample(read_jsonl(args.manifest), pair_count, args.seed)
+    manifest_rows = read_jsonl(args.manifest)
+    pair_count = len(manifest_rows) if args.samples == 0 else max(1, args.samples // 2)
+    rows = source_balanced_sample(manifest_rows, pair_count, args.seed)
+    device = prepare_runtime(args)
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        args.model, revision=args.model_revision
-    ).to("cpu").eval()
+        args.model,
+        revision=args.model_revision,
+        **model_load_kwargs(device, args.precision),
+    )
+    model = attach_adapter(model, args.adapter).to(device).eval()
     predictions = []
     directions = (
         ("en_to_vi", "source_text", "target_text", "eng_Latn", "vie_Latn"),
@@ -160,9 +217,10 @@ def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, An
     generation_started = time.perf_counter()
     with torch.inference_mode():
         for direction, source_field, target_field, source_lang, target_lang in directions:
+            tokenizer_source = str(args.adapter) if args.adapter else args.model
             tokenizer = AutoTokenizer.from_pretrained(
-                args.model,
-                revision=args.model_revision,
+                tokenizer_source,
+                revision=None if args.adapter else args.model_revision,
                 src_lang=source_lang,
                 tgt_lang=target_lang,
             )
@@ -174,6 +232,7 @@ def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, An
                     max_length=256,
                     return_tensors="pt",
                 )
+                encoded = {key: value.to(device) for key, value in encoded.items()}
                 generated = model.generate(
                     **encoded,
                     forced_bos_token_id=tokenizer.convert_tokens_to_ids(target_lang),
@@ -213,6 +272,10 @@ def main() -> int:
     parser.add_argument("--task", choices=["asr", "mt"], required=True)
     parser.add_argument("--model")
     parser.add_argument("--model-revision")
+    parser.add_argument("--adapter", type=Path, help="Optional local PEFT/LoRA adapter directory.")
+    parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.35)
     parser.add_argument("--language", choices=["vi", "en"], default="vi", help="ASR benchmark language.")
     parser.add_argument("--name", help="Artifact stem; defaults to task/language-specific base name.")
     parser.add_argument("--manifest", type=Path)
@@ -227,6 +290,12 @@ def main() -> int:
         args.num_beams = 1 if args.task == "asr" else 4
     if args.num_beams < 1:
         parser.error("--num-beams must be at least 1")
+    if args.samples < 0:
+        parser.error("--samples must be non-negative; use 0 for the full manifest")
+    if not 0.0 < args.gpu_memory_fraction <= 0.40:
+        parser.error("--gpu-memory-fraction must be in (0, 0.40]")
+    if args.device == "cpu" and args.precision != "fp32":
+        parser.error("--device cpu requires --precision fp32")
     if args.task != "asr" and args.asr_prompt:
         parser.error("--asr-prompt is valid only with --task asr")
     if args.model is None:
@@ -254,6 +323,10 @@ def main() -> int:
         {
             "model": args.model,
             "model_revision": args.model_revision,
+            "adapter": str(args.adapter) if args.adapter else None,
+            "device": resolve_device(args.device),
+            "precision": args.precision,
+            "gpu_memory_fraction": args.gpu_memory_fraction if resolve_device(args.device) == "cuda" else None,
             "manifest": str(args.manifest),
             "seed": args.seed,
             "predictions": str(prediction_path),
