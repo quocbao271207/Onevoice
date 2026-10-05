@@ -15,6 +15,9 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.data.quality import fingerprint_text, normalize_text  # noqa: E402
 
 
 def utc_now() -> str:
@@ -83,6 +86,45 @@ def validate_identifiers(task: str, rows: list[dict[str, Any]]) -> None:
             )
 
 
+def validate_content_integrity(task: str, rows: list[dict[str, Any]]) -> None:
+    """Recompute blind fingerprints from payloads instead of trusting metadata."""
+    for index, row in enumerate(rows, start=1):
+        if task == "mt":
+            source = normalize_text(row.get("source_text"))
+            target = normalize_text(row.get("target_text"))
+            if not source or not target:
+                raise ValueError(
+                    f"Blind mt manifest is missing source_text or target_text on row {index}"
+                )
+            expected = fingerprint_text(source + "\x1f" + target)
+            if row["pair_fingerprint"] != expected:
+                raise ValueError(
+                    f"Blind mt pair_fingerprint does not match row content on row {index}"
+                )
+            continue
+
+        text_value = normalize_text(row.get("text"))
+        if not text_value:
+            raise ValueError(f"Blind asr manifest is missing text on row {index}")
+        if row["text_fingerprint"] != fingerprint_text(text_value):
+            raise ValueError(
+                f"Blind asr text_fingerprint does not match row content on row {index}"
+            )
+
+        audio_value = str(row.get("audio_path") or "").strip()
+        if not audio_value:
+            raise ValueError(f"Blind asr manifest is missing audio_path on row {index}")
+        audio_path = Path(audio_value)
+        if not audio_path.is_absolute():
+            audio_path = ROOT / audio_path
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Blind asr audio is missing on row {index}: {audio_path}")
+        if row["audio_sha256"] != sha256(audio_path):
+            raise ValueError(
+                f"Blind asr audio_sha256 does not match audio content on row {index}"
+            )
+
+
 def validate_required_slices(task: str, rows: list[dict[str, Any]], required: list[str]) -> None:
     observed = set()
     for row in rows:
@@ -138,6 +180,7 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         if not rows:
             raise ValueError(f"Blind {task} manifest is empty")
         validate_identifiers(task, rows)
+        validate_content_integrity(task, rows)
         ensure_unseen(task, rows, config)
         validate_required_slices(task, rows, existing["required_slices"][task])
         manifests[task] = {

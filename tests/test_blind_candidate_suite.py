@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.run_blind_candidate_suite import sha256, validate_identifiers, verify_lock
+from scripts.run_blind_candidate_suite import (
+    sha256,
+    validate_content_integrity,
+    validate_identifiers,
+    verify_lock,
+)
+from src.data.quality import fingerprint_text
 
 
 def write_lock(path: Path, mt: Path, asr: Path) -> None:
@@ -120,3 +126,66 @@ def test_blind_identifiers_require_leakage_fingerprints(task, rows, message):
 def test_blind_identifiers_reject_duplicate_samples(task, rows, message):
     with pytest.raises(ValueError, match=message):
         validate_identifiers(task, rows)
+
+
+def test_blind_mt_fingerprint_is_recomputed_from_text():
+    source = "Take aspirin 81 mg daily."
+    target = "Uống aspirin 81 mg mỗi ngày."
+    row = {
+        "id": "mt-1",
+        "source_text": source,
+        "target_text": target,
+        "pair_fingerprint": fingerprint_text(source + "\x1f" + target),
+    }
+    validate_content_integrity("mt", [row])
+
+    row["target_text"] = "Uống aspirin 810 mg mỗi ngày."
+    with pytest.raises(ValueError, match="pair_fingerprint does not match"):
+        validate_content_integrity("mt", [row])
+
+
+@pytest.mark.parametrize("missing", ["source_text", "target_text"])
+def test_blind_mt_requires_both_text_sides(missing):
+    row = {
+        "source_text": "No penicillin.",
+        "target_text": "Không dùng penicillin.",
+        "pair_fingerprint": "declared",
+    }
+    row.pop(missing)
+    with pytest.raises(ValueError, match="missing source_text or target_text"):
+        validate_content_integrity("mt", [row])
+
+
+def test_blind_asr_fingerprints_are_recomputed_from_text_and_audio(tmp_path: Path):
+    audio = tmp_path / "blind.flac"
+    audio.write_bytes(b"blind-audio-payload")
+    text = "Không dùng penicillin 500 mg."
+    row = {
+        "id": "asr-1",
+        "text": text,
+        "text_fingerprint": fingerprint_text(text),
+        "audio_path": str(audio),
+        "audio_sha256": sha256(audio),
+    }
+    validate_content_integrity("asr", [row])
+
+    row["text"] = "Dùng penicillin 500 mg."
+    with pytest.raises(ValueError, match="text_fingerprint does not match"):
+        validate_content_integrity("asr", [row])
+
+    row["text"] = text
+    audio.write_bytes(b"tampered-audio-payload")
+    with pytest.raises(ValueError, match="audio_sha256 does not match"):
+        validate_content_integrity("asr", [row])
+
+
+def test_blind_asr_requires_existing_audio(tmp_path: Path):
+    text = "Không dùng penicillin."
+    row = {
+        "text": text,
+        "text_fingerprint": fingerprint_text(text),
+        "audio_path": str(tmp_path / "missing.flac"),
+        "audio_sha256": "declared",
+    }
+    with pytest.raises(FileNotFoundError, match="audio is missing"):
+        validate_content_integrity("asr", [row])
