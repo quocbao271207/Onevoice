@@ -20,7 +20,13 @@ from scripts.run_gpu_program import (
     verified_training_result,
     write_state,
 )
-from scripts.candidate_evidence import archive_evidence, evidence_sidecars
+from scripts.candidate_evidence import (
+    adapter_identity,
+    archive_evidence,
+    canonical_sha256,
+    evidence_sidecars,
+    sha256,
+)
 from scripts.run_gpu_rounds import archive_round
 from scripts.run_mt_candidate_suite import DEFAULT_NUM_BEAMS
 
@@ -126,6 +132,30 @@ def test_mt_extension_stops_on_validation_plateau():
     assert evidence["reason"] == "validation_plateau_or_regression"
 
 
+def write_prediction_evidence(
+    output: Path, stem: str, adapter: Path, *, task: str = "mt"
+) -> None:
+    prediction_path = output / f"{stem}_predictions.jsonl"
+    prediction_path.write_text("{}\n", encoding="utf-8")
+    specification = {"task": task, "adapter": adapter_identity(adapter)}
+    provenance = {
+        "schema_version": 1,
+        "specification": specification,
+        "specification_sha256": canonical_sha256(specification),
+        "predictions": {
+            "path": str(prediction_path.resolve()),
+            "bytes": prediction_path.stat().st_size,
+            "sha256": sha256(prediction_path),
+            "rows": 1,
+        },
+        "decoding": {},
+        "runtime": {},
+    }
+    prediction_path.with_suffix(prediction_path.suffix + ".provenance.json").write_text(
+        json.dumps(provenance), encoding="utf-8"
+    )
+
+
 def test_resume_kind_accepts_only_idle_wait_or_running_mt_candidate(tmp_path: Path):
     mt_run = tmp_path / "mt-run"
     assert resume_kind(
@@ -170,15 +200,13 @@ def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
     adapter = tmp_path / "adapter"
     adapter.mkdir()
     (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter / "adapter_model.safetensors").write_bytes(b"adapter-weights")
     output = tmp_path / "mt-candidate"
     output.mkdir()
     for stem in ("mt_candidate", "mt_clinical_candidate"):
         (output / f"{stem}.json").write_text("{}", encoding="utf-8")
         (output / f"{stem}.log").write_text("done\n", encoding="utf-8")
-        (output / f"{stem}_predictions.jsonl").write_text("{}\n", encoding="utf-8")
-        (output / f"{stem}_predictions.jsonl.provenance.json").write_text(
-            "{}", encoding="utf-8"
-        )
+        write_prediction_evidence(output, stem, adapter)
         (output / f"{stem}_resource_monitor.jsonl").write_text(
             "{}\n", encoding="utf-8"
         )
@@ -202,6 +230,9 @@ def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
 
     assert result["return_code"] == 2
     assert result["local_log_mismatches"] == ["mt_candidate.log"]
+    assert result["adapter_manifest_sha256"] == adapter_identity(adapter)[
+        "manifest_sha256"
+    ]
     state_path = tmp_path / "program_state.json"
     state = {"stage": "mt_candidate", "stages": {"mt_candidate": {"status": "running"}}}
     assert record_recovered_candidate(
@@ -210,6 +241,12 @@ def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     assert persisted["stages"]["mt_candidate"]["status"] == "complete"
     assert persisted["stages"]["mt_candidate"]["recovered_out_of_band"] is True
+
+    weights = adapter / "adapter_model.safetensors"
+    weights.write_bytes(b"mutated")
+    with pytest.raises(ValueError, match="does not bind expected adapter"):
+        verified_candidate_result(output, task="mt", expected_adapter=adapter)
+    weights.write_bytes(b"adapter-weights")
 
     checksum, _ = evidence_sidecars(archive)
     checksum.write_text("0" * 64 + f"  {archive.name}\n", encoding="utf-8")
@@ -220,17 +257,14 @@ def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
 def test_recovered_candidate_rejects_mutated_prediction(tmp_path: Path):
     adapter = tmp_path / "adapter"
     adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
     output = tmp_path / "mt-candidate"
     output.mkdir()
     for stem in ("mt_candidate", "mt_clinical_candidate"):
-        for suffix, content in (
-            (".json", "{}"),
-            (".log", "done\n"),
-            ("_predictions.jsonl", "{}\n"),
-            ("_predictions.jsonl.provenance.json", "{}"),
-            ("_resource_monitor.jsonl", "{}\n"),
-        ):
-            (output / f"{stem}{suffix}").write_text(content, encoding="utf-8")
+        (output / f"{stem}.json").write_text("{}", encoding="utf-8")
+        (output / f"{stem}.log").write_text("done\n", encoding="utf-8")
+        write_prediction_evidence(output, stem, adapter)
+        (output / f"{stem}_resource_monitor.jsonl").write_text("{}\n", encoding="utf-8")
     (output / "candidate_gate.json").write_text(
         json.dumps(
             {

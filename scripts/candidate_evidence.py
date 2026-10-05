@@ -20,6 +20,42 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def canonical_sha256(payload: Any) -> str:
+    """Hash JSON data using the canonical encoding used by provenance records."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def adapter_identity(adapter: Path | None) -> dict[str, Any] | None:
+    """Return the exact path/size/content identity embedded in prediction provenance."""
+    if adapter is None:
+        return None
+    root = adapter.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Missing adapter directory: {root}")
+    files: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Adapter checkpoint cannot contain symlinks: {path}")
+        if path.is_file():
+            files.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+    if not files:
+        raise ValueError(f"Adapter checkpoint is empty: {root}")
+    return {
+        "path": str(root),
+        "file_count": len(files),
+        "bytes": sum(int(item["bytes"]) for item in files),
+        "manifest_sha256": canonical_sha256(files),
+    }
+
+
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 

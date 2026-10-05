@@ -25,7 +25,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_evidence import sha256  # noqa: E402
+from scripts.candidate_evidence import adapter_identity, canonical_sha256, sha256  # noqa: E402
 from scripts.evaluate_benchmarks import score_asr, score_mt  # noqa: E402
 from src.training.mt_model_adapter import (  # noqa: E402
     SUPPORTED_MT_FAMILIES,
@@ -99,12 +99,6 @@ def write_predictions_checkpoint(path: Path, predictions: list[dict[str, Any]]) 
     temporary_path.replace(path)
 
 
-def _canonical_sha256(payload: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.tmp")
@@ -119,34 +113,6 @@ def prediction_provenance_path(prediction_path: Path) -> Path:
     return prediction_path.with_suffix(prediction_path.suffix + ".provenance.json")
 
 
-def _adapter_identity(adapter: Path | None) -> dict[str, Any] | None:
-    if adapter is None:
-        return None
-    root = adapter.resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Missing adapter directory: {root}")
-    files: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"Adapter checkpoint cannot contain symlinks: {path}")
-        if path.is_file():
-            files.append(
-                {
-                    "path": path.relative_to(root).as_posix(),
-                    "bytes": path.stat().st_size,
-                    "sha256": sha256(path),
-                }
-            )
-    if not files:
-        raise ValueError(f"Adapter checkpoint is empty: {root}")
-    return {
-        "path": str(root),
-        "file_count": len(files),
-        "bytes": sum(int(item["bytes"]) for item in files),
-        "manifest_sha256": _canonical_sha256(files),
-    }
-
-
 def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, Any]:
     """Bind resumable predictions to every input that can affect inference."""
     manifest = args.manifest.resolve()
@@ -154,7 +120,7 @@ def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, A
         "task": args.task,
         "model": args.model,
         "model_revision": args.model_revision,
-        "adapter": _adapter_identity(args.adapter),
+        "adapter": adapter_identity(args.adapter),
         "manifest": {
             "path": str(manifest),
             "bytes": manifest.stat().st_size,
@@ -186,7 +152,7 @@ def write_prediction_checkpoint(
     provenance = {
         "schema_version": PREDICTION_CHECKPOINT_SCHEMA_VERSION,
         "specification": specification,
-        "specification_sha256": _canonical_sha256(specification),
+        "specification_sha256": canonical_sha256(specification),
         "predictions": {
             "path": str(prediction_path.resolve()),
             "bytes": prediction_path.stat().st_size,
@@ -217,7 +183,7 @@ def load_verified_prediction_checkpoint(
     if not prediction_exists or not provenance_exists:
         raise ValueError(f"Incomplete prediction checkpoint: {prediction_path}")
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-    expected_sha256 = _canonical_sha256(expected_specification)
+    expected_sha256 = canonical_sha256(expected_specification)
     if (
         provenance.get("schema_version") != PREDICTION_CHECKPOINT_SCHEMA_VERSION
         or provenance.get("specification") != expected_specification

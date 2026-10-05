@@ -22,7 +22,12 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_evidence import sha256, verify_evidence_archive  # noqa: E402
+from scripts.candidate_evidence import (  # noqa: E402
+    adapter_identity,
+    canonical_sha256,
+    sha256,
+    verify_evidence_archive,
+)
 
 
 MT_CANDIDATE_NUM_BEAMS = 1
@@ -234,6 +239,49 @@ def completed_candidate_code(state: dict[str, Any], name: str) -> int:
     return int(code)
 
 
+def verify_prediction_provenance(
+    prediction_path: Path,
+    *,
+    expected_task: str,
+    expected_adapter_identity: dict[str, Any],
+) -> None:
+    """Rebind archived predictions to their exact live adapter and specification."""
+    provenance_path = prediction_path.with_suffix(
+        prediction_path.suffix + ".provenance.json"
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    specification = provenance.get("specification")
+    if (
+        provenance.get("schema_version") != 1
+        or not isinstance(specification, dict)
+        or specification.get("task") != expected_task
+        or specification.get("adapter") != expected_adapter_identity
+        or provenance.get("specification_sha256") != canonical_sha256(specification)
+    ):
+        raise ValueError(f"prediction provenance does not bind expected adapter: {prediction_path}")
+
+    prediction_record = provenance.get("predictions")
+    if (
+        not isinstance(prediction_record, dict)
+        or prediction_record.get("path") != str(prediction_path.resolve())
+        or int(prediction_record.get("bytes", -1)) != prediction_path.stat().st_size
+        or prediction_record.get("sha256") != sha256(prediction_path)
+        or not isinstance(provenance.get("decoding"), dict)
+        or not isinstance(provenance.get("runtime"), dict)
+    ):
+        raise ValueError(f"prediction provenance is inconsistent: {prediction_path}")
+    rows = 0
+    with prediction_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            if not isinstance(json.loads(line), dict):
+                raise ValueError(f"prediction checkpoint row is invalid: {prediction_path}")
+            rows += 1
+    if int(prediction_record.get("rows", -1)) != rows:
+        raise ValueError(f"prediction provenance row count is inconsistent: {prediction_path}")
+
+
 def verified_candidate_result(
     output_dir: Path,
     *,
@@ -256,6 +304,9 @@ def verified_candidate_result(
     manifest = verify_evidence_archive(archive_path)
     records = {str(item["path"]): item for item in manifest["files"]}
     stems = (f"{task}_candidate", f"{task}_clinical_candidate")
+    expected_identity = adapter_identity(expected_adapter)
+    if expected_identity is None:  # pragma: no cover - expected_adapter is always a Path
+        raise ValueError("candidate recovery requires an adapter")
     required_names = {"candidate_gate.json"}
     for stem in stems:
         required_names.update(
@@ -283,12 +334,19 @@ def verified_candidate_result(
                 mutable_log_mismatches.append(name)
             else:
                 raise ValueError(f"candidate evidence does not match archive: {path}")
+    for stem in stems:
+        verify_prediction_provenance(
+            output_dir / f"{stem}_predictions.jsonl",
+            expected_task=task,
+            expected_adapter_identity=expected_identity,
+        )
     return {
         "return_code": 0 if status == "pass" else 2,
         "status": status,
         "archive": str(archive_path),
         "archive_sha256": str(manifest["archive_sha256"]),
         "archive_bytes": int(manifest["archive_bytes"]),
+        "adapter_manifest_sha256": str(expected_identity["manifest_sha256"]),
         "local_log_mismatches": mutable_log_mismatches,
     }
 
@@ -310,6 +368,7 @@ def record_recovered_candidate(
             "evidence_archive": evidence["archive"],
             "evidence_archive_sha256": evidence["archive_sha256"],
             "evidence_archive_bytes": int(evidence["archive_bytes"]),
+            "adapter_manifest_sha256": evidence["adapter_manifest_sha256"],
             "local_log_mismatches": list(evidence["local_log_mismatches"]),
         }
     )
