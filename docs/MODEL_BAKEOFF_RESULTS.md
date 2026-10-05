@@ -39,6 +39,8 @@ Selection dev chứa lát thuốc, liều, số, đơn vị, phủ định, thu�
 
 Blind v2 không chỉ kiểm tra safety. Nó dùng ngưỡng release đã khóa SHA-256 trong `configs/model_bakeoff.yaml` và lấy nội dung từ `configs/accuracy_program.yaml`: cận trên 95% CI của ASR WER phải không vượt ngưỡng, còn cận dưới 95% CI của MT BLEU và chrF2 phải đạt ngưỡng cho từng chiều. Preflight và blind runner đều từ chối nếu checksum policy thay đổi. CER và code-switch WER cũng phải hữu hạn, code-switch WER phải đạt policy. Thiếu metric/CI, NaN hoặc point estimate/CI không đạt đều khóa promotion.
 
+Mỗi slot blind chỉ được mở cho winner đúng task/chiều trong snapshot `selection_comparison-<identity>.json` bất biến; tên snapshot lấy từ digest của winner bindings nên các vòng bake-off sau không ghi đè vòng cũ. `comparison.json` có thể tiếp tục nhận blind/deployment result mà không làm hỏng checksum selection đã khóa. Trước khi suy luận, runner khóa SHA-256 của snapshot này, manifest cây adapter và blind manifest vào specification; adapter bị sửa tại cùng đường dẫn cũng bị từ chối. Report có provenance sidecar chứa checksum/bytes và toàn bộ binding này, nên resume chỉ được dùng lại report đã xác minh; report có sẵn nhưng thiếu provenance hoặc bị sửa sẽ fail-closed thay vì được chấm lại.
+
 ## Successive halving và winner gate
 
 Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling utilization 70%, resume 55% và hard reaction 74% — luôn dưới 75%.

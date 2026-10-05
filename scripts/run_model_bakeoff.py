@@ -325,6 +325,11 @@ def deployment_expectations(
         adapter = Path(winner["adapter"]).resolve()
         if adapter not in adapter_hashes:
             adapter_hashes[adapter] = str(tree_manifest(adapter)["manifest_sha256"])
+        recorded_manifest = str(winner.get("adapter_manifest_sha256") or "")
+        if recorded_manifest and recorded_manifest != adapter_hashes[adapter]:
+            raise ValueError(
+                f"Selected winner adapter changed after selection: {winner['candidate_id']}"
+            )
         expected.append(
             {
                 "task": task,
@@ -994,6 +999,38 @@ def rank_scores(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
+    """Return only immutable winner bindings from a selection comparison."""
+    winners: dict[str, dict[str, dict[str, Any]]] = {}
+    for task in ("mt", "asr"):
+        task_winners = comparison.get("results", {}).get(task, {}).get("winners", {})
+        winners[task] = {
+            key: {
+                "candidate_id": winner.get("candidate_id"),
+                "adapter": winner.get("adapter"),
+                "adapter_manifest_sha256": winner.get("adapter_manifest_sha256"),
+                "direction": winner.get("direction"),
+            }
+            for key, winner in sorted(task_winners.items())
+        }
+    return {
+        "scope": comparison.get("scope"),
+        "candidate_a_freeze": comparison.get("candidate_a_freeze"),
+        "selection_sha256": comparison.get("selection_sha256"),
+        "winners": winners,
+    }
+
+
+def selection_identity_sha256(comparison: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            selection_identity(comparison),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
 def run_task_bakeoff(
     *,
     task: str,
@@ -1235,6 +1272,9 @@ def run_task_bakeoff(
         winner = {
             "candidate_id": candidate_a["id"],
             "adapter": str(candidate_a_adapter),
+            "adapter_manifest_sha256": tree_manifest(candidate_a_adapter)[
+                "manifest_sha256"
+            ],
             "direction": direction,
             "score": baseline_score,
             "decision": "candidate_a_retained",
@@ -1250,6 +1290,9 @@ def run_task_bakeoff(
                 winner = {
                     "candidate_id": challenger["candidate"]["id"],
                     "adapter": challenger["adapter"],
+                    "adapter_manifest_sha256": tree_manifest(
+                        Path(challenger["adapter"])
+                    )["manifest_sha256"],
                     "direction": direction,
                     "score": challenger_score,
                     "decision": (
@@ -1374,6 +1417,22 @@ def main() -> int:
         "blind_test_v2": "pending",
     }
     comparison_path = ROOT / "data/reports/model_bakeoff/comparison.json"
+    selection_snapshot_path = (
+        ROOT
+        / "data/reports/model_bakeoff"
+        / f"selection_comparison-{selection_identity_sha256(comparison)[:16]}.json"
+    )
+    if selection_snapshot_path.is_file():
+        selection_snapshot = json.loads(
+            selection_snapshot_path.read_text(encoding="utf-8")
+        )
+        if selection_snapshot.get("status") != "selection_complete":
+            raise ValueError("Immutable selection snapshot has an invalid status")
+        if selection_identity(selection_snapshot) != selection_identity(comparison):
+            raise ValueError("Immutable selection snapshot does not match resumed winners")
+    else:
+        selection_snapshot = deepcopy(comparison)
+        atomic_json(selection_snapshot_path, selection_snapshot)
     atomic_json(comparison_path, comparison)
 
     blind_lock_path = ROOT / config["data"]["blind_test_v2_lock"]
@@ -1382,7 +1441,7 @@ def main() -> int:
         state["stage"] = "blind_locked_test_v2"
         state["execution_status"] = "waiting_for_blind_test_v2"
         state["next_stage"] = "blind_locked_test_v2"
-        state["selection_comparison"] = str(comparison_path)
+        state["selection_comparison"] = str(selection_snapshot_path)
         atomic_json(state_path, state)
         print(
             json.dumps(
@@ -1390,7 +1449,7 @@ def main() -> int:
                     **report,
                     "state": str(state_path),
                     "candidate_a_freeze": str(freeze_path),
-                    "selection_comparison": str(comparison_path),
+                    "selection_comparison": str(selection_snapshot_path),
                     "next_stage": state["next_stage"],
                     "note": "Selection is complete; promotion is blocked until unseen blind v2 data is checksum-locked.",
                 },
@@ -1426,6 +1485,8 @@ def main() -> int:
             winner["adapter"],
             "--scope",
             args.scope,
+            "--selection-comparison",
+            str(selection_snapshot_path),
             "--output-dir",
             str(blind_output),
         ]

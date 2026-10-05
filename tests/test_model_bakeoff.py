@@ -17,6 +17,8 @@ from scripts.run_model_bakeoff import (
     multi_metric_stronger,
     report_score,
     run_stage,
+    selection_identity,
+    selection_identity_sha256,
     validate_candidate_matrix,
     validate_deployment_report,
     validate_resources,
@@ -261,6 +263,9 @@ def test_asr_selection_rejects_bad_code_switch_wer():
 
 def test_candidate_a_mt_is_benchmarked_per_direction(monkeypatch, tmp_path: Path):
     calls = []
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
 
     def fake_benchmark_unit(**kwargs):
         direction = kwargs["direction"]
@@ -295,7 +300,7 @@ def test_candidate_a_mt_is_benchmarked_per_direction(monkeypatch, tmp_path: Path
         task="mt",
         config=data,
         research_approvals=set(),
-        frozen={"adapters": {"mt": {"root": str(tmp_path)}}},
+        frozen={"adapters": {"mt": {"root": str(adapter)}}},
         python=sys.executable,
         state_dir=tmp_path,
         state_path=tmp_path / "state.json",
@@ -336,6 +341,38 @@ def test_mt_multi_metric_winner_rejects_significant_bleu_regression():
 
     assert multi_metric_stronger(bleu_regression, baseline) is False
     assert multi_metric_stronger(pareto_improvement, baseline) is True
+
+
+def test_selection_identity_ignores_later_blind_results_but_binds_winners():
+    comparison = {
+        "status": "selection_complete",
+        "scope": "research",
+        "candidate_a_freeze": "freeze.json",
+        "selection_sha256": {"mt": "a", "asr": "b"},
+        "results": {
+            "mt": {
+                "winners": {
+                    "en_to_vi": {
+                        "candidate_id": "mt-winner",
+                        "adapter": "/models/mt",
+                        "adapter_manifest_sha256": "c" * 64,
+                        "direction": "en_to_vi",
+                    }
+                }
+            },
+            "asr": {"winners": {}},
+        },
+    }
+    finalized = json.loads(json.dumps(comparison))
+    finalized["status"] = "blind_complete"
+    finalized["blind_test_v2"] = [{"promotion_allowed": True}]
+
+    assert selection_identity(finalized) == selection_identity(comparison)
+    assert selection_identity_sha256(finalized) == selection_identity_sha256(comparison)
+
+    finalized["results"]["mt"]["winners"]["en_to_vi"]["candidate_id"] = "other"
+    assert selection_identity(finalized) != selection_identity(comparison)
+    assert selection_identity_sha256(finalized) != selection_identity_sha256(comparison)
 
 
 def test_asr_selection_requires_cer_evidence():

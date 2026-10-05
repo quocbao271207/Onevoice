@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts.run_blind_candidate_suite import (
+    adapter_tree_manifest,
     blind_quality_failures,
+    evaluate,
     load_locked_accuracy_config,
     sha256,
     validate_content_integrity,
     validate_identifiers,
     verify_lock,
+    verify_report_provenance,
+    verify_selection_winner,
 )
 from src.data.quality import fingerprint_text
 
@@ -48,6 +54,214 @@ def test_placeholder_blind_lock_cannot_be_opened():
     root = Path(__file__).resolve().parents[1]
     with pytest.raises(ValueError, match="not locked"):
         verify_lock(root / "data/eval/blind_test_v2.lock.json")
+
+
+def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    weights = adapter / "adapter_model.safetensors"
+    weights.write_bytes(b"winner-weights")
+    manifest = adapter_tree_manifest(adapter)
+    comparison = tmp_path / "comparison.json"
+    comparison.write_text(
+        json.dumps(
+            {
+                "status": "selection_complete",
+                "results": {
+                    "mt": {
+                        "winners": {
+                            "en_to_vi": {
+                                "candidate_id": "mt-winner",
+                                "adapter": str(adapter),
+                                "adapter_manifest_sha256": manifest["manifest_sha256"],
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selected = verify_selection_winner(
+        comparison, "mt", "en_to_vi", "mt-winner", adapter
+    )
+
+    assert selected["sha256"] == sha256(comparison)
+    assert selected["adapter_manifest"]["manifest_sha256"] == manifest["manifest_sha256"]
+    with pytest.raises(ValueError, match="not the selected winner"):
+        verify_selection_winner(comparison, "mt", "en_to_vi", "other", adapter)
+
+    weights.write_bytes(b"changed-after-selection")
+    with pytest.raises(ValueError, match="adapter checksum"):
+        verify_selection_winner(comparison, "mt", "en_to_vi", "mt-winner", adapter)
+
+
+def test_blind_report_provenance_rejects_tampering(tmp_path: Path):
+    report = tmp_path / "blind.json"
+    report.write_text('{"wer":0.1}', encoding="utf-8")
+    provenance = tmp_path / "blind_provenance.json"
+    provenance.write_text(
+        json.dumps(
+            {
+                "specification_sha256": "a" * 64,
+                "blind_manifest_sha256": "b" * 64,
+                "selection_sha256": "c" * 64,
+                "report_sha256": sha256(report),
+                "report_bytes": report.stat().st_size,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert verify_report_provenance(
+        report, provenance, "a" * 64, "b" * 64, "c" * 64
+    )["report_sha256"] == sha256(report)
+
+    report.write_text('{"wer":0.9}', encoding="utf-8")
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        verify_report_provenance(
+            report, provenance, "a" * 64, "b" * 64, "c" * 64
+        )
+
+
+def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter / "adapter_model.safetensors").write_bytes(b"selected-weights")
+    adapter_manifest = adapter_tree_manifest(adapter)
+
+    mt_manifest = tmp_path / "blind-mt.jsonl"
+    asr_manifest = tmp_path / "blind-asr.jsonl"
+    mt_manifest.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr_manifest.write_text('{"id":"asr"}\n', encoding="utf-8")
+    comparison = tmp_path / "selection.json"
+    comparison.write_text(
+        json.dumps(
+            {
+                "status": "selection_complete",
+                "results": {
+                    "mt": {
+                        "winners": {
+                            "en_to_vi": {
+                                "candidate_id": "mt-winner",
+                                "adapter": str(adapter),
+                                "adapter_manifest_sha256": adapter_manifest[
+                                    "manifest_sha256"
+                                ],
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text(
+        json.dumps(
+            {
+                "status": "locked_unopened",
+                "manifests": {
+                    "mt": {"path": str(mt_manifest), "sha256": sha256(mt_manifest)},
+                    "asr": {"path": str(asr_manifest), "sha256": sha256(asr_manifest)},
+                },
+                "selection": None,
+                "opened": {"mt": {"en_to_vi": None, "vi_to_en": None}, "asr": None},
+            }
+        ),
+        encoding="utf-8",
+    )
+    accuracy = tmp_path / "accuracy.yaml"
+    accuracy.write_text(
+        "release_gates:\n  aggregate:\n    mt_sacrebleu_min: 25\n    mt_chrf2_min: 46\n",
+        encoding="utf-8",
+    )
+    config = {
+        "candidates": {
+            "mt": [
+                {
+                    "id": "mt-winner",
+                    "model": "base-model",
+                    "revision": "r" * 40,
+                    "model_family": "nllb",
+                    "license": {"production_eligible": True},
+                }
+            ]
+        },
+        "promotion_gate": {"critical_slices": [], "policy_slices": []},
+        "data": {
+            "accuracy_program": {"path": str(accuracy), "sha256": sha256(accuracy)}
+        },
+    }
+    output = tmp_path / "output"
+    output.mkdir()
+    stem = "blind_v2_mt_en_to_vi_mt-winner"
+    report = output / f"{stem}.json"
+    report.write_text(
+        json.dumps(
+            {
+                "directions": {
+                    "en_to_vi": {
+                        "samples": 1,
+                        "sacrebleu": 30.0,
+                        "sacrebleu_bootstrap_95ci": [29.0, 31.0],
+                        "chrf2": 50.0,
+                        "chrf2_bootstrap_95ci": [49.0, 51.0],
+                    }
+                },
+                "categories": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    specification = {
+        "candidate": "mt-winner",
+        "model": "base-model",
+        "revision": "r" * 40,
+        "adapter": str(adapter.resolve()),
+        "adapter_manifest_sha256": adapter_manifest["manifest_sha256"],
+        "selection_sha256": sha256(comparison),
+        "blind_manifest_sha256": sha256(mt_manifest),
+        "direction": "en_to_vi",
+        "scope": "research",
+    }
+    specification_sha = hashlib.sha256(
+        json.dumps(specification, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    provenance = output / f"{stem}_provenance.json"
+    provenance.write_text(
+        json.dumps(
+            {
+                "specification_sha256": specification_sha,
+                "blind_manifest_sha256": sha256(mt_manifest),
+                "selection_sha256": sha256(comparison),
+                "report_sha256": sha256(report),
+                "report_bytes": report.stat().st_size,
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        task="mt",
+        direction="en_to_vi",
+        candidate="mt-winner",
+        adapter=adapter,
+        selection_comparison=comparison,
+        scope="research",
+        output_dir=output,
+        python="unused",
+    )
+
+    result = evaluate(args, lock_path, config)
+
+    locked = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert result["promotion_allowed"] is True
+    assert result["report_sha256"] == sha256(report)
+    assert locked["selection"]["sha256"] == sha256(comparison)
+    assert locked["opened"]["mt"]["en_to_vi"]["candidate_sha256"] == specification_sha
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,36 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def adapter_tree_manifest(adapter: Path) -> dict[str, Any]:
+    adapter = adapter.resolve()
+    if not (adapter / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"Blind adapter is incomplete: {adapter}")
+    files = []
+    for path in sorted(adapter.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Blind adapter cannot contain symlinks: {path}")
+        if path.is_file():
+            files.append(
+                {
+                    "path": path.relative_to(adapter).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+    if not files:
+        raise ValueError(f"Blind adapter is empty: {adapter}")
+    digest = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "root": str(adapter),
+        "file_count": len(files),
+        "bytes": sum(int(item["bytes"]) for item in files),
+        "manifest_sha256": digest,
+        "files": files,
+    }
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -300,6 +330,7 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         "status": "locked_unopened",
         "locked_at": utc_now(),
         "manifests": manifests,
+        "selection": None,
         "opened": {"mt": {"en_to_vi": None, "vi_to_en": None}, "asr": None},
     }
     atomic_json(lock_path, locked)
@@ -317,6 +348,11 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
         path = Path(record["path"])
         if not path.is_file() or sha256(path) != record["sha256"]:
             raise ValueError(f"Blind {task} checksum mismatch")
+    selection = lock.get("selection")
+    if selection:
+        path = Path(selection["path"])
+        if not path.is_file() or sha256(path) != selection["sha256"]:
+            raise ValueError("Blind selection comparison checksum mismatch")
     return lock
 
 
@@ -325,6 +361,63 @@ def candidate_from_config(config: dict[str, Any], task: str, candidate_id: str) 
         if candidate["id"] == candidate_id:
             return candidate
     raise ValueError(f"Unknown {task} candidate: {candidate_id}")
+
+
+def verify_selection_winner(
+    comparison_path: Path,
+    task: str,
+    direction: str | None,
+    candidate_id: str,
+    adapter: Path,
+) -> dict[str, Any]:
+    comparison_path = comparison_path.resolve()
+    if not comparison_path.is_file():
+        raise FileNotFoundError(comparison_path)
+    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    if comparison.get("status") != "selection_complete":
+        raise ValueError("Blind evaluation requires a finalized selection comparison")
+    key = str(direction or "vi")
+    try:
+        winner = comparison["results"][task]["winners"][key]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Selection comparison lacks winner for {task}/{key}") from exc
+    if winner.get("candidate_id") != candidate_id:
+        raise ValueError(f"Blind candidate is not the selected winner for {task}/{key}")
+    adapter = adapter.resolve()
+    if Path(str(winner.get("adapter") or "")).resolve() != adapter:
+        raise ValueError(f"Blind adapter path does not match selected winner for {task}/{key}")
+    manifest = adapter_tree_manifest(adapter)
+    expected_manifest = str(winner.get("adapter_manifest_sha256") or "")
+    if manifest["manifest_sha256"] != expected_manifest:
+        raise ValueError(f"Blind adapter checksum does not match selected winner for {task}/{key}")
+    return {
+        "path": str(comparison_path),
+        "sha256": sha256(comparison_path),
+        "winner": winner,
+        "adapter_manifest": manifest,
+    }
+
+
+def verify_report_provenance(
+    report_path: Path,
+    provenance_path: Path,
+    specification_sha256: str,
+    manifest_sha256: str,
+    selection_sha256: str,
+) -> dict[str, Any]:
+    if not report_path.is_file() or not provenance_path.is_file():
+        raise FileNotFoundError(f"Blind report provenance is incomplete: {report_path}")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    expected = {
+        "specification_sha256": specification_sha256,
+        "blind_manifest_sha256": manifest_sha256,
+        "selection_sha256": selection_sha256,
+        "report_sha256": sha256(report_path),
+        "report_bytes": report_path.stat().st_size,
+    }
+    if any(provenance.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"Blind report provenance mismatch: {report_path}")
+    return provenance
 
 
 def opening_slot(lock: dict[str, Any], task: str, direction: str | None) -> tuple[dict[str, Any], str]:
@@ -342,30 +435,58 @@ def evaluate(
     candidate = candidate_from_config(config, args.task, args.candidate)
     if args.scope == "production" and not candidate["license"].get("production_eligible"):
         raise ValueError("Candidate license is not approved for production promotion")
+    selection = verify_selection_winner(
+        args.selection_comparison,
+        args.task,
+        args.direction,
+        args.candidate,
+        args.adapter,
+    )
+    selection_record = {
+        "path": selection["path"],
+        "sha256": selection["sha256"],
+    }
+    existing_selection = lock.get("selection")
+    if existing_selection is not None and existing_selection != selection_record:
+        raise ValueError("Blind suite was already bound to another selection comparison")
     slot, key = opening_slot(lock, args.task, args.direction)
     specification = {
         "candidate": args.candidate,
         "model": candidate["model"],
         "revision": candidate["revision"],
         "adapter": str(args.adapter.resolve()),
+        "adapter_manifest_sha256": selection["adapter_manifest"]["manifest_sha256"],
+        "selection_sha256": selection["sha256"],
+        "blind_manifest_sha256": lock["manifests"][args.task]["sha256"],
         "direction": args.direction,
         "scope": args.scope,
     }
     digest = hashlib.sha256(
         json.dumps(specification, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    previous = slot.get(key)
-    if previous and previous.get("candidate_sha256") != digest:
-        raise ValueError(f"Blind slot {args.task}/{key} was already opened for another candidate")
-    if previous is None:
-        slot[key] = {**specification, "candidate_sha256": digest, "opened_at": utc_now()}
-        lock["status"] = "partially_opened"
-        atomic_json(lock_path, lock)
-
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"blind_v2_{args.task}_{key}_{args.candidate}"
     report_path = output_dir / f"{stem}.json"
+    provenance_path = output_dir / f"{stem}_provenance.json"
+    if report_path.is_file():
+        verify_report_provenance(
+            report_path,
+            provenance_path,
+            digest,
+            specification["blind_manifest_sha256"],
+            selection["sha256"],
+        )
+
+    previous = slot.get(key)
+    if previous and previous.get("candidate_sha256") != digest:
+        raise ValueError(f"Blind slot {args.task}/{key} was already opened for another candidate")
+    if previous is None:
+        lock["selection"] = selection_record
+        slot[key] = {**specification, "candidate_sha256": digest, "opened_at": utc_now()}
+        lock["status"] = "partially_opened"
+        atomic_json(lock_path, lock)
+
     if not report_path.is_file():
         command = [
             args.python,
@@ -427,6 +548,32 @@ def evaluate(
             raise RuntimeError(
                 f"Blind benchmark failed with {monitored['return_code']}; see {log_path}"
             )
+        if not report_path.is_file():
+            raise FileNotFoundError(f"Blind benchmark did not create report: {report_path}")
+        atomic_json(
+            provenance_path,
+            {
+                "version": 1,
+                "created_at": utc_now(),
+                "specification_sha256": digest,
+                "blind_manifest_sha256": specification["blind_manifest_sha256"],
+                "selection_sha256": selection["sha256"],
+                "report": str(report_path),
+                "report_bytes": report_path.stat().st_size,
+                "report_sha256": sha256(report_path),
+            },
+        )
+    provenance = verify_report_provenance(
+        report_path,
+        provenance_path,
+        digest,
+        specification["blind_manifest_sha256"],
+        selection["sha256"],
+    )
+    if adapter_tree_manifest(args.adapter)["manifest_sha256"] != specification[
+        "adapter_manifest_sha256"
+    ]:
+        raise ValueError("Blind adapter changed during evaluation")
     report = json.loads(report_path.read_text(encoding="utf-8"))
     required = config["promotion_gate"]["critical_slices"] + config["promotion_gate"]["policy_slices"]
     failed = clinical_failures(report, required)
@@ -442,7 +589,11 @@ def evaluate(
         "evaluated_at": utc_now(),
         "candidate": specification,
         "manifest_sha256": lock["manifests"][args.task]["sha256"],
+        "selection_sha256": selection["sha256"],
         "report": str(report_path),
+        "report_bytes": provenance["report_bytes"],
+        "report_sha256": provenance["report_sha256"],
+        "report_provenance": str(provenance_path),
         "critical_gate": "pass" if not failed else "fail",
         "failed_slices": failed,
         "quality_gate": "pass" if not quality_failed else "fail",
@@ -468,6 +619,7 @@ def main() -> int:
     parser.add_argument("--direction", choices=["en_to_vi", "vi_to_en"])
     parser.add_argument("--candidate")
     parser.add_argument("--adapter", type=Path)
+    parser.add_argument("--selection-comparison", type=Path)
     parser.add_argument("--scope", choices=["research", "production"], default="research")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/reports/model_bakeoff/blind_v2")
     parser.add_argument("--python", default=sys.executable)
@@ -480,8 +632,11 @@ def main() -> int:
     elif args.action == "verify":
         result = verify_lock(args.lock)
     else:
-        if not args.task or not args.candidate or not args.adapter:
-            parser.error("--action evaluate requires --task, --candidate and --adapter")
+        if not args.task or not args.candidate or not args.adapter or not args.selection_comparison:
+            parser.error(
+                "--action evaluate requires --task, --candidate, --adapter and "
+                "--selection-comparison"
+            )
         if not args.adapter.is_dir():
             parser.error("--adapter must be a directory")
         result = evaluate(args, args.lock, config)
