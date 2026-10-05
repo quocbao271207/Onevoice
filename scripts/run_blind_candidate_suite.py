@@ -79,12 +79,43 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def values(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> set[str]:
-    result = set()
-    for row in rows:
-        for key in keys:
-            if row.get(key):
-                result.add(f"{key}:{row[key]}")
+def leakage_values(task: str, rows: list[dict[str, Any]]) -> set[str]:
+    """Derive comparison keys from payloads so absent metadata cannot hide overlap."""
+    result: set[str] = set()
+    for index, row in enumerate(rows, start=1):
+        identifier = str(row.get("id") or "").strip()
+        if identifier:
+            result.add(f"id:{identifier}")
+        if task == "mt":
+            source = normalize_text(row.get("source_text"))
+            target = normalize_text(row.get("target_text"))
+            if not source or not target:
+                raise ValueError(
+                    f"MT leakage comparison row {index} lacks source_text or target_text"
+                )
+            result.add(f"pair_fingerprint:{fingerprint_text(source + chr(31) + target)}")
+            continue
+
+        text_value = normalize_text(row.get("text"))
+        if not text_value:
+            raise ValueError(f"ASR leakage comparison row {index} lacks text")
+        result.add(f"text_fingerprint:{fingerprint_text(text_value)}")
+        audio_digest = str(row.get("audio_sha256") or "").strip()
+        if not audio_digest:
+            audio_value = str(row.get("audio_path") or "").strip()
+            if not audio_value:
+                raise ValueError(
+                    f"ASR leakage comparison row {index} lacks audio_sha256 and audio_path"
+                )
+            audio_path = Path(audio_value)
+            if not audio_path.is_absolute():
+                audio_path = ROOT / audio_path
+            if not audio_path.is_file():
+                raise FileNotFoundError(
+                    f"ASR leakage comparison audio is missing on row {index}: {audio_path}"
+                )
+            audio_digest = sha256(audio_path)
+        result.add(f"audio_sha256:{audio_digest}")
     return result
 
 
@@ -126,6 +157,11 @@ def validate_content_integrity(task: str, rows: list[dict[str, Any]]) -> None:
     """Recompute blind fingerprints from payloads instead of trusting metadata."""
     for index, row in enumerate(rows, start=1):
         if task == "mt":
+            if row.get("source_language") != "en" or row.get("target_language") != "vi":
+                raise ValueError(
+                    f"Blind mt row {index} must use canonical source_language=en and "
+                    "target_language=vi"
+                )
             source = normalize_text(row.get("source_text"))
             target = normalize_text(row.get("target_text"))
             if not source or not target:
@@ -139,6 +175,8 @@ def validate_content_integrity(task: str, rows: list[dict[str, Any]]) -> None:
                 )
             continue
 
+        if not str(row.get("language") or "").startswith("vi"):
+            raise ValueError(f"Blind asr row {index} must declare a Vietnamese language")
         text_value = normalize_text(row.get("text"))
         if not text_value:
             raise ValueError(f"Blind asr manifest is missing text on row {index}")
@@ -409,12 +447,7 @@ def load_locked_accuracy_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str, Any]) -> None:
-    keys = ("id", "pair_fingerprint") if task == "mt" else (
-        "id",
-        "text_fingerprint",
-        "audio_sha256",
-    )
-    blind_values = values(blind_rows, keys)
+    blind_values = leakage_values(task, blind_rows)
     comparison_paths = [
         ROOT / config["data"]["train"][task],
         ROOT / config["data"]["selection_dev"][task]["path"],
@@ -427,7 +460,7 @@ def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str,
     for path in comparison_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
-        overlap = blind_values & values(read_jsonl(path), keys)
+        overlap = blind_values & leakage_values(task, read_jsonl(path))
         if overlap:
             raise ValueError(f"Blind {task} leakage against {path}: {len(overlap)} keys")
 

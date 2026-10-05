@@ -13,6 +13,7 @@ from scripts.run_blind_candidate_suite import (
     blind_report_coverage_failures,
     blind_quality_failures,
     coverage_counts,
+    ensure_unseen,
     evaluate,
     load_locked_accuracy_config,
     sha256,
@@ -500,6 +501,8 @@ def test_blind_mt_fingerprint_is_recomputed_from_text():
     target = "Uống aspirin 81 mg mỗi ngày."
     row = {
         "id": "mt-1",
+        "source_language": "en",
+        "target_language": "vi",
         "source_text": source,
         "target_text": target,
         "pair_fingerprint": fingerprint_text(source + "\x1f" + target),
@@ -514,6 +517,8 @@ def test_blind_mt_fingerprint_is_recomputed_from_text():
 @pytest.mark.parametrize("missing", ["source_text", "target_text"])
 def test_blind_mt_requires_both_text_sides(missing):
     row = {
+        "source_language": "en",
+        "target_language": "vi",
         "source_text": "No penicillin.",
         "target_text": "Không dùng penicillin.",
         "pair_fingerprint": "declared",
@@ -529,6 +534,7 @@ def test_blind_asr_fingerprints_are_recomputed_from_text_and_audio(tmp_path: Pat
     text = "Không dùng penicillin 500 mg."
     row = {
         "id": "asr-1",
+        "language": "vi",
         "text": text,
         "text_fingerprint": fingerprint_text(text),
         "audio_path": str(audio),
@@ -549,6 +555,7 @@ def test_blind_asr_fingerprints_are_recomputed_from_text_and_audio(tmp_path: Pat
 def test_blind_asr_requires_existing_audio(tmp_path: Path):
     text = "Không dùng penicillin."
     row = {
+        "language": "vi",
         "text": text,
         "text_fingerprint": fingerprint_text(text),
         "audio_path": str(tmp_path / "missing.flac"),
@@ -556,6 +563,123 @@ def test_blind_asr_requires_existing_audio(tmp_path: Path):
     }
     with pytest.raises(FileNotFoundError, match="audio is missing"):
         validate_content_integrity("asr", [row])
+
+
+def test_blind_content_requires_canonical_task_languages(tmp_path: Path):
+    mt = {
+        "source_language": "vi",
+        "target_language": "en",
+        "source_text": "Không dùng aspirin.",
+        "target_text": "Do not use aspirin.",
+        "pair_fingerprint": "declared",
+    }
+    with pytest.raises(ValueError, match="canonical source_language=en"):
+        validate_content_integrity("mt", [mt])
+
+    audio = tmp_path / "english.flac"
+    audio.write_bytes(b"audio")
+    asr = {
+        "language": "en",
+        "text": "Do not use aspirin.",
+        "text_fingerprint": fingerprint_text("Do not use aspirin."),
+        "audio_path": str(audio),
+        "audio_sha256": sha256(audio),
+    }
+    with pytest.raises(ValueError, match="Vietnamese language"):
+        validate_content_integrity("asr", [asr])
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _unseen_config(task: str, train: Path, selection: Path) -> dict:
+    other = "asr" if task == "mt" else "mt"
+    return {
+        "data": {
+            "train": {task: str(train), other: str(train)},
+            "selection_dev": {
+                task: {"path": str(selection)},
+                other: {"path": str(selection)},
+            },
+            "forbidden_selection_inputs": [],
+        }
+    }
+
+
+def test_blind_mt_leakage_is_recomputed_when_historical_fingerprint_is_missing(
+    tmp_path: Path,
+):
+    source = "Take aspirin 81 mg daily."
+    target = "Uống aspirin 81 mg mỗi ngày."
+    train = tmp_path / "mt-train.jsonl"
+    selection = tmp_path / "mt-selection.jsonl"
+    _write_jsonl(
+        train,
+        [{"id": "historical", "source_text": source, "target_text": target}],
+    )
+    _write_jsonl(
+        selection,
+        [{"id": "other", "source_text": "No fever.", "target_text": "Không sốt."}],
+    )
+    blind = [
+        {
+            "id": "new-id",
+            "source_text": source,
+            "target_text": target,
+            "pair_fingerprint": fingerprint_text(source + "\x1f" + target),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="leakage against"):
+        ensure_unseen("mt", blind, _unseen_config("mt", train, selection))
+
+
+def test_blind_asr_leakage_hashes_audio_when_historical_sha_is_missing(
+    tmp_path: Path,
+):
+    historical_audio = tmp_path / "historical.flac"
+    blind_audio = tmp_path / "blind.flac"
+    historical_audio.write_bytes(b"same-audio-content")
+    blind_audio.write_bytes(b"same-audio-content")
+    train = tmp_path / "asr-train.jsonl"
+    selection = tmp_path / "asr-selection.jsonl"
+    _write_jsonl(
+        train,
+        [
+            {
+                "id": "historical",
+                "text": "Một câu lịch sử.",
+                "audio_path": str(historical_audio),
+            }
+        ],
+    )
+    other_audio = tmp_path / "other.flac"
+    other_audio.write_bytes(b"other-audio-content")
+    _write_jsonl(
+        selection,
+        [
+            {
+                "id": "other",
+                "text": "Một câu khác.",
+                "audio_path": str(other_audio),
+            }
+        ],
+    )
+    blind = [
+        {
+            "id": "new-id",
+            "text": "Nội dung hoàn toàn mới.",
+            "audio_path": str(blind_audio),
+            "audio_sha256": sha256(blind_audio),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="leakage against"):
+        ensure_unseen("asr", blind, _unseen_config("asr", train, selection))
 
 
 def test_blind_coverage_counts_unique_slices_per_row():
