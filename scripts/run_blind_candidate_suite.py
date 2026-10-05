@@ -280,6 +280,61 @@ def clinical_failures(report: dict[str, Any], required: list[str]) -> list[str]:
     return failures
 
 
+def _reported_samples(record: Any) -> int | None:
+    try:
+        samples = int(record.get("samples")) if isinstance(record, dict) else None
+    except (TypeError, ValueError):
+        return None
+    return samples if samples is not None and samples >= 0 else None
+
+
+def _casefold_record(records: Any, name: str) -> dict[str, Any] | None:
+    if not isinstance(records, dict):
+        return None
+    target = name.casefold()
+    for key, value in records.items():
+        if str(key).casefold() == target and isinstance(value, dict):
+            return value
+    return None
+
+
+def blind_report_coverage_failures(
+    report: dict[str, Any],
+    task: str,
+    direction: str | None,
+    expected_rows: int,
+    expected_slices: dict[str, int],
+) -> list[str]:
+    """Bind report sample counts to the immutable blind manifest coverage."""
+    metric_view = report
+    if task == "mt":
+        metric_view = _casefold_record(report.get("directions"), str(direction)) or {}
+    failures: list[str] = []
+    actual_rows = _reported_samples(metric_view)
+    if actual_rows != expected_rows:
+        failures.append(f"rows:{actual_rows}/{expected_rows}")
+
+    categories = report.get("categories") or {}
+    slices = report.get("slices") or {}
+    for name, expected in sorted(expected_slices.items()):
+        if task == "mt" and name in {"en_to_vi", "vi_to_en"}:
+            if name != direction:
+                continue
+            record = _casefold_record(report.get("directions"), name)
+        elif task == "asr" and name in {"north", "central", "south"}:
+            record = _casefold_record(slices.get("accent"), name)
+        elif task == "asr" and name in {"doctor", "patient"}:
+            record = _casefold_record(slices.get("role"), name)
+        elif task == "asr" and name == "noise":
+            record = _casefold_record(slices.get("noise"), "true")
+        else:
+            record = _casefold_record(categories, name)
+        actual = _reported_samples(record)
+        if actual != expected:
+            failures.append(f"slice:{name}:{actual}/{expected}")
+    return failures
+
+
 def blind_quality_failures(
     report: dict[str, Any],
     task: str,
@@ -678,6 +733,18 @@ def evaluate(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     required = config["promotion_gate"]["critical_slices"] + config["promotion_gate"]["policy_slices"]
     failed = clinical_failures(report, required)
+    manifest_record = lock["manifests"][args.task]
+    expected_slices = {
+        name: int(manifest_record["coverage"]["slice_samples"][name])
+        for name in lock["required_slices"][args.task]
+    }
+    coverage_failed = blind_report_coverage_failures(
+        report,
+        args.task,
+        args.direction,
+        int(manifest_record["rows"]),
+        expected_slices,
+    )
     accuracy_config = load_locked_accuracy_config(config)
     quality_failed = blind_quality_failures(
         report,
@@ -697,9 +764,11 @@ def evaluate(
         "report_provenance": str(provenance_path),
         "critical_gate": "pass" if not failed else "fail",
         "failed_slices": failed,
+        "coverage_gate": "pass" if not coverage_failed else "fail",
+        "coverage_failures": coverage_failed,
         "quality_gate": "pass" if not quality_failed else "fail",
         "quality_failures": quality_failed,
-        "promotion_allowed": not failed and not quality_failed,
+        "promotion_allowed": not failed and not coverage_failed and not quality_failed,
     }
     atomic_json(output_dir / f"{stem}_gate.json", result)
     slot[key]["result"] = result

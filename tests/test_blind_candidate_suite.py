@@ -10,6 +10,7 @@ import yaml
 
 from scripts.run_blind_candidate_suite import (
     adapter_tree_manifest,
+    blind_report_coverage_failures,
     blind_quality_failures,
     coverage_counts,
     evaluate,
@@ -408,6 +409,7 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
 
     locked = json.loads(lock_path.read_text(encoding="utf-8"))
     assert result["promotion_allowed"] is True
+    assert result["coverage_gate"] == "pass"
     assert result["report_sha256"] == sha256(report)
     assert locked["selection"]["sha256"] == sha256(comparison)
     assert locked["opened"]["mt"]["en_to_vi"]["candidate_sha256"] == specification_sha
@@ -643,6 +645,58 @@ def test_blind_minimum_coverage_is_a_hard_gate():
     del policy["slice_samples"]["negation"]
     with pytest.raises(ValueError, match="lacks required slice quotas"):
         validate_minimum_coverage("mt", rows, policy, required)
+
+
+def test_blind_report_coverage_must_match_locked_mt_manifest():
+    report = {
+        "directions": {"en_to_vi": {"samples": 2}},
+        "categories": {
+            "drug_name": {"samples": 2},
+            "dose": {"samples": 1},
+        },
+    }
+    expected = {
+        "drug_name": 2,
+        "dose": 1,
+        "en_to_vi": 2,
+        "vi_to_en": 2,
+    }
+    assert blind_report_coverage_failures(
+        report, "mt", "en_to_vi", 2, expected
+    ) == []
+
+    report["categories"]["dose"]["samples"] = 0
+    assert blind_report_coverage_failures(
+        report, "mt", "en_to_vi", 2, expected
+    ) == ["slice:dose:0/1"]
+
+
+def test_blind_report_coverage_must_match_locked_asr_dimensions():
+    report = {
+        "samples": 2,
+        "categories": {"code_switch": {"samples": 1}},
+        "slices": {
+            "accent": {"Central": {"samples": 2}},
+            "role": {
+                "Doctor": {"samples": 1},
+                "patient": {"samples": 1},
+            },
+            "noise": {"True": {"samples": 1}, "False": {"samples": 1}},
+        },
+    }
+    expected = {
+        "code_switch": 1,
+        "central": 2,
+        "doctor": 1,
+        "patient": 1,
+        "noise": 1,
+    }
+    assert blind_report_coverage_failures(report, "asr", None, 2, expected) == []
+
+    del report["slices"]["accent"]["Central"]
+    assert blind_report_coverage_failures(report, "asr", None, 2, expected) == [
+        "slice:central:None/2"
+    ]
 
 
 def accuracy_config():

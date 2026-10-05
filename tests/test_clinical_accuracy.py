@@ -14,6 +14,7 @@ from scripts.evaluate_benchmarks import (
     score_asr,
     score_mt,
 )
+from scripts.run_baseline_benchmarks import asr_prediction_slices
 from src.pipeline.safety_guard import extract_quantities, negation_count, validate_translation
 from src.training.clinical_sampling import (
     clinical_risk_tags,
@@ -171,6 +172,37 @@ def test_asr_safety_scoring_preserves_explicit_alternatives_and_fails_missing_va
     report = score_asr([perfect, failed])
     assert report["categories"]["drug_name"]["safety_failure_rate"] == 0.0
     assert report["categories"]["dose"]["safety_failure_rate"] == 0.5
+
+
+def test_asr_blind_dimensions_survive_prediction_and_slice_scoring():
+    dimensions = {
+        "accent_region": "Central",
+        "role": "Doctor",
+        "recording_condition": "clinic",
+        "noise": True,
+    }
+    slices = asr_prediction_slices({"blind_dimensions": dimensions})
+    assert slices == {
+        "accent": "Central",
+        "role": "Doctor",
+        "recording_condition": "clinic",
+        "noise": True,
+        "noise_snr": None,
+    }
+
+    report = score_asr(
+        [
+            {
+                "id": "blind-asr-1",
+                "reference": "Không dùng aspirin.",
+                "hypothesis": "Không dùng aspirin.",
+                **slices,
+            }
+        ]
+    )
+    assert report["slices"]["accent"]["Central"]["samples"] == 1
+    assert report["slices"]["role"]["Doctor"]["samples"] == 1
+    assert report["slices"]["noise"]["True"]["samples"] == 1
 
 
 def test_locked_safety_suite_has_no_exact_pair_overlap_with_training_manifest():

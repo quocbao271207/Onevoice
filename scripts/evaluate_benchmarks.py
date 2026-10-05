@@ -121,7 +121,15 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     slices: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        for key in ("source", "accent", "role", "recording_condition", "code_switch", "noise_snr"):
+        for key in (
+            "source",
+            "accent",
+            "role",
+            "recording_condition",
+            "code_switch",
+            "noise",
+            "noise_snr",
+        ):
             if row.get(key) not in (None, ""):
                 slices[key][str(row[key])].append(row)
     overall = score(rows)

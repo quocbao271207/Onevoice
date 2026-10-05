@@ -276,6 +276,24 @@ def attach_adapter(model: Any, adapter: Path | None) -> Any:
     return PeftModel.from_pretrained(model, str(adapter))
 
 
+def asr_prediction_slices(row: dict[str, Any]) -> dict[str, Any]:
+    """Preserve selection/blind dimensions in saved ASR predictions and reports."""
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    dimensions = row.get("blind_dimensions") or row.get("selection_dimensions") or {}
+    if not isinstance(dimensions, dict):
+        dimensions = {}
+    return {
+        "accent": row.get("accent") or dimensions.get("accent_region"),
+        "role": metadata.get("role") or dimensions.get("role"),
+        "recording_condition": metadata.get("rec_condition")
+        or dimensions.get("recording_condition"),
+        "noise": dimensions.get("noise") if isinstance(dimensions.get("noise"), bool) else None,
+        "noise_snr": row.get("noise_snr")
+        if row.get("noise_snr") is not None
+        else metadata.get("noise_snr"),
+    }
+
+
 def prepare_runtime(args: argparse.Namespace) -> str:
     device = resolve_device(args.device)
     if not 0.0 < args.gpu_memory_fraction <= 0.40:
@@ -355,10 +373,7 @@ def run_asr(
                         "reference": row["text"],
                         "hypothesis": hypothesis,
                         "source": row.get("source"),
-                        "accent": row.get("accent"),
-                        "role": row.get("metadata", {}).get("role")
-                        or row.get("selection_dimensions", {}).get("role"),
-                        "recording_condition": row.get("metadata", {}).get("rec_condition"),
+                        **asr_prediction_slices(row),
                         "code_switch": row.get("language") == "vi-code-switch"
                         or "code_switch" in row.get("categories", []),
                         "categories": row.get("categories", []),
