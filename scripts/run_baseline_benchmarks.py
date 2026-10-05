@@ -84,6 +84,17 @@ def batches(rows: list[Any], size: int):
         yield rows[offset : offset + size]
 
 
+def write_predictions_checkpoint(path: Path, predictions: list[dict[str, Any]]) -> None:
+    """Atomically preserve inference output before potentially long scoring."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in predictions) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
 def resolve_device(requested: str) -> str:
     """Resolve ``auto`` lazily so importing this module stays CPU-test friendly."""
     if requested != "auto":
@@ -125,7 +136,10 @@ def prepare_runtime(args: argparse.Namespace) -> str:
     return device
 
 
-def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def run_asr(
+    args: argparse.Namespace,
+    prediction_path: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
     eligible = [row for row in read_jsonl(args.manifest) if str(row.get("language") or "").startswith(args.language)]
@@ -203,6 +217,9 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                 )
             print(f"[ASR] {len(predictions)}/{len(rows)}", flush=True)
     generation_seconds = time.perf_counter() - generation_started
+    if prediction_path is not None:
+        write_predictions_checkpoint(prediction_path, predictions)
+        print(f"[artifact] wrote predictions checkpoint: {prediction_path}", flush=True)
     report = score_asr(predictions)
     report["decoding"] = {
         "num_beams": args.num_beams,
@@ -213,7 +230,10 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
     return predictions, report
 
 
-def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def run_mt(
+    args: argparse.Namespace,
+    prediction_path: Path | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     manifest_rows = read_jsonl(args.manifest)
@@ -278,6 +298,9 @@ def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, An
                     flush=True,
                 )
     generation_seconds = time.perf_counter() - generation_started
+    if prediction_path is not None:
+        write_predictions_checkpoint(prediction_path, predictions)
+        print(f"[artifact] wrote predictions checkpoint: {prediction_path}", flush=True)
     report = score_mt(predictions)
     report["decoding"] = {
         "num_beams": args.num_beams,
@@ -341,13 +364,12 @@ def main() -> int:
     if not args.manifest.is_file():
         raise FileNotFoundError(args.manifest)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    predictions, report = run_asr(args) if args.task == "asr" else run_mt(args)
     stem = args.name or (f"asr_{args.language}_base" if args.task == "asr" else "mt_base")
     prediction_path = args.output_dir / f"{stem}_predictions.jsonl"
-    prediction_path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in predictions) + "\n",
-        encoding="utf-8",
+    predictions, report = (
+        run_asr(args, prediction_path=prediction_path)
+        if args.task == "asr"
+        else run_mt(args, prediction_path=prediction_path)
     )
     report.update(
         {

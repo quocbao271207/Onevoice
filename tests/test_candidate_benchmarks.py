@@ -12,6 +12,7 @@ from scripts.run_baseline_benchmarks import (
     prepare_runtime,
     resolve_device,
     source_balanced_sample,
+    write_predictions_checkpoint,
 )
 from scripts.run_asr_candidate_suite import candidate_checks as asr_candidate_checks
 from scripts.run_mt_candidate_suite import candidate_checks as mt_candidate_checks
@@ -51,6 +52,19 @@ def test_source_balanced_sample_can_take_full_manifest():
     ]
     selected = source_balanced_sample(rows, len(rows), seed=7)
     assert {row["id"] for row in selected} == {"a", "b", "c"}
+
+
+def test_predictions_checkpoint_is_utf8_jsonl_and_replaces_stale_file(tmp_path: Path):
+    path = tmp_path / "candidate_predictions.jsonl"
+    path.write_text("stale", encoding="utf-8")
+    predictions = [{"id": "thuốc", "hypothesis": "Không dùng 5 mg."}]
+
+    write_predictions_checkpoint(path, predictions)
+
+    assert path.read_text(encoding="utf-8") == (
+        '{"id": "thuốc", "hypothesis": "Không dùng 5 mg."}\n'
+    )
+    assert not path.with_suffix(".jsonl.tmp").exists()
 
 
 def test_candidate_gate_requires_every_clinical_slice():
