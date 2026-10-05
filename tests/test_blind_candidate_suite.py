@@ -431,6 +431,30 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
             [{"id": "asr-1", "text_fingerprint": "text-1"}],
             "missing audio_sha256",
         ),
+        (
+            "asr",
+            [
+                {
+                    "id": "asr-1",
+                    "text_fingerprint": "text-1",
+                    "audio_sha256": "audio",
+                    "group": "group-1",
+                }
+            ],
+            "missing speaker",
+        ),
+        (
+            "asr",
+            [
+                {
+                    "id": "asr-1",
+                    "text_fingerprint": "text-1",
+                    "audio_sha256": "audio",
+                    "speaker": "speaker-1",
+                }
+            ],
+            "missing group",
+        ),
     ],
 )
 def test_blind_identifiers_require_leakage_fingerprints(task, rows, message):
@@ -464,11 +488,15 @@ def test_blind_identifiers_require_leakage_fingerprints(task, rows, message):
                     "id": "asr-1",
                     "text_fingerprint": "text-1",
                     "audio_sha256": "audio",
+                    "speaker": "speaker-1",
+                    "group": "group-1",
                 },
                 {
                     "id": "asr-2",
                     "text_fingerprint": "text-2",
                     "audio_sha256": "audio",
+                    "speaker": "speaker-2",
+                    "group": "group-2",
                 },
             ],
             "duplicate audio_sha256",
@@ -480,11 +508,15 @@ def test_blind_identifiers_require_leakage_fingerprints(task, rows, message):
                     "id": "asr",
                     "text_fingerprint": "text-1",
                     "audio_sha256": "audio-1",
+                    "speaker": "speaker-1",
+                    "group": "group-1",
                 },
                 {
                     "id": "asr",
                     "text_fingerprint": "text-2",
                     "audio_sha256": "audio-2",
+                    "speaker": "speaker-2",
+                    "group": "group-2",
                 },
             ],
             "duplicate id",
@@ -654,6 +686,8 @@ def test_blind_asr_leakage_hashes_audio_when_historical_sha_is_missing(
                 "id": "historical",
                 "text": "Một câu lịch sử.",
                 "audio_path": str(historical_audio),
+                "speaker": "historical-speaker",
+                "group": "historical-group",
             }
         ],
     )
@@ -666,6 +700,8 @@ def test_blind_asr_leakage_hashes_audio_when_historical_sha_is_missing(
                 "id": "other",
                 "text": "Một câu khác.",
                 "audio_path": str(other_audio),
+                "speaker": "other-speaker",
+                "group": "other-group",
             }
         ],
     )
@@ -675,6 +711,52 @@ def test_blind_asr_leakage_hashes_audio_when_historical_sha_is_missing(
             "text": "Nội dung hoàn toàn mới.",
             "audio_path": str(blind_audio),
             "audio_sha256": sha256(blind_audio),
+            "speaker": "blind-speaker",
+            "group": "blind-group",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="leakage against"):
+        ensure_unseen("asr", blind, _unseen_config("asr", train, selection))
+
+
+@pytest.mark.parametrize(("key", "value"), [("speaker", "speaker-1"), ("group", "group-1")])
+def test_blind_asr_rejects_historical_speaker_or_group_reuse(
+    tmp_path: Path, key: str, value: str
+):
+    train = tmp_path / "asr-train.jsonl"
+    selection = tmp_path / "asr-selection.jsonl"
+    _write_jsonl(
+        train,
+        [
+            {
+                "id": "train",
+                "text": "Câu train.",
+                "audio_sha256": "a" * 64,
+                "speaker": value if key == "speaker" else "train-speaker",
+                "group": value if key == "group" else "train-group",
+            }
+        ],
+    )
+    _write_jsonl(
+        selection,
+        [
+            {
+                "id": "selection",
+                "text": "Câu selection.",
+                "audio_sha256": "b" * 64,
+                "speaker": "selection-speaker",
+                "group": "selection-group",
+            }
+        ],
+    )
+    blind = [
+        {
+            "id": "blind",
+            "text": "Câu blind mới.",
+            "audio_sha256": "c" * 64,
+            "speaker": value if key == "speaker" else "blind-speaker",
+            "group": value if key == "group" else "blind-group",
         }
     ]
 

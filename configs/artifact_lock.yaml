@@ -40,7 +40,7 @@ evaluation:
   mt_selection_dev: data/eval/mt_selection_dev.jsonl
   mt_selection_dev_sha256: a073b05299128ed3131c8eb674c17e1b44e9d25ae1166c6b59feba5622d49f6c
   asr_selection_dev: data/eval/asr_selection_dev.jsonl
-  asr_selection_dev_sha256: c7ecfe79d9bdf00362b4d080b9e857fefca5c17326e1eb9885e4921d4bae018c
+  asr_selection_dev_sha256: 87beeb2eb5bc048eb14e2aa2a01482860b0ff27b5b4a7c1b56f7d05bdb0db160
   blind_test_v2_lock: data/eval/blind_test_v2.lock.json
   blind_test_v2_status: awaiting_unseen_data
   rule: "Locked safety evaluation only; never train or select checkpoints on this suite."

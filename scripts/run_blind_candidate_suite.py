@@ -116,6 +116,10 @@ def leakage_values(task: str, rows: list[dict[str, Any]]) -> set[str]:
                 )
             audio_digest = sha256(audio_path)
         result.add(f"audio_sha256:{audio_digest}")
+        for key in ("speaker", "group"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                result.add(f"{key}:{value}")
     return result
 
 
@@ -124,7 +128,7 @@ def validate_identifiers(task: str, rows: list[dict[str, Any]]) -> None:
     required = (
         ("id", "pair_fingerprint")
         if task == "mt"
-        else ("id", "text_fingerprint", "audio_sha256")
+        else ("id", "text_fingerprint", "audio_sha256", "speaker", "group")
     )
     unique = ("id", "pair_fingerprint") if task == "mt" else ("id", "audio_sha256")
     for key in required:

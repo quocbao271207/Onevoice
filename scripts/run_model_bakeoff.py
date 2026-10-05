@@ -237,6 +237,25 @@ def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
             path,
             strict_selection=True,
         )
+    for task in ("mt", "asr"):
+        train_path = (ROOT / config["data"]["train"][task]).resolve()
+        if not train_path.is_file():
+            raise FileNotFoundError(train_path)
+        train_rows = read_jsonl(train_path)
+        if manifest_task(train_rows, train_path) != task:
+            raise ValueError(f"Training task mismatch for {task}: {train_path}")
+        train_values = leakage_values(
+            train_rows,
+            task,
+            train_path,
+            strict_selection=False,
+        )
+        for key, selected in selection_values[task].items():
+            overlap = selected & train_values[key]
+            if overlap:
+                raise ValueError(
+                    f"Selection/train leakage for {task}.{key}: {len(overlap)}"
+                )
     for path in sorted(forbidden):
         if not path.is_file():
             raise FileNotFoundError(path)

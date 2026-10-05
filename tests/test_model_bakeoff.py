@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 import scripts.run_model_bakeoff as bakeoff
+from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
     critical_safety_pass,
     deployment_expectations,
@@ -102,6 +103,30 @@ def test_bakeoff_preflight_recomputes_fingerprints_and_rejects_locked_overlap(
                 "text": asr_text,
                 "text_fingerprint": bakeoff.fingerprint_text(asr_text),
                 "audio_sha256": "a" * 64,
+                "speaker": "shared-speaker",
+                "group": "selection-group",
+            }
+        ],
+    )
+    write(
+        "train-mt.jsonl",
+        [
+            {
+                "id": "mt-train",
+                "source_text": "No fever.",
+                "target_text": "Không sốt.",
+            }
+        ],
+    )
+    write(
+        "train-asr.jsonl",
+        [
+            {
+                "id": "asr-train",
+                "text": "đau ngực",
+                "audio_sha256": "c" * 64,
+                "speaker": "shared-speaker",
+                "group": "train-group",
             }
         ],
     )
@@ -123,6 +148,7 @@ def test_bakeoff_preflight_recomputes_fingerprints_and_rejects_locked_overlap(
     accuracy_path.write_text("version: 1\n", encoding="utf-8")
     data = {
         "data": {
+            "train": {"mt": "train-mt.jsonl", "asr": "train-asr.jsonl"},
             "selection_dev": {
                 "mt": {"path": mt_path, "sha256": mt_sha},
                 "asr": {"path": asr_path, "sha256": asr_sha},
@@ -135,6 +161,22 @@ def test_bakeoff_preflight_recomputes_fingerprints_and_rejects_locked_overlap(
         }
     }
     monkeypatch.setattr(bakeoff, "ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="Selection/train leakage for asr.speaker"):
+        validate_selection_artifacts(data)
+
+    write(
+        "train-asr.jsonl",
+        [
+            {
+                "id": "asr-train",
+                "text": "đau ngực",
+                "audio_sha256": "c" * 64,
+                "speaker": "train-speaker",
+                "group": "train-group",
+            }
+        ],
+    )
 
     with pytest.raises(ValueError, match="pair_fingerprint"):
         validate_selection_artifacts(data)
@@ -153,6 +195,54 @@ def test_bakeoff_preflight_recomputes_fingerprints_and_rejects_locked_overlap(
 
     with pytest.raises(ValueError, match="pair_fingerprint mismatch"):
         validate_selection_artifacts(data)
+
+
+def test_selection_builder_filters_content_speaker_and_group_leakage():
+    excluded_rows = [
+        {
+            "id": "train",
+            "text": "Một transcript đã dùng.",
+            "audio_sha256": "a" * 64,
+            "speaker": "speaker-train",
+            "group": "group-train",
+        }
+    ]
+    candidates = [
+        {
+            "id": "same-text",
+            "text": "Một transcript đã dùng!",
+            "audio_sha256": "b" * 64,
+            "speaker": "speaker-new",
+            "group": "group-new",
+        },
+        {
+            "id": "same-speaker",
+            "text": "Transcript mới một.",
+            "audio_sha256": "c" * 64,
+            "speaker": "speaker-train",
+            "group": "group-new-2",
+        },
+        {
+            "id": "same-group",
+            "text": "Transcript mới hai.",
+            "audio_sha256": "d" * 64,
+            "speaker": "speaker-new-2",
+            "group": "group-train",
+        },
+        {
+            "id": "fresh",
+            "text": "Transcript hoàn toàn mới.",
+            "audio_sha256": "e" * 64,
+            "speaker": "speaker-fresh",
+            "group": "group-fresh",
+        },
+    ]
+
+    filtered = filter_disjoint(
+        "asr", candidates, collect_leakage_values("asr", excluded_rows)
+    )
+
+    assert [row["id"] for row in filtered] == ["fresh"]
 
 
 def test_bakeoff_metric_policy_rejects_duplicates_and_invalid_code_switch_limit():

@@ -10,12 +10,20 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.data.quality import fingerprint_text  # noqa: E402
+
+
 SEED = 20261005
 NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 UNIT_RE = re.compile(
@@ -53,6 +61,72 @@ MEDICAL_TERMS = (
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def manifest_task(rows: list[dict[str, Any]], path: Path) -> str:
+    tasks = set()
+    for row in rows:
+        if row.get("source_text") is not None and row.get("target_text") is not None:
+            tasks.add("mt")
+        elif row.get("text") is not None:
+            tasks.add("asr")
+        else:
+            raise ValueError(f"Cannot infer manifest task from {path}")
+    if len(tasks) != 1:
+        raise ValueError(f"Manifest mixes tasks: {path}")
+    return tasks.pop()
+
+
+def row_leakage_values(task: str, row: dict[str, Any]) -> dict[str, str]:
+    row_id = str(row.get("id") or "").strip()
+    if not row_id:
+        raise ValueError("Selection source row is missing id")
+    values = {"id": row_id}
+    if task == "mt":
+        source = str(row.get("source_text") or "").strip()
+        target = str(row.get("target_text") or "").strip()
+        if not source or not target:
+            raise ValueError(f"Selection source MT row {row_id} is missing text")
+        values["pair_fingerprint"] = fingerprint_text(source + "\x1f" + target)
+        return values
+    transcript = str(row.get("text") or "").strip()
+    if not transcript:
+        raise ValueError(f"Selection source ASR row {row_id} is missing text")
+    values["text_fingerprint"] = fingerprint_text(transcript)
+    for key in ("audio_sha256", "speaker", "group"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            values[key] = value
+    return values
+
+
+def collect_leakage_values(
+    task: str, rows: list[dict[str, Any]]
+) -> dict[str, set[str]]:
+    keys = (
+        ("id", "pair_fingerprint")
+        if task == "mt"
+        else ("id", "text_fingerprint", "audio_sha256", "speaker", "group")
+    )
+    values = {key: set() for key in keys}
+    for row in rows:
+        for key, value in row_leakage_values(task, row).items():
+            values[key].add(value)
+    return values
+
+
+def filter_disjoint(
+    task: str,
+    rows: list[dict[str, Any]],
+    excluded: dict[str, set[str]],
+) -> list[dict[str, Any]]:
+    kept = []
+    for row in rows:
+        values = row_leakage_values(task, row)
+        if any(value in excluded[key] for key, value in values.items()):
+            continue
+        kept.append(row)
+    return kept
 
 
 def stable_key(row: dict[str, Any], seed: int = SEED) -> str:
@@ -195,15 +269,16 @@ def build_asr(rows: list[dict[str, Any]], size: int) -> list[dict[str, Any]]:
     )
 
 
-def ensure_no_test_overlap(
-    selected: list[dict[str, Any]], test_rows: list[dict[str, Any]], keys: tuple[str, ...]
+def ensure_no_overlap(
+    task: str,
+    selected: list[dict[str, Any]],
+    excluded: dict[str, set[str]],
 ) -> None:
-    for key in keys:
-        selected_values = {row.get(key) for row in selected if row.get(key)}
-        test_values = {row.get(key) for row in test_rows if row.get(key)}
-        overlap = selected_values & test_values
+    selected_values = collect_leakage_values(task, selected)
+    for key, values in selected_values.items():
+        overlap = values & excluded[key]
         if overlap:
-            raise ValueError(f"Selection/test leakage for {key}: {len(overlap)} rows")
+            raise ValueError(f"Selection leakage for {task}.{key}: {len(overlap)} rows")
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -224,23 +299,29 @@ def main() -> int:
     if min(args.mt_size, args.asr_size) < 1:
         parser.error("selection sizes must be positive")
 
-    mt = build_mt(
-        read_jsonl(ROOT / "data/processed/manifests/mt--validation.jsonl"), args.mt_size
-    )
-    asr = build_asr(
-        read_jsonl(ROOT / "data/processed/manifests/asr--validation-local.jsonl"),
-        args.asr_size,
-    )
-    ensure_no_test_overlap(
-        mt,
-        read_jsonl(ROOT / "data/processed/manifests/mt--test.jsonl"),
-        ("id", "pair_fingerprint"),
-    )
-    ensure_no_test_overlap(
-        asr,
-        read_jsonl(ROOT / "data/processed/manifests/asr--test-local.jsonl"),
-        ("id", "text_fingerprint", "audio_sha256"),
-    )
+    config = yaml.safe_load((ROOT / "configs/model_bakeoff.yaml").read_text(encoding="utf-8"))
+    excluded_rows: dict[str, list[dict[str, Any]]] = {"mt": [], "asr": []}
+    exclusion_paths = [
+        *(ROOT / path for path in config["data"]["train"].values()),
+        *(ROOT / path for path in config["data"]["forbidden_selection_inputs"]),
+    ]
+    for path in exclusion_paths:
+        rows = read_jsonl(path)
+        excluded_rows[manifest_task(rows, path)].extend(rows)
+    excluded = {
+        task: collect_leakage_values(task, rows) for task, rows in excluded_rows.items()
+    }
+
+    mt_source = read_jsonl(ROOT / "data/processed/manifests/mt--validation.jsonl")
+    asr_source = read_jsonl(ROOT / "data/processed/manifests/asr--validation-local.jsonl")
+    mt_candidates = filter_disjoint("mt", mt_source, excluded["mt"])
+    asr_candidates = filter_disjoint("asr", asr_source, excluded["asr"])
+    if len(mt_candidates) < args.mt_size or len(asr_candidates) < args.asr_size:
+        raise ValueError("Not enough disjoint validation rows for requested selection sizes")
+    mt = build_mt(mt_candidates, args.mt_size)
+    asr = build_asr(asr_candidates, args.asr_size)
+    ensure_no_overlap("mt", mt, excluded["mt"])
+    ensure_no_overlap("asr", asr, excluded["asr"])
     outputs = {
         ROOT / "data/eval/mt_selection_dev.jsonl": mt,
         ROOT / "data/eval/asr_selection_dev.jsonl": asr,
@@ -252,6 +333,10 @@ def main() -> int:
             "rows": len(rows),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
+    report["excluded_validation_rows"] = {
+        "mt": len(mt_source) - len(mt_candidates),
+        "asr": len(asr_source) - len(asr_candidates),
+    }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
