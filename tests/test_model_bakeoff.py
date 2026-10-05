@@ -11,11 +11,13 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.run_model_bakeoff import (
     critical_safety_pass,
+    deployment_expectations,
     interval_stronger,
     license_gate,
     report_score,
     run_stage,
     validate_candidate_matrix,
+    validate_deployment_report,
     validate_resources,
     validate_selection_artifacts,
     write_runtime_round_config,
@@ -256,3 +258,98 @@ def test_legacy_rescore_is_explicitly_not_vinai_evidence():
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["model"] == "facebook/nllb-200-distilled-600M"
     assert report["evidence_status"] == "invalid_for_model_comparison"
+
+
+def test_deployment_expectations_bind_exact_adapter_tree(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    winners = [
+        (
+            "mt",
+            "en_to_vi",
+            {"candidate_id": "mt-winner", "adapter": str(adapter)},
+        ),
+        (
+            "asr",
+            None,
+            {"candidate_id": "asr-winner", "adapter": str(adapter)},
+        ),
+    ]
+    expected = deployment_expectations(winners)
+    assert expected[0]["adapter_manifest_sha256"] == expected[1]["adapter_manifest_sha256"]
+    assert len(expected[0]["adapter_manifest_sha256"]) == 64
+
+
+def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: Path):
+    checksum = "a" * 64
+    project_root = tmp_path / "project"
+    artifact = project_root / "models" / "mt-winner.tar"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"compiled-qnn-artifact")
+    latency_samples = [200.0 + index for index in range(100)]
+    expected = [
+        {
+            "task": "mt",
+            "direction": "en_to_vi",
+            "candidate_id": "mt-winner",
+            "adapter_manifest_sha256": checksum,
+        }
+    ]
+    winner = {
+        **expected[0],
+        "artifact_path": "models/mt-winner.tar",
+        "artifact_sha256": bakeoff.sha256(artifact),
+        "measurement_runs": 100,
+        "latency_samples_ms": latency_samples,
+        "latency_p50_ms": bakeoff.percentile_linear(latency_samples, 0.50),
+        "latency_p95_ms": bakeoff.percentile_linear(latency_samples, 0.95),
+        "peak_ram_bytes": 100_000_000,
+        "peak_vram_bytes": 0,
+        "model_bytes": artifact.stat().st_size,
+    }
+    report = {
+        "version": 1,
+        "status": "pass",
+        "target": "QCS6490",
+        "measurement_source": "physical_board",
+        "measured_at": "2026-10-06T12:00:00+07:00",
+        "device": {
+            "chipset": "QCS6490",
+            "board": "Dragonwing RB3 Gen 2 Vision Kit",
+            "os": "Qc_Linux 1.6",
+        },
+        "winners": [winner],
+    }
+    metrics = [
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "peak_ram_bytes",
+        "peak_vram_bytes",
+        "model_bytes",
+    ]
+    assert validate_deployment_report(report, expected, metrics, 30, project_root) == (True, [])
+
+    report["measurement_source"] = "cloud_profile"
+    winner["candidate_id"] = "wrong-winner"
+    winner["adapter_manifest_sha256"] = "c" * 64
+    winner["measurement_runs"] = 2
+    winner["latency_p95_ms"] = 200.0
+    winner["peak_ram_bytes"] = float("nan")
+    winner["model_bytes"] = 1.5
+    passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
+    assert passed is False
+    assert "measurement_source:not_physical_board" in failures
+    assert "winner:mt/en_to_vi:candidate_mismatch" in failures
+    assert "winner:mt/en_to_vi:adapter_checksum_mismatch" in failures
+    assert "winner:mt/en_to_vi:insufficient_measurement_runs" in failures
+    assert "winner:mt/en_to_vi:peak_ram_bytes_invalid" in failures
+    assert "winner:mt/en_to_vi:model_bytes_invalid" in failures
+    assert "winner:mt/en_to_vi:latency_percentiles_reversed" in failures
+
+    winner["model_bytes"] = artifact.stat().st_size
+    artifact.write_bytes(b"tampered")
+    passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
+    assert passed is False
+    assert "winner:mt/en_to_vi:artifact_checksum_mismatch" in failures
+    assert "winner:mt/en_to_vi:model_bytes_mismatch" in failures

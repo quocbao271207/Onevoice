@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def utc_now() -> str:
@@ -87,6 +89,13 @@ def validate_resources(config: dict[str, Any]) -> None:
         raise ValueError("GPU utilization policy must satisfy 0 < resume < rolling < hard < 75")
     if not config["principles"].get("one_gpu_child_at_a_time"):
         raise ValueError("Bake-off requires one GPU child at a time")
+    deployment_min_runs = config["promotion_gate"].get("deployment_min_runs")
+    if (
+        isinstance(deployment_min_runs, bool)
+        or not isinstance(deployment_min_runs, int)
+        or deployment_min_runs < 1
+    ):
+        raise ValueError("Deployment benchmark requires a positive integer run count")
 
 
 def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
@@ -169,6 +178,191 @@ def tree_manifest(path: Path) -> dict[str, Any]:
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return {"root": str(path.resolve()), "files": files, "manifest_sha256": manifest_digest}
+
+
+def deployment_expectations(
+    winner_specs: list[tuple[str, str | None, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Bind hardware evidence to the exact selected adapter trees."""
+    adapter_hashes: dict[Path, str] = {}
+    expected = []
+    for task, direction, winner in winner_specs:
+        adapter = Path(winner["adapter"]).resolve()
+        if adapter not in adapter_hashes:
+            adapter_hashes[adapter] = str(tree_manifest(adapter)["manifest_sha256"])
+        expected.append(
+            {
+                "task": task,
+                "direction": direction,
+                "candidate_id": winner["candidate_id"],
+                "adapter_manifest_sha256": adapter_hashes[adapter],
+            }
+        )
+    return expected
+
+
+def percentile_linear(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def validate_deployment_report(
+    report: dict[str, Any],
+    expected_winners: list[dict[str, Any]],
+    required_metrics: list[str],
+    min_runs: int,
+    project_root: Path = ROOT,
+) -> tuple[bool, list[str]]:
+    """Validate fresh physical-board evidence for every selected winner."""
+    failures: list[str] = []
+    if report.get("version") != 1:
+        failures.append("version:invalid")
+    if report.get("status") != "pass":
+        failures.append("status:not_pass")
+    if report.get("target") != "QCS6490":
+        failures.append("target:not_qcs6490")
+    if report.get("measurement_source") != "physical_board":
+        failures.append("measurement_source:not_physical_board")
+
+    measured_at = str(report.get("measured_at") or "")
+    try:
+        measured_time = datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
+        if measured_time.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError:
+        failures.append("measured_at:invalid")
+
+    device = report.get("device")
+    if not isinstance(device, dict):
+        failures.append("device:missing")
+    else:
+        if str(device.get("chipset") or "").upper() != "QCS6490":
+            failures.append("device.chipset:not_qcs6490")
+        if not str(device.get("board") or "").strip():
+            failures.append("device.board:missing")
+        if not str(device.get("os") or "").strip():
+            failures.append("device.os:missing")
+
+    expected_by_key = {
+        (item["task"], item.get("direction")): item for item in expected_winners
+    }
+    records = report.get("winners")
+    if not isinstance(records, list):
+        return False, failures + ["winners:missing"]
+    record_by_key: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            failures.append("winners:invalid_record")
+            continue
+        task = str(record.get("task") or "")
+        direction_value = record.get("direction")
+        direction = str(direction_value) if direction_value is not None else None
+        key = (task, direction)
+        if key in record_by_key:
+            failures.append(f"winner:{task}/{direction or 'vi'}:duplicate")
+        record_by_key[key] = record
+    if set(record_by_key) != set(expected_by_key):
+        failures.append("winners:set_mismatch")
+
+    for key, expected in expected_by_key.items():
+        task, direction = key
+        label = f"winner:{task}/{direction or 'vi'}"
+        record = record_by_key.get(key)
+        if record is None:
+            continue
+        if record.get("candidate_id") != expected["candidate_id"]:
+            failures.append(f"{label}:candidate_mismatch")
+        if record.get("adapter_manifest_sha256") != expected["adapter_manifest_sha256"]:
+            failures.append(f"{label}:adapter_checksum_mismatch")
+        artifact_sha = str(record.get("artifact_sha256") or "")
+        if not SHA256_RE.fullmatch(artifact_sha):
+            failures.append(f"{label}:artifact_sha256_invalid")
+        runs = record.get("measurement_runs")
+        if isinstance(runs, bool) or not isinstance(runs, int) or runs < min_runs:
+            failures.append(f"{label}:insufficient_measurement_runs")
+
+        latency_samples = record.get("latency_samples_ms")
+        parsed_samples: list[float] = []
+        if not isinstance(latency_samples, list):
+            failures.append(f"{label}:latency_samples_missing")
+        else:
+            for value in latency_samples:
+                try:
+                    sample = float(value)
+                except (TypeError, ValueError):
+                    sample = math.nan
+                if not math.isfinite(sample) or sample <= 0:
+                    parsed_samples = []
+                    failures.append(f"{label}:latency_samples_invalid")
+                    break
+                parsed_samples.append(sample)
+            if parsed_samples and (
+                len(parsed_samples) < min_runs or runs != len(parsed_samples)
+            ):
+                failures.append(f"{label}:latency_sample_count_mismatch")
+
+        numeric: dict[str, float] = {}
+        for metric in required_metrics:
+            value = record.get(metric)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = math.nan
+            if not math.isfinite(number):
+                failures.append(f"{label}:{metric}_invalid")
+                continue
+            if metric.endswith("_bytes") and not number.is_integer():
+                failures.append(f"{label}:{metric}_invalid")
+                continue
+            if metric == "peak_vram_bytes":
+                if number < 0:
+                    failures.append(f"{label}:{metric}_invalid")
+            elif number <= 0:
+                failures.append(f"{label}:{metric}_invalid")
+            numeric[metric] = number
+        if (
+            "latency_p50_ms" in numeric
+            and "latency_p95_ms" in numeric
+            and numeric["latency_p95_ms"] < numeric["latency_p50_ms"]
+        ):
+            failures.append(f"{label}:latency_percentiles_reversed")
+        if parsed_samples and "latency_p50_ms" in numeric and "latency_p95_ms" in numeric:
+            calculated = {
+                "latency_p50_ms": percentile_linear(parsed_samples, 0.50),
+                "latency_p95_ms": percentile_linear(parsed_samples, 0.95),
+            }
+            for metric, expected_value in calculated.items():
+                tolerance = max(1e-6, abs(expected_value) * 1e-6)
+                if abs(numeric[metric] - expected_value) > tolerance:
+                    failures.append(f"{label}:{metric}_does_not_match_samples")
+
+        artifact_value = str(record.get("artifact_path") or "").strip()
+        if not artifact_value:
+            failures.append(f"{label}:artifact_path_missing")
+            continue
+        artifact_path = Path(artifact_value)
+        if not artifact_path.is_absolute():
+            artifact_path = project_root / artifact_path
+        artifact_path = artifact_path.resolve()
+        models_root = (project_root / "models").resolve()
+        if models_root not in artifact_path.parents:
+            failures.append(f"{label}:artifact_outside_models")
+        elif not artifact_path.is_file():
+            failures.append(f"{label}:artifact_missing")
+        else:
+            if SHA256_RE.fullmatch(artifact_sha) and sha256(artifact_path) != artifact_sha:
+                failures.append(f"{label}:artifact_checksum_mismatch")
+            if "model_bytes" in numeric and artifact_path.stat().st_size != int(
+                numeric["model_bytes"]
+            ):
+                failures.append(f"{label}:model_bytes_mismatch")
+    return not failures, failures
 
 
 def freeze_candidate_a(current: dict[str, Any], output: Path) -> dict[str, Any]:
@@ -1035,13 +1229,12 @@ def main() -> int:
         atomic_json(state_path, state)
         return CRITICAL_EXIT_WAITING_FOR_BLIND
     deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
-    deployment_pass = (
-        deployment.get("status") == "pass"
-        and deployment.get("target") == "QCS6490"
-        and all(
-            deployment.get(name) is not None
-            for name in config["promotion_gate"]["deployment_metrics"]
-        )
+    expected_deployment = deployment_expectations(winner_specs)
+    deployment_pass, deployment_failures = validate_deployment_report(
+        deployment,
+        expected_deployment,
+        list(config["promotion_gate"]["deployment_metrics"]),
+        int(config["promotion_gate"]["deployment_min_runs"]),
     )
     blind_pass = all(item.get("promotion_allowed") for item in blind_results)
     winner_ids = {
@@ -1064,6 +1257,7 @@ def main() -> int:
         {
             "status": "complete",
             "deployment": deployment,
+            "deployment_gate_failures": deployment_failures,
             "promotion_allowed": promotion_allowed,
             "production_license_gate": production_licenses,
         }

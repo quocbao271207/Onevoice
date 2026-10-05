@@ -79,3 +79,5 @@ Runner có resume theo command digest, checkpoint watcher, archive/checksum từ
 ## Deployment reference
 
 Dự án giữ immutable evidence QCS6490 đã đo ngày 26/09/2026. Tuy nhiên trang Qualcomm hiện tại được kiểm tra lại ngày 05/10/2026 không còn liệt kê QCS6490 cho Whisper-Small-Quantized. Vì vậy evidence cũ không bị xóa, nhưng promotion mới bắt buộc rerun trên board QCS6490 và báo latency p50/p95, peak RAM/VRAM, model bytes. Không suy diễn khả năng deployment của winner fine-tuned chỉ từ reference OpenAI Whisper-small.
+
+`deployment_selected_winners.json` phải là schema version 1, ghi `measurement_source=physical_board`, timestamp có timezone và metadata board/chipset/OS. Mỗi winner phải khớp task, chiều, candidate ID và SHA-256 manifest của đúng adapter; artifact triển khai phải nằm dưới `models/`, có path/SHA-256/byte size khớp file thật. Report phải chứa ít nhất 30 latency samples để runner tự tính lại p50/p95; p95 không được thấp hơn p50 và mọi số đo phải hữu hạn/dương (VRAM được phép bằng 0 nếu chạy NPU/CPU). Report cloud cũ, report của model khác hoặc số đo giả/thiếu đều bị reject.
