@@ -25,6 +25,7 @@ from scripts.run_model_bakeoff import (
     validate_selection_artifacts,
     write_runtime_round_config,
 )
+from src.pipeline.selection_policy import selection_policy_record
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -354,11 +355,13 @@ def test_mt_multi_metric_winner_rejects_significant_bleu_regression():
 
 
 def test_selection_identity_ignores_later_blind_results_but_binds_winners():
+    policy = selection_policy_record(config())
     comparison = {
         "status": "selection_complete",
         "scope": "research",
         "candidate_a_freeze": "freeze.json",
         "selection_sha256": {"mt": "a", "asr": "b"},
+        "selection_policy": policy,
         "results": {
             "mt": {
                 "winners": {
@@ -383,6 +386,10 @@ def test_selection_identity_ignores_later_blind_results_but_binds_winners():
     finalized["results"]["mt"]["winners"]["en_to_vi"]["candidate_id"] = "other"
     assert selection_identity(finalized) != selection_identity(comparison)
     assert selection_identity_sha256(finalized) != selection_identity_sha256(comparison)
+
+    finalized = json.loads(json.dumps(comparison))
+    finalized["selection_policy"]["winner_rule"] = "legacy_single_metric"
+    assert selection_identity(finalized) != selection_identity(comparison)
 
 
 def test_asr_selection_requires_cer_evidence():

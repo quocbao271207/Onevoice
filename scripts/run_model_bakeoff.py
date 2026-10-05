@@ -28,8 +28,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.data.quality import fingerprint_text  # noqa: E402
 from scripts.run_gpu_rounds import validate_resource_limits  # noqa: E402
+from src.data.quality import fingerprint_text  # noqa: E402
+from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
 
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
@@ -1010,6 +1011,7 @@ def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
         "scope": comparison.get("scope"),
         "candidate_a_freeze": comparison.get("candidate_a_freeze"),
         "selection_sha256": comparison.get("selection_sha256"),
+        "selection_policy": comparison.get("selection_policy"),
         "winners": winners,
     }
 
@@ -1406,6 +1408,7 @@ def main() -> int:
         "promotion_allowed": False,
         "candidate_a_freeze": str(freeze_path),
         "selection_sha256": report["selection_sha256"],
+        "selection_policy": selection_policy_record(config),
         "results": {"mt": mt_result, "asr": asr_result},
         "blind_test_v2": "pending",
     }

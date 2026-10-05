@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from scripts.run_blind_candidate_suite import (
     adapter_tree_manifest,
@@ -20,6 +21,18 @@ from scripts.run_blind_candidate_suite import (
     verify_selection_winner,
 )
 from src.data.quality import fingerprint_text
+from src.pipeline.selection_policy import (
+    configured_selection_hashes,
+    selection_policy_record,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def full_bakeoff_config() -> dict:
+    path = ROOT / "configs/model_bakeoff.yaml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def write_lock(path: Path, mt: Path, asr: Path) -> None:
@@ -64,10 +77,13 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
     weights.write_bytes(b"winner-weights")
     manifest = adapter_tree_manifest(adapter)
     comparison = tmp_path / "comparison.json"
+    config = full_bakeoff_config()
     comparison.write_text(
         json.dumps(
             {
                 "status": "selection_complete",
+                "selection_policy": selection_policy_record(config),
+                "selection_sha256": configured_selection_hashes(config),
                 "results": {
                     "mt": {
                         "winners": {
@@ -85,17 +101,74 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
     )
 
     selected = verify_selection_winner(
-        comparison, "mt", "en_to_vi", "mt-winner", adapter
+        comparison,
+        "mt",
+        "en_to_vi",
+        "mt-winner",
+        adapter,
+        selection_policy_record(config),
+        configured_selection_hashes(config),
     )
 
     assert selected["sha256"] == sha256(comparison)
     assert selected["adapter_manifest"]["manifest_sha256"] == manifest["manifest_sha256"]
+    stale_hashes = configured_selection_hashes(config)
+    stale_hashes["mt"] = "0" * 64
+    with pytest.raises(ValueError, match="selection inputs"):
+        verify_selection_winner(
+            comparison,
+            "mt",
+            "en_to_vi",
+            "mt-winner",
+            adapter,
+            selection_policy_record(config),
+            stale_hashes,
+        )
     with pytest.raises(ValueError, match="not the selected winner"):
-        verify_selection_winner(comparison, "mt", "en_to_vi", "other", adapter)
+        verify_selection_winner(
+            comparison,
+            "mt",
+            "en_to_vi",
+            "other",
+            adapter,
+            selection_policy_record(config),
+            configured_selection_hashes(config),
+        )
 
     weights.write_bytes(b"changed-after-selection")
     with pytest.raises(ValueError, match="adapter checksum"):
-        verify_selection_winner(comparison, "mt", "en_to_vi", "mt-winner", adapter)
+        verify_selection_winner(
+            comparison,
+            "mt",
+            "en_to_vi",
+            "mt-winner",
+            adapter,
+            selection_policy_record(config),
+            configured_selection_hashes(config),
+        )
+
+
+def test_blind_rejects_legacy_selection_without_bound_policy(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    comparison = tmp_path / "legacy-comparison.json"
+    comparison.write_text(
+        json.dumps({"status": "selection_complete", "results": {}}),
+        encoding="utf-8",
+    )
+    config = full_bakeoff_config()
+
+    with pytest.raises(ValueError, match="selection policy"):
+        verify_selection_winner(
+            comparison,
+            "mt",
+            "en_to_vi",
+            "legacy",
+            adapter,
+            selection_policy_record(config),
+            configured_selection_hashes(config),
+        )
 
 
 def test_blind_report_provenance_rejects_tampering(tmp_path: Path):
@@ -138,27 +211,6 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
     mt_manifest.write_text('{"id":"mt"}\n', encoding="utf-8")
     asr_manifest.write_text('{"id":"asr"}\n', encoding="utf-8")
     comparison = tmp_path / "selection.json"
-    comparison.write_text(
-        json.dumps(
-            {
-                "status": "selection_complete",
-                "results": {
-                    "mt": {
-                        "winners": {
-                            "en_to_vi": {
-                                "candidate_id": "mt-winner",
-                                "adapter": str(adapter),
-                                "adapter_manifest_sha256": adapter_manifest[
-                                    "manifest_sha256"
-                                ],
-                            }
-                        }
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
     lock_path = tmp_path / "lock.json"
     lock_path.write_text(
         json.dumps(
@@ -180,6 +232,7 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
         encoding="utf-8",
     )
     config = {
+        "principles": {"candidate_a_auto_promotion_forbidden": True},
         "candidates": {
             "mt": [
                 {
@@ -191,11 +244,44 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
                 }
             ]
         },
-        "promotion_gate": {"critical_slices": [], "policy_slices": []},
+        "promotion_gate": {
+            "critical_slices": [],
+            "policy_slices": [],
+            "mt_metrics": ["sacrebleu", "chrf2"],
+            "asr_metrics": ["wer", "cer", "code_switch_wer"],
+            "asr_code_switch_wer_max": 0.21,
+        },
         "data": {
-            "accuracy_program": {"path": str(accuracy), "sha256": sha256(accuracy)}
+            "accuracy_program": {"path": str(accuracy), "sha256": sha256(accuracy)},
+            "selection_dev": {
+                "mt": {"sha256": "a" * 64},
+                "asr": {"sha256": "b" * 64},
+            },
         },
     }
+    comparison.write_text(
+        json.dumps(
+            {
+                "status": "selection_complete",
+                "selection_policy": selection_policy_record(config),
+                "selection_sha256": configured_selection_hashes(config),
+                "results": {
+                    "mt": {
+                        "winners": {
+                            "en_to_vi": {
+                                "candidate_id": "mt-winner",
+                                "adapter": str(adapter),
+                                "adapter_manifest_sha256": adapter_manifest[
+                                    "manifest_sha256"
+                                ],
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     output = tmp_path / "output"
     output.mkdir()
     stem = "blind_v2_mt_en_to_vi_mt-winner"

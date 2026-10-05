@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data.quality import fingerprint_text, normalize_text  # noqa: E402
+from src.pipeline.selection_policy import (  # noqa: E402
+    configured_selection_hashes,
+    selection_policy_record,
+)
 
 
 def utc_now() -> str:
@@ -369,6 +373,8 @@ def verify_selection_winner(
     direction: str | None,
     candidate_id: str,
     adapter: Path,
+    expected_policy: dict[str, Any],
+    expected_selection_hashes: dict[str, str],
 ) -> dict[str, Any]:
     comparison_path = comparison_path.resolve()
     if not comparison_path.is_file():
@@ -376,6 +382,10 @@ def verify_selection_winner(
     comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
     if comparison.get("status") != "selection_complete":
         raise ValueError("Blind evaluation requires a finalized selection comparison")
+    if comparison.get("selection_policy") != expected_policy:
+        raise ValueError("Blind evaluation selection policy is missing, stale, or mismatched")
+    if comparison.get("selection_sha256") != expected_selection_hashes:
+        raise ValueError("Blind evaluation selection inputs are missing, stale, or mismatched")
     key = str(direction or "vi")
     try:
         winner = comparison["results"][task]["winners"][key]
@@ -441,6 +451,8 @@ def evaluate(
         args.direction,
         args.candidate,
         args.adapter,
+        selection_policy_record(config),
+        configured_selection_hashes(config),
     )
     selection_record = {
         "path": selection["path"],
