@@ -37,7 +37,7 @@ License metadata được pin cùng revision trong `configs/model_bakeoff.yaml`.
 
 Selection dev chứa lát thuốc, liều, số, đơn vị, phủ định, thuật ngữ và code-switch. ASR còn giữ accent/role/recording-condition để báo riêng. Blind v2 chỉ được khóa khi có đủ hai chiều MT và ASR Bắc/Trung/Nam, bác sĩ/bệnh nhân và nhiễu. Script fail-closed nếu thiếu ID/fingerprint, có ID/pair/audio trùng trong chính blind set, hoặc có ID, text fingerprint, pair fingerprint hay audio SHA giao train/selection/test cũ. Trước khi khóa, runner còn tự tính lại pair/text fingerprint từ nội dung chuẩn hóa và SHA-256 từ chính file audio; metadata khai báo sai, file audio thiếu hoặc bị sửa đều bị từ chối.
 
-Blind v2 không chỉ kiểm tra safety. Nó dùng ngưỡng release đã khóa trong `configs/accuracy_program.yaml`: cận trên 95% CI của ASR WER phải không vượt ngưỡng, còn cận dưới 95% CI của MT BLEU và chrF2 phải đạt ngưỡng cho từng chiều. CER và code-switch WER cũng phải hữu hạn, code-switch WER phải đạt policy. Thiếu metric/CI, NaN hoặc point estimate/CI không đạt đều khóa promotion.
+Blind v2 không chỉ kiểm tra safety. Nó dùng ngưỡng release đã khóa SHA-256 trong `configs/model_bakeoff.yaml` và lấy nội dung từ `configs/accuracy_program.yaml`: cận trên 95% CI của ASR WER phải không vượt ngưỡng, còn cận dưới 95% CI của MT BLEU và chrF2 phải đạt ngưỡng cho từng chiều. Preflight và blind runner đều từ chối nếu checksum policy thay đổi. CER và code-switch WER cũng phải hữu hạn, code-switch WER phải đạt policy. Thiếu metric/CI, NaN hoặc point estimate/CI không đạt đều khóa promotion.
 
 ## Successive halving và winner gate
 

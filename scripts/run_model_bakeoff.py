@@ -112,6 +112,14 @@ def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
         if actual != record["sha256"]:
             raise ValueError(f"Selection checksum mismatch for {task}: {actual}")
         hashes[task] = actual
+    accuracy_record = config["data"]["accuracy_program"]
+    accuracy_path = (ROOT / accuracy_record["path"]).resolve()
+    if not accuracy_path.is_file():
+        raise FileNotFoundError(accuracy_path)
+    accuracy_hash = sha256(accuracy_path)
+    if accuracy_hash != accuracy_record["sha256"]:
+        raise ValueError(f"Accuracy policy checksum mismatch: {accuracy_hash}")
+    hashes["accuracy_program"] = accuracy_hash
     return hashes
 
 

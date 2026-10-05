@@ -241,6 +241,17 @@ def blind_quality_failures(
     return failures
 
 
+def load_locked_accuracy_config(config: dict[str, Any]) -> dict[str, Any]:
+    record = config["data"]["accuracy_program"]
+    path = (ROOT / record["path"]).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    actual = sha256(path)
+    if actual != record["sha256"]:
+        raise ValueError(f"Accuracy policy checksum mismatch: {actual}")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str, Any]) -> None:
     keys = ("id", "pair_fingerprint") if task == "mt" else (
         "id",
@@ -419,10 +430,7 @@ def evaluate(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     required = config["promotion_gate"]["critical_slices"] + config["promotion_gate"]["policy_slices"]
     failed = clinical_failures(report, required)
-    accuracy_path = ROOT / config["data"]["accuracy_program"]
-    if not accuracy_path.is_file():
-        raise FileNotFoundError(accuracy_path)
-    accuracy_config = yaml.safe_load(accuracy_path.read_text(encoding="utf-8"))
+    accuracy_config = load_locked_accuracy_config(config)
     quality_failed = blind_quality_failures(
         report,
         args.task,

@@ -44,7 +44,7 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
     validate_resources(data)
     validate_candidate_matrix(data)
     hashes = validate_selection_artifacts(data)
-    assert set(hashes) == {"mt", "asr"}
+    assert set(hashes) == {"mt", "asr", "accuracy_program"}
     assert data["successive_halving"]["comparison_unit"] == "effective_train_samples"
     assert data["principles"]["one_gpu_child_at_a_time"] is True
     required = set(data["promotion_gate"]["critical_slices"] + data["promotion_gate"]["policy_slices"])

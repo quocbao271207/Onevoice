@@ -26,7 +26,9 @@ resources:
   invariant: "All limits are below 75%; never run two GPU children concurrently."
 
 data:
-  accuracy_program: configs/accuracy_program.yaml
+  accuracy_program:
+    path: configs/accuracy_program.yaml
+    sha256: e052efc03efc03a02fd32f8fb242fbb43839737e1d5baa44112b8d7218f63106
   train:
     mt: data/processed/manifests/mt--train.jsonl
     asr: data/processed/manifests/asr--train-local.jsonl

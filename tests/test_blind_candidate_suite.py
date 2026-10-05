@@ -7,6 +7,7 @@ import pytest
 
 from scripts.run_blind_candidate_suite import (
     blind_quality_failures,
+    load_locked_accuracy_config,
     sha256,
     validate_content_integrity,
     validate_identifiers,
@@ -251,3 +252,21 @@ def test_blind_asr_quality_requires_upper_ci_and_code_switch_policy():
         "wer_bootstrap_95ci:upper_bound_above_policy",
         "code_switch_wer:missing_or_invalid",
     ]
+
+
+def test_accuracy_policy_is_checksum_locked(tmp_path: Path):
+    path = tmp_path / "accuracy.yaml"
+    path.write_text("version: 1\n", encoding="utf-8")
+    config = {
+        "data": {
+            "accuracy_program": {
+                "path": str(path),
+                "sha256": sha256(path),
+            }
+        }
+    }
+    assert load_locked_accuracy_config(config) == {"version": 1}
+
+    path.write_text("version: 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Accuracy policy checksum mismatch"):
+        load_locked_accuracy_config(config)
