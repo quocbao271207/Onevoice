@@ -106,7 +106,7 @@ python scripts/run_gpu_rounds.py --task mt --config configs/gpu_rounds.yaml --ou
 python scripts/run_gpu_rounds.py --task asr --config configs/gpu_rounds.yaml --output-root gpu-runs
 ```
 
-The ASR command runs the three configured pilots, selects the lowest completed validation WER, inherits its learning rate and LoRA parameters, then appends `final-selected-full` automatically. That final candidate uses all training rows, 512 validation rows, three epochs and effective batch 32. It is a full-data LoRA fine-tune, not a full-parameter fine-tune. Every checkpoint and completed round is archived with SHA-256 evidence before the next model may start.
+The ASR command runs the three configured pilots, selects the lowest completed validation WER, inherits its learning rate and LoRA parameters, then appends `final-selected-full` automatically. That final candidate uses all training rows, 512 validation rows, three epochs and effective batch 32. It is a full-data LoRA fine-tune, not a full-parameter fine-tune. Every checkpoint and completed round is archived with SHA-256 evidence before the next model may start. The checkpoint watcher writes an atomic archive, checksum sidecar and canonical content manifest containing each member path, byte count and SHA-256, then reads the archive back against that manifest before publishing it in `checkpoint_archives.json`. A checksum-verified legacy checkpoint is backfilled only from its still-live checkpoint tree and must pass the same read-back verification.
 
 When an MT full-run is already active, schedule the remaining program once instead of launching later stages by hand:
 

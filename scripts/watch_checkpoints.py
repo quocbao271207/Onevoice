@@ -7,11 +7,18 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.candidate_evidence import evidence_sidecars, verify_evidence_archive  # noqa: E402
 
 
 CHECKPOINT_PATTERN = re.compile(r"checkpoint-(\d+)")
@@ -60,6 +67,56 @@ def verified_existing_archive(archive_path: Path, checksum_path: Path) -> bool:
     return len(fields) >= 2 and fields[0].lower() == sha256(archive_path)
 
 
+def checkpoint_file_records(checkpoint: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in sorted(checkpoint.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Checkpoint cannot contain symlinks: {path}")
+        if not path.is_file():
+            continue
+        records.append(
+            {
+                "path": (Path(checkpoint.name) / path.relative_to(checkpoint)).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+                "source": path,
+            }
+        )
+    if not records:
+        raise ValueError(f"Checkpoint is empty: {checkpoint}")
+    return records
+
+
+def write_atomic(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def ensure_content_manifest(
+    archive_path: Path,
+    records: list[dict[str, Any]],
+) -> tuple[Path, dict[str, Any]]:
+    _, manifest_path = evidence_sidecars(archive_path)
+    if manifest_path.is_file():
+        return manifest_path, verify_evidence_archive(archive_path)
+    public_records = [
+        {key: record[key] for key in ("path", "bytes", "sha256")} for record in records
+    ]
+    manifest = {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "archive": archive_path.name,
+        "archive_bytes": archive_path.stat().st_size,
+        "archive_sha256": sha256(archive_path),
+        "file_count": len(public_records),
+        "content_bytes": sum(int(record["bytes"]) for record in public_records),
+        "files": public_records,
+    }
+    write_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    return manifest_path, verify_evidence_archive(archive_path)
+
+
 def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
     complete = completed_checkpoint(checkpoint)
     if complete is None:
@@ -68,13 +125,20 @@ def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / f"{checkpoint.name}.tar.gz"
     checksum_path = archive_dir / f"{checkpoint.name}.tar.gz.sha256"
+    records = checkpoint_file_records(checkpoint)
     if verified_existing_archive(archive_path, checksum_path):
+        manifest_path, manifest = ensure_content_manifest(archive_path, records)
         return {
             "step": step,
             "checkpoint": str(checkpoint.resolve()),
             "archive": str(archive_path.resolve()),
             "bytes": archive_path.stat().st_size,
             "sha256": checksum_path.read_text(encoding="utf-8").split()[0].lower(),
+            "manifest": str(manifest_path.resolve()),
+            "manifest_bytes": manifest_path.stat().st_size,
+            "manifest_sha256": sha256(manifest_path),
+            "file_count": int(manifest["file_count"]),
+            "content_bytes": int(manifest["content_bytes"]),
             "eval_loss": next(
                 (
                     float(item["eval_loss"])
@@ -90,16 +154,14 @@ def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
     temporary.unlink(missing_ok=True)
     try:
         with tarfile.open(temporary, "w:gz") as archive:
-            archive.add(checkpoint, arcname=checkpoint.name)
-        with tarfile.open(temporary, "r:gz") as archive:
-            archived_names = {Path(member.name).name for member in archive.getmembers() if member.isfile()}
-        if not REQUIRED_TRAINER_FILES <= archived_names or not MODEL_FILES & archived_names:
-            raise RuntimeError(f"Archive verification failed for {checkpoint}")
+            for record in records:
+                archive.add(record["source"], arcname=record["path"], recursive=False)
         os.replace(temporary, archive_path)
     finally:
         temporary.unlink(missing_ok=True)
     digest = sha256(archive_path)
-    checksum_path.write_text(f"{digest}  {archive_path.name}\n", encoding="utf-8")
+    write_atomic(checksum_path, f"{digest}  {archive_path.name}\n")
+    manifest_path, manifest = ensure_content_manifest(archive_path, records)
     eval_loss = next(
         (
             float(item["eval_loss"])
@@ -114,6 +176,11 @@ def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
         "archive": str(archive_path.resolve()),
         "bytes": archive_path.stat().st_size,
         "sha256": digest,
+        "manifest": str(manifest_path.resolve()),
+        "manifest_bytes": manifest_path.stat().st_size,
+        "manifest_sha256": sha256(manifest_path),
+        "file_count": int(manifest["file_count"]),
+        "content_bytes": int(manifest["content_bytes"]),
         "eval_loss": eval_loss,
         "status": "archived",
     }

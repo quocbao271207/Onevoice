@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-import tarfile
 from pathlib import Path
 
+import pytest
+
+from scripts.candidate_evidence import verify_evidence_archive
 from scripts.watch_checkpoints import (
     archive_ready_checkpoints,
     completed_checkpoint,
@@ -46,17 +48,60 @@ def test_checkpoint_archive_is_atomic_checksummed_and_idempotent(tmp_path: Path)
     assert first[0]["eval_loss"] == 1.25
     archive_path = archive_dir / "checkpoint-500.tar.gz"
     checksum_path = archive_dir / "checkpoint-500.tar.gz.sha256"
+    content_manifest_path = archive_dir / "checkpoint-500.tar.gz.manifest.json"
     assert verified_existing_archive(archive_path, checksum_path)
     assert checksum_path.read_text(encoding="utf-8").split()[0] == sha256(archive_path)
-    with tarfile.open(archive_path, "r:gz") as archive:
-        assert "checkpoint-500/trainer_state.json" in archive.getnames()
+    content_manifest = verify_evidence_archive(archive_path)
+    assert content_manifest_path.is_file()
+    assert {item["path"] for item in content_manifest["files"]} == {
+        "checkpoint-500/adapter_model.safetensors",
+        "checkpoint-500/optimizer.pt",
+        "checkpoint-500/rng_state.pth",
+        "checkpoint-500/scheduler.pt",
+        "checkpoint-500/trainer_state.json",
+    }
+    assert first[0]["manifest"] == str(content_manifest_path.resolve())
+    assert first[0]["manifest_sha256"] == sha256(content_manifest_path)
+    assert first[0]["file_count"] == 5
     assert not list(archive_dir.glob("*.part"))
+    assert not list(archive_dir.glob("*.tmp"))
 
     second = archive_ready_checkpoints(model_dir, archive_dir)
     assert second[0]["status"] == "already_verified"
     manifest = json.loads((archive_dir / "checkpoint_archives.json").read_text(encoding="utf-8"))
     assert [item["step"] for item in manifest["checkpoints"]] == [500]
+    assert manifest["checkpoints"][0]["manifest_sha256"] == sha256(content_manifest_path)
     assert checkpoint.is_dir()
+
+
+def test_existing_legacy_checkpoint_archive_gets_a_verified_content_manifest(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    make_checkpoint(model_dir, 500)
+    archive_dir = tmp_path / "archives"
+
+    archive_ready_checkpoints(model_dir, archive_dir)
+    content_manifest_path = archive_dir / "checkpoint-500.tar.gz.manifest.json"
+    content_manifest_path.unlink()
+
+    records = archive_ready_checkpoints(model_dir, archive_dir)
+
+    assert records[0]["status"] == "already_verified"
+    assert records[0]["manifest"] == str(content_manifest_path.resolve())
+    assert verify_evidence_archive(archive_dir / "checkpoint-500.tar.gz")["file_count"] == 5
+
+
+def test_corrupt_checkpoint_content_manifest_is_rejected(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    make_checkpoint(model_dir, 500)
+    archive_dir = tmp_path / "archives"
+    archive_ready_checkpoints(model_dir, archive_dir)
+    manifest_path = archive_dir / "checkpoint-500.tar.gz.manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][0]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="member verification failed"):
+        archive_ready_checkpoints(model_dir, archive_dir)
 
 
 def test_mismatched_trainer_step_is_not_archived(tmp_path: Path):
