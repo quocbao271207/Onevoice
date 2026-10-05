@@ -226,7 +226,7 @@ def main() -> int:
             "mt_run": str(mt_run),
             "resource_policy": (
                 "One GPU child at a time; every trainer/evaluator enforces the central 35% allocation, "
-                "40% hard memory stop, and scheduled utilization limits."
+                "40% hard memory stop, 70% rolling utilization limit, and 74% hard utilization guard."
             ),
             "stages": {},
         }

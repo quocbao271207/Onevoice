@@ -56,6 +56,23 @@ def active_utilization_limits(
     return float(limits["utilization_percent"]), float(limits["resume_percent"]), False
 
 
+def utilization_throttle_reason(
+    *,
+    current: float,
+    rolling: float,
+    sample_count: int,
+    rolling_samples: int,
+    utilization_limit: float,
+    hard_utilization_limit: float,
+) -> str | None:
+    """Return the first utilization guard that requires pausing the GPU child."""
+    if current >= hard_utilization_limit:
+        return "hard_utilization"
+    if sample_count >= rolling_samples and rolling > utilization_limit:
+        return "rolling_utilization"
+    return None
+
+
 def process_group_pids(group_id: int) -> set[int]:
     result = subprocess.run(
         ["ps", "-eo", "pid=,pgid="],
@@ -284,6 +301,7 @@ def monitor_process(
     limits: dict[str, Any],
 ) -> dict[str, Any]:
     memory_fraction = float(limits["gpu_memory_fraction"])
+    hard_utilization_limit = float(limits["hard_utilization_percent"])
     sample_seconds = float(limits["sample_seconds"])
     window = deque(maxlen=int(limits["rolling_samples"]))
     stopped = False
@@ -314,7 +332,15 @@ def monitor_process(
                     )
                 window.append(sample["utilization"])
                 rolling = sum(window) / len(window)
-                if not stopped and len(window) == window.maxlen and rolling > utilization_limit:
+                throttle_reason = utilization_throttle_reason(
+                    current=sample["utilization"],
+                    rolling=rolling,
+                    sample_count=len(window),
+                    rolling_samples=window.maxlen,
+                    utilization_limit=utilization_limit,
+                    hard_utilization_limit=hard_utilization_limit,
+                )
+                if not stopped and throttle_reason is not None:
                     os.killpg(process_group, signal.SIGSTOP)
                     stopped = True
                     throttles += 1
@@ -329,6 +355,8 @@ def monitor_process(
                     "rolling_utilization": rolling,
                     "training_stopped": stopped,
                     "active_utilization_limit_percent": utilization_limit,
+                    "hard_utilization_limit_percent": hard_utilization_limit,
+                    "throttle_reason": throttle_reason,
                     "boosted_window": boosted_window,
                 }
                 monitor.write(json.dumps(record) + "\n")
@@ -345,6 +373,8 @@ def monitor_process(
         "throttle_events": throttles,
         "peak_process_memory_mib": peak_process_memory,
         "configured_memory_fraction": memory_fraction,
+        "configured_utilization_limit_percent": float(limits["utilization_percent"]),
+        "hard_utilization_limit_percent": hard_utilization_limit,
         "daytime_utilization_limit_percent": float(limits["utilization_percent"]),
         "boosted_utilization_limit_percent": float(
             limits.get("boosted_window", {}).get("utilization_percent", limits["utilization_percent"])
@@ -387,11 +417,20 @@ def main() -> int:
     limits = config["limits"]
     if not 0.0 < float(limits["gpu_memory_fraction"]) <= 0.40:
         raise ValueError("gpu_memory_fraction must be in (0, 0.40]")
-    if not 0.0 < float(limits["utilization_percent"]) < 40.0:
-        raise ValueError("utilization_percent must be below 40")
+    utilization_limit = float(limits["utilization_percent"])
+    hard_utilization_limit = float(limits["hard_utilization_percent"])
+    resume_percent = float(limits["resume_percent"])
+    if not 0.0 < resume_percent < utilization_limit < hard_utilization_limit < 75.0:
+        raise ValueError(
+            "utilization thresholds must satisfy 0 < resume < rolling < hard < 75"
+        )
     boosted = limits.get("boosted_window", {})
-    if boosted and not float(limits["utilization_percent"]) < float(boosted["utilization_percent"]) <= 100.0:
-        raise ValueError("boosted utilization must be above daytime limit and at most 100")
+    if boosted and not (
+        utilization_limit
+        < float(boosted["utilization_percent"])
+        < hard_utilization_limit
+    ):
+        raise ValueError("boosted utilization must be above the base limit and below the hard limit")
     task = config["tasks"][args.task]
     rounds = configured_rounds(task, args.max_rounds, args.round_name)
     rounds = apply_round_overrides(

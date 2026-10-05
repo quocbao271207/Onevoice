@@ -15,35 +15,61 @@ from scripts.run_gpu_rounds import (
     configured_rounds,
     resolve_adaptive_final,
     select_completed_round,
+    utilization_throttle_reason,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_gpu_round_schedule_raises_utilization_only_from_02_to_09_bangkok():
+def test_gpu_round_policy_keeps_uniform_headroom_below_75_percent():
     limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))["limits"]
     timezone = ZoneInfo("Asia/Bangkok")
     assert active_utilization_limits(limits, datetime(2026, 10, 4, 1, 59, tzinfo=timezone)) == (
-        38.0,
-        24.0,
+        70.0,
+        55.0,
         False,
     )
     assert active_utilization_limits(limits, datetime(2026, 10, 4, 2, 0, tzinfo=timezone)) == (
-        75.0,
+        70.0,
         55.0,
-        True,
-    )
-    assert active_utilization_limits(limits, datetime(2026, 10, 4, 8, 59, tzinfo=timezone)) == (
-        75.0,
-        55.0,
-        True,
-    )
-    assert active_utilization_limits(limits, datetime(2026, 10, 4, 9, 0, tzinfo=timezone)) == (
-        38.0,
-        24.0,
         False,
     )
+    assert active_utilization_limits(limits, datetime(2026, 10, 4, 8, 59, tzinfo=timezone)) == (
+        70.0,
+        55.0,
+        False,
+    )
+    assert active_utilization_limits(limits, datetime(2026, 10, 4, 9, 0, tzinfo=timezone)) == (
+        70.0,
+        55.0,
+        False,
+    )
+    assert (
+        0.0
+        < limits["resume_percent"]
+        < limits["utilization_percent"]
+        < limits["hard_utilization_percent"]
+        < 75.0
+    )
+
+
+def test_gpu_round_hard_utilization_guard_preempts_a_low_rolling_average():
+    common = {
+        "sample_count": 10,
+        "rolling_samples": 10,
+        "utilization_limit": 70.0,
+        "hard_utilization_limit": 74.0,
+    }
+    assert (
+        utilization_throttle_reason(current=74.0, rolling=20.0, **common)
+        == "hard_utilization"
+    )
+    assert (
+        utilization_throttle_reason(current=73.0, rolling=70.1, **common)
+        == "rolling_utilization"
+    )
+    assert utilization_throttle_reason(current=73.0, rolling=70.0, **common) is None
 
 
 def test_gpu_round_cli_args_preserve_false_and_skip_none():
