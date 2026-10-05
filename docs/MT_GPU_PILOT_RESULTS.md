@@ -81,5 +81,6 @@ Run `mt-20261004-172023/01-final-r8-lr1e4-full` dùng toàn bộ 339.028 cặp t
 | 21000 | **1.4638671875** | 18.785.159 | `3b4b2a22c0b04b7ffe807acbd3784eadd1304c59422dfe70ad1de519272d3aa0` |
 | 21500 | **1.46148586273193** | 18.785.341 | `5184f49ba90a2c2a07b33411e25bc16f4b670fd10486b31c64b00e7a70e1b58d` |
 | 22000 | **1.46164762973785** | 18.786.839 | `0adf8baa20ee55b57c80f9f8628c6c166e6a6e63a081b2e42e32c1f9dff61c4a` |
+| 22500 | **1.45876753330231** | 18.787.798 | `3300c6a4f7efb0fac712608f0b18ade3f0acb6b08ce1d3d0f1e9c96f3a233470` |
 
-Bốn mươi bốn archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Các checkpoint mới còn được đọc lại cấu trúc để xác nhận có adapter, optimizer, scheduler, RNG và trainer state. Eval loss sớm đang giảm theo xu hướng, với dao động nhỏ giữa checkpoint 21.500 và 22.000; đây chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn. Promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.
+Bốn mươi lăm archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Các checkpoint mới còn được đọc lại cấu trúc để xác nhận có adapter, optimizer, scheduler, RNG và trainer state. Eval loss sớm đang giảm theo xu hướng, với dao động nhỏ giữa checkpoint 21.500 và 22.000 rồi lập mức thấp mới tại 22.500; đây chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn. Promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.
