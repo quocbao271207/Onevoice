@@ -31,7 +31,7 @@ License metadata được pin cùng revision trong `configs/model_bakeoff.yaml`.
 ## Dữ liệu công bằng
 
 - Train: giữ nguyên manifest train đã audit.
-- Model selection: `data/eval/mt_selection_dev.jsonl` (256 cặp) và `data/eval/asr_selection_dev.jsonl` (384 câu), chỉ sinh từ validation và đã kiểm tra không giao với test.
+- Model selection: `data/eval/mt_selection_dev.jsonl` (256 cặp) và `data/eval/asr_selection_dev.jsonl` (384 câu), chỉ sinh từ validation. Bake-off preflight tự tính lại fingerprint từ payload, khóa uniqueness và kiểm tra ID/cặp dịch/transcript/audio hash/speaker/recording group không giao mọi locked test hay safety manifest trước khi dùng GPU.
 - Blind locked test v2: `data/eval/blind_test_v2.lock.json` hiện là `awaiting_unseen_data`. Không tự chế blind set từ dữ liệu model đã nhìn thấy.
 - Test/safety cũ không được mở lặp lại để chọn model.
 

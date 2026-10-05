@@ -61,6 +61,93 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
         assert b"\r\n" not in (ROOT / data["data"]["selection_dev"][task]["path"]).read_bytes()
 
 
+def test_bakeoff_preflight_recomputes_fingerprints_and_rejects_locked_overlap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    def write(path: str, rows: list[dict]) -> tuple[str, str]:
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        return path, bakeoff.sha256(destination)
+
+    mt_source = "Give aspirin 5 mg."
+    mt_target = "Dùng aspirin 5 mg."
+    mt_pair = bakeoff.fingerprint_text(mt_source + "\x1f" + mt_target)
+    mt_path, mt_sha = write(
+        "selection-mt.jsonl",
+        [
+            {
+                "id": "mt-selection",
+                "source_text": mt_source,
+                "target_text": mt_target,
+                "pair_fingerprint": mt_pair,
+            }
+        ],
+    )
+    asr_text = "không dùng thuốc"
+    asr_path, asr_sha = write(
+        "selection-asr.jsonl",
+        [
+            {
+                "id": "asr-selection",
+                "text": asr_text,
+                "text_fingerprint": bakeoff.fingerprint_text(asr_text),
+                "audio_sha256": "a" * 64,
+            }
+        ],
+    )
+    write(
+        "locked-mt.jsonl",
+        [
+            {
+                "id": "different-id",
+                "source_text": mt_source,
+                "target_text": mt_target,
+            }
+        ],
+    )
+    write(
+        "locked-asr.jsonl",
+        [{"id": "locked-asr", "text": "đau ngực", "audio_sha256": "b" * 64}],
+    )
+    accuracy_path = tmp_path / "accuracy.yaml"
+    accuracy_path.write_text("version: 1\n", encoding="utf-8")
+    data = {
+        "data": {
+            "selection_dev": {
+                "mt": {"path": mt_path, "sha256": mt_sha},
+                "asr": {"path": asr_path, "sha256": asr_sha},
+            },
+            "forbidden_selection_inputs": ["locked-mt.jsonl", "locked-asr.jsonl"],
+            "accuracy_program": {
+                "path": "accuracy.yaml",
+                "sha256": bakeoff.sha256(accuracy_path),
+            },
+        }
+    }
+    monkeypatch.setattr(bakeoff, "ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="pair_fingerprint"):
+        validate_selection_artifacts(data)
+
+    rows = [
+        {
+            "id": "mt-selection",
+            "source_text": mt_source,
+            "target_text": mt_target,
+            "pair_fingerprint": "0" * 64,
+        }
+    ]
+    selection = tmp_path / mt_path
+    selection.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    data["data"]["selection_dev"]["mt"]["sha256"] = bakeoff.sha256(selection)
+
+    with pytest.raises(ValueError, match="pair_fingerprint mismatch"):
+        validate_selection_artifacts(data)
+
+
 def test_bakeoff_metric_policy_rejects_duplicates_and_invalid_code_switch_limit():
     data = config()
     data["promotion_gate"]["mt_metrics"].append("chrf2")

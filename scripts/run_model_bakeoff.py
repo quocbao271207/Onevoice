@@ -26,6 +26,11 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.data.quality import fingerprint_text  # noqa: E402
+
+
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -40,6 +45,86 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    if not rows:
+        raise ValueError(f"Manifest is empty: {path}")
+    return rows
+
+
+def manifest_task(rows: list[dict[str, Any]], path: Path) -> str:
+    tasks = set()
+    for row in rows:
+        if row.get("source_text") is not None and row.get("target_text") is not None:
+            tasks.add("mt")
+        elif row.get("text") is not None:
+            tasks.add("asr")
+        else:
+            raise ValueError(f"Cannot infer manifest task from {path}")
+    if len(tasks) != 1:
+        raise ValueError(f"Manifest mixes tasks: {path}")
+    return tasks.pop()
+
+
+def leakage_values(
+    rows: list[dict[str, Any]],
+    task: str,
+    path: Path,
+    *,
+    strict_selection: bool,
+) -> dict[str, set[str]]:
+    keys = (
+        ("id", "pair_fingerprint")
+        if task == "mt"
+        else ("id", "text_fingerprint", "audio_sha256", "speaker", "group")
+    )
+    values = {key: set() for key in keys}
+    required = set(keys[:2] if task == "mt" else keys[:3])
+    counts = {key: 0 for key in keys}
+    for index, row in enumerate(rows, start=1):
+        row_id = str(row.get("id") or "").strip()
+        if not row_id:
+            raise ValueError(f"Missing id in {path} row {index}")
+        values["id"].add(row_id)
+        counts["id"] += 1
+        if task == "mt":
+            source = str(row.get("source_text") or "").strip()
+            target = str(row.get("target_text") or "").strip()
+            if not source or not target:
+                raise ValueError(f"Missing MT payload in {path} row {index}")
+            computed = fingerprint_text(source + "\x1f" + target)
+            declared = str(row.get("pair_fingerprint") or "").strip()
+            if declared and declared != computed:
+                raise ValueError(f"pair_fingerprint mismatch in {path} row {index}")
+            values["pair_fingerprint"].add(computed)
+            counts["pair_fingerprint"] += 1
+        else:
+            transcript = str(row.get("text") or "").strip()
+            if not transcript:
+                raise ValueError(f"Missing ASR text in {path} row {index}")
+            computed = fingerprint_text(transcript)
+            declared = str(row.get("text_fingerprint") or "").strip()
+            if declared and declared != computed:
+                raise ValueError(f"text_fingerprint mismatch in {path} row {index}")
+            values["text_fingerprint"].add(computed)
+            counts["text_fingerprint"] += 1
+            for key in ("audio_sha256", "speaker", "group"):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    values[key].add(value)
+                    counts[key] += 1
+        if strict_selection:
+            for key in required:
+                if counts[key] != index:
+                    raise ValueError(f"Selection manifest is missing {key}: {path} row {index}")
+    if strict_selection:
+        for key in required:
+            if len(values[key]) != len(rows):
+                raise ValueError(f"Selection manifest contains duplicate {key}: {path}")
+    return values
 
 
 def command_digest(command: list[str]) -> str:
@@ -116,6 +201,7 @@ def validate_resources(config: dict[str, Any]) -> None:
 def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
     hashes = {}
     forbidden = {(ROOT / value).resolve() for value in config["data"]["forbidden_selection_inputs"]}
+    selection_values: dict[str, dict[str, set[str]]] = {}
     for task in ("mt", "asr"):
         record = config["data"]["selection_dev"][task]
         path = (ROOT / record["path"]).resolve()
@@ -127,6 +213,32 @@ def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
         if actual != record["sha256"]:
             raise ValueError(f"Selection checksum mismatch for {task}: {actual}")
         hashes[task] = actual
+        rows = read_jsonl(path)
+        if manifest_task(rows, path) != task:
+            raise ValueError(f"Selection task mismatch for {task}: {path}")
+        selection_values[task] = leakage_values(
+            rows,
+            task,
+            path,
+            strict_selection=True,
+        )
+    for path in sorted(forbidden):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        rows = read_jsonl(path)
+        task = manifest_task(rows, path)
+        forbidden_values = leakage_values(
+            rows,
+            task,
+            path,
+            strict_selection=False,
+        )
+        for key, selected in selection_values[task].items():
+            overlap = selected & forbidden_values[key]
+            if overlap:
+                raise ValueError(
+                    f"Selection/{path.name} leakage for {task}.{key}: {len(overlap)}"
+                )
     accuracy_record = config["data"]["accuracy_program"]
     accuracy_path = (ROOT / accuracy_record["path"]).resolve()
     if not accuracy_path.is_file():
