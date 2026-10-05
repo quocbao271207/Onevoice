@@ -664,8 +664,8 @@ GPU command chỉ được chạy sau khi manifest checksum và preflight artifa
 | D-01 | Có dùng MedEV khi giấy phép nguồn chưa ghi rõ không? | Chủ dự án đã duyệt 22/09/2026 | Chỉ nghiên cứu/phi thương mại, không chia sẻ lại; thay nguồn nếu làm sản phẩm thương mại. |
 | D-02 | Các dòng chỉ có tiếng Anh trong tập `hard` của ViMedCSS được đo thế nào? | Đã chốt | Giữ trong test khó và báo riêng nhóm tiếng Anh/câu trộn ngôn ngữ. |
 | D-03 | Có thêm nguồn phổ thông/vùng giọng không? | Đã chốt sau EDA mở rộng | Dùng VIVOS cân bằng theo người nói và nhãn vùng của VietMed. Không gộp FPTU Vovinam/ViVoice34/GovVox vì rò dữ liệu, nguồn gốc hoặc quyền truy cập chưa đạt. |
-| D-04 | MT dùng NLLB hay VinAI Translate? | Đã chốt | Dùng một NLLB cho **text EN ↔ text VN** trong phạm vi nghiên cứu/phi thương mại. |
-| D-05 | ASR trên thiết bị dùng bản small hay base? | Chờ đo trên board | Ưu tiên small để giữ chất lượng; dùng base nếu small quá chậm hoặc quá nặng. |
+| D-04 | MT dùng NLLB, VinAI hay M2M100? | Mở lại có kiểm soát 05/10/2026 | Hoàn tất NLLB Candidate A; sau đó bake-off theo chiều. VinAI AGPL bị khóa trước GPU tới khi có phê duyệt research-license; M2M100-418M MIT là fallback production. |
+| D-05 | ASR dùng PhoWhisper-small, Whisper-small hay PhoWhisper-base? | Bake-off sau Candidate A | So sánh successive halving; safety hard gate và 95% CI trước blind v2, rồi mới đo winner trên board. |
 
 ## 14. Điều kiện để được thuê và chạy GPU
 

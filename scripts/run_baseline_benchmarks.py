@@ -25,12 +25,25 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.evaluate_benchmarks import score_asr, score_mt  # noqa: E402
+from src.training.mt_model_adapter import (  # noqa: E402
+    SUPPORTED_MT_FAMILIES,
+    configure_tokenizer,
+    direction_fields,
+    forced_bos_token_id,
+    language_codes,
+    requested_directions,
+)
 
 
 MODEL_REVISIONS = {
     "vinai/PhoWhisper-small": "a86b604c346caf7148c37512eafe783a16420adb",
     "distil-whisper/distil-small.en": "9e4a67ca4569c30be43a3fe7fba1621e504f0093",
     "facebook/nllb-200-distilled-600M": "f8d333a098d19b4fd9a8b18f94170487ad3f821d",
+    "facebook/m2m100_418M": "55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636",
+    "vinai/vinai-translate-en2vi-v2": "82f8c91bd22e82085186b45a8a76373f5a79f667",
+    "vinai/vinai-translate-vi2en-v2": "ae7baa85da07dbe8e23ac26a9f5ef560c17e2138",
+    "openai/whisper-small": "973afd24965f72e36ca33b3055d56a652f456b4d",
+    "vinai/PhoWhisper-base": "7ebdb9e88f5cc5271fb88f4d642c82ff9388650e",
 }
 
 
@@ -179,9 +192,11 @@ def run_asr(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                         "hypothesis": hypothesis,
                         "source": row.get("source"),
                         "accent": row.get("accent"),
-                        "role": row.get("metadata", {}).get("role"),
+                        "role": row.get("metadata", {}).get("role")
+                        or row.get("selection_dimensions", {}).get("role"),
                         "recording_condition": row.get("metadata", {}).get("rec_condition"),
-                        "code_switch": row.get("language") == "vi-code-switch",
+                        "code_switch": row.get("language") == "vi-code-switch"
+                        or "code_switch" in row.get("categories", []),
                         "categories": row.get("categories", []),
                         "safety_expectations": row.get("safety_expectations", {}),
                     }
@@ -212,20 +227,18 @@ def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, An
     )
     model = attach_adapter(model, args.adapter).to(device).eval()
     predictions = []
-    directions = (
-        ("en_to_vi", "source_text", "target_text", "eng_Latn", "vie_Latn"),
-        ("vi_to_en", "target_text", "source_text", "vie_Latn", "eng_Latn"),
-    )
+    directions = requested_directions(args.mt_direction, args.mt_model_family)
     generation_started = time.perf_counter()
     with torch.inference_mode():
-        for direction, source_field, target_field, source_lang, target_lang in directions:
+        for direction in directions:
+            source_field, target_field = direction_fields(direction)
+            source_lang, target_lang = language_codes(args.mt_model_family, direction)
             tokenizer_source = str(args.adapter) if args.adapter else args.model
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_source,
                 revision=None if args.adapter else args.model_revision,
-                src_lang=source_lang,
-                tgt_lang=target_lang,
             )
+            configure_tokenizer(tokenizer, args.mt_model_family, direction)
             for chunk in batches(rows, args.batch_size):
                 encoded = tokenizer(
                     [row[source_field] for row in chunk],
@@ -235,13 +248,17 @@ def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, An
                     return_tensors="pt",
                 )
                 encoded = {key: value.to(device) for key, value in encoded.items()}
-                generated = model.generate(
-                    **encoded,
-                    forced_bos_token_id=tokenizer.convert_tokens_to_ids(target_lang),
-                    max_new_tokens=256,
-                    num_beams=args.num_beams,
-                    do_sample=False,
+                generation_kwargs = {
+                    "max_new_tokens": 256,
+                    "num_beams": args.num_beams,
+                    "do_sample": False,
+                }
+                bos_token_id = forced_bos_token_id(
+                    tokenizer, args.mt_model_family, direction
                 )
+                if bos_token_id is not None:
+                    generation_kwargs["forced_bos_token_id"] = bos_token_id
+                generated = model.generate(**encoded, **generation_kwargs)
                 hypotheses = tokenizer.batch_decode(generated, skip_special_tokens=True)
                 for row, hypothesis in zip(chunk, hypotheses):
                     predictions.append(
@@ -256,7 +273,10 @@ def run_mt(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, An
                             "terminology": row.get("terminology", {}),
                         }
                     )
-                print(f"[MT:{direction}] {len(predictions)}/{len(rows) * 2}", flush=True)
+                print(
+                    f"[MT:{direction}] {len(predictions)}/{len(rows) * len(directions)}",
+                    flush=True,
+                )
     generation_seconds = time.perf_counter() - generation_started
     report = score_mt(predictions)
     report["decoding"] = {
@@ -274,6 +294,12 @@ def main() -> int:
     parser.add_argument("--task", choices=["asr", "mt"], required=True)
     parser.add_argument("--model")
     parser.add_argument("--model-revision")
+    parser.add_argument("--mt-model-family", choices=SUPPORTED_MT_FAMILIES, default="nllb")
+    parser.add_argument(
+        "--mt-direction",
+        choices=["joint", "en_to_vi", "vi_to_en"],
+        default="joint",
+    )
     parser.add_argument("--adapter", type=Path, help="Optional local PEFT/LoRA adapter directory.")
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
@@ -300,6 +326,8 @@ def main() -> int:
         parser.error("--device cpu requires --precision fp32")
     if args.task != "asr" and args.asr_prompt:
         parser.error("--asr-prompt is valid only with --task asr")
+    if args.task == "mt":
+        requested_directions(args.mt_direction, args.mt_model_family)
     if args.model is None:
         if args.task == "asr":
             args.model = "vinai/PhoWhisper-small" if args.language == "vi" else "distil-whisper/distil-small.en"
@@ -325,6 +353,8 @@ def main() -> int:
         {
             "model": args.model,
             "model_revision": args.model_revision,
+            "mt_model_family": args.mt_model_family if args.task == "mt" else None,
+            "mt_direction": args.mt_direction if args.task == "mt" else None,
             "adapter": str(args.adapter) if args.adapter else None,
             "device": resolve_device(args.device),
             "precision": args.precision,

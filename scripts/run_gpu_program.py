@@ -358,7 +358,9 @@ def main() -> int:
         )
         state["stage"] = "finished"
         state["execution_status"] = "complete"
-        state["promotion_allowed"] = mt_gate_code == 0 and asr_gate_code == 0
+        state["candidate_a_gate_pass"] = mt_gate_code == 0 and asr_gate_code == 0
+        state["promotion_allowed"] = False
+        state["promotion_deferred_to_model_bakeoff"] = True
         state["gate_results"] = {
             "mt": "pass" if mt_gate_code == 0 else "fail",
             "asr": "pass" if asr_gate_code == 0 else "fail",

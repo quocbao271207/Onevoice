@@ -1,0 +1,200 @@
+version: 1
+decision_date: "2026-10-05"
+
+principles:
+  preserve_current_pipeline: true
+  current_candidate_a_is_reference: true
+  candidate_a_auto_promotion_forbidden: true
+  compare_by_learned_samples_or_tokens_not_wall_time: true
+  one_gpu_child_at_a_time: true
+  blind_test_v2_open_once: true
+
+prerequisite:
+  current_program_state_glob: gpu-runs/program-*/program_state.json
+  required_execution_status: complete
+  freeze_candidate_a_before_bakeoff: true
+
+resources:
+  gpu_memory_fraction: 0.35
+  gpu_memory_hard_fraction: 0.40
+  utilization_percent: 70.0
+  hard_utilization_percent: 74.0
+  resume_percent: 55.0
+  sample_seconds: 2.0
+  rolling_samples: 10
+  checkpoint_archive_poll_seconds: 15.0
+  invariant: "All limits are below 75%; never run two GPU children concurrently."
+
+data:
+  train:
+    mt: data/processed/manifests/mt--train.jsonl
+    asr: data/processed/manifests/asr--train-local.jsonl
+  selection_dev:
+    mt:
+      path: data/eval/mt_selection_dev.jsonl
+      sha256: 309ab49d678994807d7816f549c3014d1564ce33e55b1893cb8ec68a93d01232
+    asr:
+      path: data/eval/asr_selection_dev.jsonl
+      sha256: 4225e2294b418509e7aba45529852dcc234d612b9da040595fa3ee43e296fd95
+  blind_test_v2_lock: data/eval/blind_test_v2.lock.json
+  forbidden_selection_inputs:
+    - data/processed/manifests/mt--test.jsonl
+    - data/processed/manifests/asr--test-local.jsonl
+    - data/eval/medical_safety_mt.jsonl
+    - data/eval/medical_safety_asr_vi.jsonl
+
+successive_halving:
+  seed: 20261005
+  zero_shot:
+    train_steps: 0
+  pilot:
+    train_steps: 400
+    max_train_samples: 8192
+  semifinal:
+    train_steps: 2000
+    keep: 2
+  full:
+    train_steps: -1
+    eligibility: winner_or_overlapping_95ci
+  comparison_unit: effective_train_samples
+  bootstrap_repeats: 1000
+
+promotion_gate:
+  critical_failure_rate_max: 0.0
+  critical_slices: [drug_name, dose, number, unit, negation]
+  policy_slices: [terminology, code_switch]
+  require_all_slices_nonempty: true
+  require_better_than_candidate_a_beyond_95ci: true
+  mt_metrics: [sacrebleu, chrf2]
+  asr_metrics: [wer, cer, code_switch_wer]
+  asr_code_switch_wer_max: 0.21
+  deployment_metrics: [latency_p50_ms, latency_p95_ms, peak_ram_bytes, peak_vram_bytes, model_bytes]
+
+candidates:
+  mt:
+    - id: mt_nllb_600m_a
+      role: candidate_a
+      status: in_progress
+      directions: [en_to_vi, vi_to_en]
+      model: facebook/nllb-200-distilled-600M
+      revision: f8d333a098d19b4fd9a8b18f94170487ad3f821d
+      model_family: nllb
+      license:
+        id: cc-by-nc-4.0
+        source: https://huggingface.co/facebook/nllb-200-distilled-600M
+        review_status: approved_research_only
+        production_eligible: false
+        gpu_eligible: true
+    - id: mt_vinai_en2vi_v2
+      role: challenger
+      status: planned
+      directions: [en_to_vi]
+      model: vinai/vinai-translate-en2vi-v2
+      revision: 82f8c91bd22e82085186b45a8a76373f5a79f667
+      model_family: mbart_directional
+      license:
+        id: agpl-3.0
+        source: https://huggingface.co/vinai/vinai-translate-en2vi-v2
+        review_status: legal_review_required
+        production_eligible: false
+        research_reference_allowed: true
+        gpu_eligible: false
+    - id: mt_vinai_vi2en_v2
+      role: challenger
+      status: planned
+      directions: [vi_to_en]
+      model: vinai/vinai-translate-vi2en-v2
+      revision: ae7baa85da07dbe8e23ac26a9f5ef560c17e2138
+      model_family: mbart_directional
+      license:
+        id: agpl-3.0
+        source: https://huggingface.co/vinai/vinai-translate-vi2en-v2
+        review_status: legal_review_required
+        production_eligible: false
+        research_reference_allowed: true
+        gpu_eligible: false
+    - id: mt_m2m100_418m
+      role: production_fallback
+      status: planned
+      directions: [en_to_vi, vi_to_en]
+      model: facebook/m2m100_418M
+      revision: 55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636
+      model_family: m2m100
+      license:
+        id: mit
+        source: https://huggingface.co/facebook/m2m100_418M
+        review_status: approved
+        production_eligible: true
+        gpu_eligible: true
+
+  asr:
+    - id: asr_phowhisper_small_a
+      role: candidate_a
+      status: waiting_for_current_pipeline
+      model: vinai/PhoWhisper-small
+      revision: a86b604c346caf7148c37512eafe783a16420adb
+      license:
+        id: bsd-3-clause
+        source: https://huggingface.co/vinai/PhoWhisper-small
+        review_status: approved
+        production_eligible: true
+        gpu_eligible: true
+    - id: asr_whisper_small_multilingual
+      role: challenger
+      status: planned
+      model: openai/whisper-small
+      revision: 973afd24965f72e36ca33b3055d56a652f456b4d
+      license:
+        id: apache-2.0
+        source: https://huggingface.co/openai/whisper-small
+        review_status: approved
+        production_eligible: true
+        gpu_eligible: true
+    - id: asr_phowhisper_base
+      role: lightweight_challenger
+      status: planned
+      model: vinai/PhoWhisper-base
+      revision: 7ebdb9e88f5cc5271fb88f4d642c82ff9388650e
+      license:
+        id: bsd-3-clause
+        source: https://huggingface.co/vinai/PhoWhisper-base
+        review_status: approved
+        production_eligible: true
+        gpu_eligible: true
+
+  deployment_reference:
+    - id: qualcomm_whisper_small_quantized
+      role: deployment_reference_only
+      status: historical_evidence_available_current_catalog_recheck_required
+      trainable: false
+      model: Whisper-Small-Quantized
+      quantization: w8a16
+      upstream_model: openai/whisper-small
+      target: Qualcomm QCS6490
+      license:
+        id: apache-2.0
+        source: https://aihub.qualcomm.com/models/whisper_small_quantized
+        review_status: approved
+        production_eligible: true
+        gpu_eligible: false
+      current_catalog_observation:
+        checked_at: "2026-10-05"
+        qcs6490_listed: false
+        note: "Official current page no longer lists QCS6490; retain immutable historical project profile as evidence, but require a fresh physical-board rerun."
+      historical_evidence: data/reports/aihub/asr/whisper_small_quantized_reference.json
+
+evidence_corrections:
+  - artifact: data/reports/experiments/decoding/mt_val_greedy_rescored.json
+    status: invalid_for_vinai_claim
+    correct_model: facebook/nllb-200-distilled-600M
+    reason: "Derived from the NLLB greedy predictions; no VinAI inference evidence exists in this artifact."
+
+workflow:
+  - current_pipeline_complete
+  - freeze_candidate_a
+  - mt_multi_model_bakeoff
+  - asr_multi_model_bakeoff
+  - full_train_selected_winners
+  - blind_locked_test_v2
+  - deployment_benchmark
+  - promotion_or_reject

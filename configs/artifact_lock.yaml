@@ -11,8 +11,13 @@ datasets:
 
 base_models:
   vinai/PhoWhisper-small: a86b604c346caf7148c37512eafe783a16420adb
+  vinai/PhoWhisper-base: 7ebdb9e88f5cc5271fb88f4d642c82ff9388650e
+  openai/whisper-small: 973afd24965f72e36ca33b3055d56a652f456b4d
   distil-whisper/distil-small.en: 9e4a67ca4569c30be43a3fe7fba1621e504f0093
   facebook/nllb-200-distilled-600M: f8d333a098d19b4fd9a8b18f94170487ad3f821d
+  facebook/m2m100_418M: 55c2e61bbf05dfb8d7abccdc3fae6fc8512fd636
+  vinai/vinai-translate-en2vi-v2: 82f8c91bd22e82085186b45a8a76373f5a79f667
+  vinai/vinai-translate-vi2en-v2: ae7baa85da07dbe8e23ac26a9f5ef560c17e2138
 
 manifests:
   validation_report: data/reports/manifests/validation.json
@@ -32,6 +37,12 @@ evaluation:
   medical_safety_asr_vi_sha256: 4c0cf6ae761a73940edfe29517c55a3f4aee4a1b32c287d11ed50cd6aaffe6a9
   medical_safety_mt: data/eval/medical_safety_mt.jsonl
   medical_safety_mt_sha256: 68493af1858de00caa37b0e3f125e61cdba8618337520295316aef2be34ef408
+  mt_selection_dev: data/eval/mt_selection_dev.jsonl
+  mt_selection_dev_sha256: 309ab49d678994807d7816f549c3014d1564ce33e55b1893cb8ec68a93d01232
+  asr_selection_dev: data/eval/asr_selection_dev.jsonl
+  asr_selection_dev_sha256: 4225e2294b418509e7aba45529852dcc234d612b9da040595fa3ee43e296fd95
+  blind_test_v2_lock: data/eval/blind_test_v2.lock.json
+  blind_test_v2_status: awaiting_unseen_data
   rule: "Locked safety evaluation only; never train or select checkpoints on this suite."
 
 constraints:

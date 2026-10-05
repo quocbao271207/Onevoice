@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-05T00:00:00+07:00",
+  "status": "waiting_for_candidate_a",
+  "promotion_allowed": false,
+  "candidate_a": {
+    "mt_nllb_600m_a": "in_progress",
+    "asr_phowhisper_small_a": "waiting_for_current_pipeline"
+  },
+  "planned_not_benchmarked": [
+    "mt_vinai_en2vi_v2",
+    "mt_vinai_vi2en_v2",
+    "mt_m2m100_418m",
+    "asr_whisper_small_multilingual",
+    "asr_phowhisper_base"
+  ],
+  "benchmarked": [],
+  "evidence_correction": {
+    "data/reports/experiments/decoding/mt_val_greedy_rescored.json": "invalid_for_vinai_claim"
+  },
+  "blind_test_v2": "awaiting_unseen_data",
+  "results": {}
+}

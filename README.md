@@ -16,10 +16,13 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/run_asr_candidate_suite.py` — chấm LoRA ASR Việt trên full test, code-switch và clinical audio suite, fail-closed
 - `scripts/run_mt_candidate_suite.py` — chấm LoRA MT trên full locked test + clinical suite, fail-closed và tạo archive checksum
 - `scripts/run_gpu_program.py` — tự quyết định MT continuation bằng validation trend, rồi nối tuần tự MT gate → ASR pilots/full-data → ASR gate; state nguyên tử và không chạy hai GPU child đồng thời
+- `scripts/run_model_bakeoff.py` — sau khi Candidate A hoàn tất, đóng băng nó rồi chạy successive-halving đa model trên selection dev; không mở test khóa cũ để chọn model
+- `scripts/run_blind_candidate_suite.py` — khóa checksum và mở blind test v2 đúng một lần cho winner cuối
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board
 - `docs/ACCURACY_IMPROVEMENT_PLAN.md` — kế hoạch accuracy, fine-tune hai giai đoạn và gate lâm sàng
+- `docs/MODEL_BAKEOFF_RESULTS.md` — trạng thái, license gate, fairness, winner rule và kết quả đa model
 - `configs/accuracy_program.yaml` — ngưỡng release máy đọc được
 - `data/eval/medical_safety_asr_vi.jsonl` — 16 audio test khóa cho thuốc/liều/số/đơn vị/phủ định/thuật ngữ/code-switch
 - `data/eval/medical_safety_mt.jsonl` — tập test khóa riêng cho thuốc/liều/số/đơn vị/phủ định
@@ -44,4 +47,5 @@ Kết quả regression gần nhất được ghi trong `project_analysis.md`; kh
 2. Giữ Piper CPU fallback cho đến khi có source exporter loại được `NonZero/ReduceMax→Range`; graph mới phải qua local QNN gate trước khi upload. Sau đó mới export NLLB base theo encoder/decoder/KV-cache tĩnh.
 3. Hoàn tất candidate MT full-data đang chạy, tải ngay checkpoint/report/checksum về local và chấm locked MT suite.
 4. Chạy ba pilot ASR rồi để controller tự chọn cấu hình cho vòng ASR full-data; không chạy ASR và MT đồng thời trên một GPU.
-5. Chỉ promotion candidate vượt cả metric tổng thể và locked clinical suite; sau đó chạy INT8 parity/QNN compile rồi mới benchmark toàn tuyến trên board QCS6490 thật.
+5. Đóng băng NLLB/PhoWhisper Candidate A, sau đó chạy bake-off M2M100/VinAI (nếu license gate mở), Whisper-small/PhoWhisper-base bằng successive halving.
+6. Chỉ promotion winner vượt hard safety gate, cải thiện ngoài 95% CI trên blind v2 mở một lần, rồi pass INT8 parity/QNN và benchmark board QCS6490 thật.

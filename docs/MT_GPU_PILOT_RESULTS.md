@@ -9,7 +9,7 @@ Model nền: `facebook/nllb-200-distilled-600M@f8d333a098d19b4fd9a8b18f94170487a
 - LoRA, bf16, batch/device 2, gradient accumulation 16, effective batch 32.
 - 8.192 hàng train ưu tiên lâm sàng, oversample risk factor 2, hai chiều EN↔VI.
 - 256 hàng validation, 200 optimizer steps, eval/save mỗi 50 steps.
-- Process CUDA giới hạn 35% VRAM; rolling utilization ban ngày 38%, 02:00–09:00 Asia/Bangkok 75%.
+- Process CUDA giới hạn 35% VRAM; policy áp dụng cho các stage khởi động mới là rolling 70%, resume 55% và hard reaction 74%, luôn dưới 75%. Job MT đang chạy giữ controller in-memory cũ để không mất optimizer/checkpoint.
 - Runtime monitor đã tự chuyển `active_utilization_limit_percent` từ 38 sang 75 và `boosted_window` từ false sang true lúc `2026-10-05T02:00:13+07:00`, không restart trainer.
 - Cả ba vòng có 0 lần throttle và không vượt giới hạn đã cấu hình.
 
@@ -71,5 +71,7 @@ Run `mt-20261004-172023/01-final-r8-lr1e4-full` dùng toàn bộ 339.028 cặp t
 | 16000 | **1.4826416969299316** | 18.773.509 | `3502aa3ace7143d9f49a3f8c0739241d7ee4e139e4ad0fc22e89c593d3d57576` |
 | 16500 | **1.4798743724822998** | 18.775.961 | `5cbb3fb07a4f04ea96f353ffd616d2492e05a2dae49e06f88bcbfd75193c83a4` |
 | 17000 | **1.4781849384307861** | 18.775.845 | `c3b55c16e91c14e690bff3aeb19fa8bec0b986003fe26813d2c9e02baf92ffa9` |
+| 17500 | **1.4769376516342163** | 18.777.804 | `e653c6df775bdfc7d87d1f844dae95c51da49bd7d98b449bd76ec121617abcd2` |
+| 18000 | **1.4739108085632324** | 18.779.083 | `44d9ef037cdf3bed9299d1335afab24222246b42c94aedc83056bdf2aabdac71` |
 
-Ba mươi bốn archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Các checkpoint mới còn được đọc lại cấu trúc để xác nhận có adapter, optimizer, scheduler, RNG và trainer state. Eval loss sớm đang giảm nhưng chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn; promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.
+Ba mươi sáu archive, sidecar checksum và manifest đã được tải về `test/checkpoints/mt-20261004-172023/` rồi băm lại trên local. Các checkpoint mới còn được đọc lại cấu trúc để xác nhận có adapter, optimizer, scheduler, RNG và trainer state. Eval loss sớm đang giảm nhưng chưa phải BLEU/chrF trên test khóa và không phải bằng chứng an toàn; promotion vẫn bị khóa tới khi full-run, full test và toàn bộ clinical gate hoàn tất.

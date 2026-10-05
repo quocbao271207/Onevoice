@@ -9,6 +9,12 @@ principles:
     - "Tat ca model phai co baseline truoc fine-tune va benchmark sau quantization."
     - "Khong cong bo WER/BLEU/latency neu chua co artifact benchmark."
     - "Khong dung evaluation-only dataset de train."
+    - "Candidate A khong duoc promote vinh vien truoc multi-model bake-off, blind test v2 va deployment gate."
+
+model_bakeoff:
+  config: configs/model_bakeoff.yaml
+  results: data/reports/model_bakeoff/comparison.json
+  policy: "Hoan tat NLLB/PhoWhisper Candidate A truoc; sau do successive-halving theo selection dev, khong dung locked test cu de chon model."
 
 asr_vi:
   selected_base: vinai/PhoWhisper-small

@@ -1,0 +1,36 @@
+{
+  "task": "mt",
+  "samples": 24,
+  "sacrebleu": 25.933335547673277,
+  "sacrebleu_signature": "BLEU = 25.93 55.2/30.5/19.7/13.7 (BP = 1.000 ratio = 1.058 hyp_len = 745 ref_len = 704)",
+  "chrf2": 46.016082484475575,
+  "safety_failure_rate": 0.0,
+  "safety_issue_counts": {},
+  "safety_failure_examples": [],
+  "directions": {
+    "en_to_vi": {
+      "samples": 12,
+      "sacrebleu": 28.77725306369747,
+      "sacrebleu_signature": "BLEU = 28.78 60.1/34.7/22.6/16.0 (BP = 0.976 ratio = 0.976 hyp_len = 404 ref_len = 414)",
+      "chrf2": 46.44638200147412,
+      "safety_failure_rate": 0.0,
+      "safety_issue_counts": {},
+      "safety_failure_examples": []
+    },
+    "vi_to_en": {
+      "samples": 12,
+      "sacrebleu": 21.631708718503756,
+      "sacrebleu_signature": "BLEU = 21.63 49.3/25.5/16.1/10.8 (BP = 1.000 ratio = 1.176 hyp_len = 341 ref_len = 290)",
+      "chrf2": 45.63328894800565,
+      "safety_failure_rate": 0.0,
+      "safety_issue_counts": {},
+      "safety_failure_examples": []
+    }
+  },
+  "predictions": "data\\reports\\experiments\\decoding\\mt_val_greedy_predictions.jsonl",
+  "model": "facebook/nllb-200-distilled-600M",
+  "model_revision": "f8d333a098d19b4fd9a8b18f94170487ad3f821d",
+  "evidence_status": "invalid_for_model_comparison",
+  "derived_from": "mt_val_greedy_predictions.jsonl",
+  "correction_note": "This is a re-score of NLLB greedy predictions, not a VinAI Translate benchmark."
+}

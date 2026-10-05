@@ -141,9 +141,33 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def bootstrap(group: list[dict[str, Any]], repeats: int = 1000) -> dict[str, list[float]]:
+        rng = np.random.default_rng(20261005)
+        bleu_values = []
+        chrf_values = []
+        for _ in range(repeats):
+            sampled = [group[index] for index in rng.integers(0, len(group), len(group))]
+            hypotheses = [row["hypothesis"] for row in sampled]
+            references = [row["reference"] for row in sampled]
+            bleu_values.append(
+                sacrebleu.corpus_bleu(hypotheses, [references], tokenize="intl").score
+            )
+            chrf_values.append(sacrebleu.corpus_chrf(hypotheses, [references]).score)
+        return {
+            "sacrebleu_bootstrap_95ci": [
+                float(np.quantile(bleu_values, 0.025)),
+                float(np.quantile(bleu_values, 0.975)),
+            ],
+            "chrf2_bootstrap_95ci": [
+                float(np.quantile(chrf_values, 0.025)),
+                float(np.quantile(chrf_values, 0.975)),
+            ],
+        }
+
     def score(
         group: list[dict[str, Any]],
         relevant_issue_prefixes: set[str] | None = None,
+        include_confidence_interval: bool = True,
     ) -> dict[str, Any]:
         hypotheses = [row["hypothesis"] for row in group]
         references = [row["reference"] for row in group]
@@ -194,6 +218,7 @@ def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "safety_failure_rate": safety_failures / max(1, len(group)),
             "safety_issue_counts": dict(issue_counts),
             "safety_failure_examples": failure_examples,
+            **(bootstrap(group) if include_confidence_interval else {}),
         }
 
     by_direction: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -214,7 +239,11 @@ def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "code_switch": {"identifier_mismatch", "terminology_missing"},
     }
     category_scores = {
-        category: score(group, category_issue_prefixes.get(category))
+        category: score(
+            group,
+            category_issue_prefixes.get(category),
+            include_confidence_interval=False,
+        )
         for category, group in sorted(by_category.items())
     }
     critical_categories = {

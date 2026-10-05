@@ -14,15 +14,35 @@ from pathlib import Path
 from typing import Any
 
 from src.training.clinical_sampling import oversample_clinical_rows, prioritize_rows
+from src.training.mt_model_adapter import (
+    SUPPORTED_MT_FAMILIES,
+    configure_tokenizer,
+    direction_fields as model_direction_fields,
+    requested_directions as model_requested_directions,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def direction_fields(direction: str) -> tuple[str, str, str, str]:
+    """Backward-compatible NLLB field/language mapping used by older callers."""
+    source_field, target_field = model_direction_fields(direction)
+    if direction == "en_to_vi":
+        return source_field, target_field, "eng_Latn", "vie_Latn"
+    return source_field, target_field, "vie_Latn", "eng_Latn"
+
+
+def requested_directions(direction: str, family: str = "nllb") -> tuple[str, ...]:
+    """Preserve the historical one-argument API while supporting new families."""
+    return model_requested_directions(direction, family)
 
 
 @dataclass
 class MTTrainingConfig:
     base_model: str = "facebook/nllb-200-distilled-600M"
     base_model_revision: str = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
+    model_family: str = "nllb"
     train_manifest: str = "data/processed/manifests/mt--train.jsonl"
     validation_manifest: str = "data/processed/manifests/mt--validation.jsonl"
     output_dir: str = "models/mt/nllb-medical"
@@ -57,21 +77,6 @@ class MTTrainingConfig:
     early_stopping_patience: int = 4
 
 
-def direction_fields(direction: str) -> tuple[str, str, str, str]:
-    if direction == "en_to_vi":
-        return "source_text", "target_text", "eng_Latn", "vie_Latn"
-    if direction == "vi_to_en":
-        return "target_text", "source_text", "vie_Latn", "eng_Latn"
-    raise ValueError(f"Unsupported direction: {direction}")
-
-
-def requested_directions(direction: str) -> tuple[str, ...]:
-    if direction == "joint":
-        return ("en_to_vi", "vi_to_en")
-    direction_fields(direction)
-    return (direction,)
-
-
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     file_path = Path(path)
     if not file_path.exists():
@@ -102,11 +107,14 @@ def preflight(config: MTTrainingConfig) -> dict[str, Any]:
         "base_model": config.base_model,
         "base_model_revision": config.base_model_revision,
         "direction": config.direction,
-        "directions": list(requested_directions(config.direction)),
+        "model_family": config.model_family,
+        "directions": list(requested_directions(config.direction, config.model_family)),
         "train_examples": len(train_rows),
         "validation_examples": len(validation_rows),
-        "effective_train_examples": len(train_rows) * len(requested_directions(config.direction)),
-        "effective_validation_examples": len(validation_rows) * len(requested_directions(config.direction)),
+        "effective_train_examples": len(train_rows)
+        * len(requested_directions(config.direction, config.model_family)),
+        "effective_validation_examples": len(validation_rows)
+        * len(requested_directions(config.direction, config.model_family)),
         "exact_overlap": 0,
         "max_source_length": config.max_source_length,
         "max_target_length": config.max_target_length,
@@ -164,7 +172,7 @@ def train(config: MTTrainingConfig) -> None:
     logger.info("Preflight: %s", json.dumps(report, ensure_ascii=False))
     set_seed(config.seed)
 
-    directions = requested_directions(config.direction)
+    directions = requested_directions(config.direction, config.model_family)
     tokenizer = AutoTokenizer.from_pretrained(
         config.base_model,
         revision=config.base_model_revision,
@@ -200,9 +208,8 @@ def train(config: MTTrainingConfig) -> None:
         model.print_trainable_parameters()
 
     def tokenized_direction(rows: list[dict[str, Any]], direction: str) -> Dataset:
-        src_field, tgt_field, src_lang, tgt_lang = direction_fields(direction)
-        tokenizer.src_lang = src_lang
-        tokenizer.tgt_lang = tgt_lang
+        src_field, tgt_field = model_direction_fields(direction)
+        configure_tokenizer(tokenizer, config.model_family, direction)
         directional = Dataset.from_list(
             [
                 {
@@ -316,6 +323,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model", default=MTTrainingConfig.base_model)
     parser.add_argument("--base-model-revision", default=MTTrainingConfig.base_model_revision)
+    parser.add_argument("--model-family", choices=SUPPORTED_MT_FAMILIES, default="nllb")
     parser.add_argument("--train-manifest", default=MTTrainingConfig.train_manifest)
     parser.add_argument("--validation-manifest", default=MTTrainingConfig.validation_manifest)
     parser.add_argument("--output-dir", default=MTTrainingConfig.output_dir)
@@ -376,6 +384,7 @@ def main() -> int:
     config = MTTrainingConfig(
         base_model=args.base_model,
         base_model_revision=args.base_model_revision,
+        model_family=args.model_family,
         train_manifest=args.train_manifest,
         validation_manifest=args.validation_manifest,
         output_dir=args.output_dir,

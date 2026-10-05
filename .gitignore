@@ -22,6 +22,17 @@ data/raw/
 data/processed/
 data/augmented/
 data/reports/
+# Keep only machine-readable bake-off status and the corrected legacy evidence.
+!data/reports/
+data/reports/*
+!data/reports/model_bakeoff/
+data/reports/model_bakeoff/*
+!data/reports/model_bakeoff/comparison.json
+!data/reports/experiments/
+data/reports/experiments/*
+!data/reports/experiments/decoding/
+data/reports/experiments/decoding/*
+!data/reports/experiments/decoding/mt_val_greedy_rescored.json
 data/review/
 models/asr/
 models/mt/
