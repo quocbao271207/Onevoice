@@ -523,6 +523,63 @@ def validate_deployment_report(
     return not failures, failures
 
 
+def validate_deployment_draft(
+    draft: dict[str, Any],
+    expected_winners: list[dict[str, Any]],
+    comparison_path: Path,
+) -> tuple[bool, list[str]]:
+    """Verify that pending physical measurements remain bound to this selection."""
+    failures: list[str] = []
+    if draft.get("version") != 1:
+        failures.append("version:invalid")
+    if draft.get("status") != "pending_physical_measurement":
+        failures.append("status:not_pending")
+    if draft.get("target") != "QCS6490":
+        failures.append("target:not_qcs6490")
+    if draft.get("measurement_source") != "physical_board":
+        failures.append("measurement_source:not_physical_board")
+    selection = draft.get("selection_comparison")
+    if not isinstance(selection, dict):
+        failures.append("selection_comparison:missing")
+    else:
+        if selection.get("path") != str(comparison_path.resolve()):
+            failures.append("selection_comparison:path_mismatch")
+        if selection.get("sha256") != sha256(comparison_path):
+            failures.append("selection_comparison:checksum_mismatch")
+
+    expected_by_key = {
+        (item["task"], item.get("direction")): item for item in expected_winners
+    }
+    records = draft.get("winners")
+    if not isinstance(records, list):
+        return False, failures + ["winners:missing"]
+    record_by_key: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            failures.append("winners:invalid_record")
+            continue
+        direction_value = record.get("direction")
+        key = (
+            str(record.get("task") or ""),
+            str(direction_value) if direction_value is not None else None,
+        )
+        if key in record_by_key:
+            failures.append(f"winner:{key[0]}/{key[1] or 'vi'}:duplicate")
+        record_by_key[key] = record
+    if set(record_by_key) != set(expected_by_key):
+        failures.append("winners:set_mismatch")
+    for key, expected in expected_by_key.items():
+        record = record_by_key.get(key)
+        if record is None:
+            continue
+        label = f"winner:{key[0]}/{key[1] or 'vi'}"
+        if record.get("candidate_id") != expected["candidate_id"]:
+            failures.append(f"{label}:candidate_mismatch")
+        if record.get("adapter_manifest_sha256") != expected["adapter_manifest_sha256"]:
+            failures.append(f"{label}:adapter_checksum_mismatch")
+    return not failures, failures
+
+
 def freeze_candidate_a(current: dict[str, Any], output: Path) -> dict[str, Any]:
     adapters = {"mt": current.get("mt_adapter"), "asr": current.get("asr_adapter")}
     missing = [task for task, value in adapters.items() if not value]
@@ -1530,15 +1587,53 @@ def main() -> int:
     comparison["status"] = "blind_complete"
     atomic_json(comparison_path, comparison)
 
-    deployment_path = ROOT / "data/reports/model_bakeoff/deployment_selected_winners.json"
+    expected_deployment = deployment_expectations(winner_specs)
+    deployment_dir = ROOT / "data/reports/model_bakeoff"
+    deployment_path = deployment_dir / "deployment_selected_winners.json"
     if not deployment_path.is_file():
+        deployment_draft_path = deployment_dir / "deployment_selected_winners.draft.json"
+        if not deployment_draft_path.is_file():
+            draft_command = [
+                args.python,
+                str(ROOT / "scripts/prepare_deployment_benchmark.py"),
+                "--action",
+                "template",
+                "--selection-comparison",
+                str(comparison_path),
+                "--config",
+                str(args.config),
+                "--draft",
+                str(deployment_draft_path),
+            ]
+            run_stage(
+                "prepare_deployment_draft",
+                draft_command,
+                state_path,
+                state,
+                state_dir / "logs/prepare_deployment_draft.log",
+                [deployment_draft_path],
+            )
+        deployment_draft = json.loads(deployment_draft_path.read_text(encoding="utf-8"))
+        draft_pass, draft_failures = validate_deployment_draft(
+            deployment_draft,
+            expected_deployment,
+            comparison_path,
+        )
+        if not draft_pass:
+            raise ValueError(
+                "Deployment draft does not match selected winners: "
+                + ", ".join(draft_failures)
+            )
         state["stage"] = "deployment_benchmark"
         state["execution_status"] = "waiting_for_qcs6490_benchmark"
         state["next_stage"] = "deployment_benchmark"
+        state["deployment_draft_template"] = {
+            "path": str(deployment_draft_path),
+            "created_sha256": sha256(deployment_draft_path),
+        }
         atomic_json(state_path, state)
         return CRITICAL_EXIT_WAITING_FOR_BLIND
     deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
-    expected_deployment = deployment_expectations(winner_specs)
     deployment_pass, deployment_failures = validate_deployment_report(
         deployment,
         expected_deployment,

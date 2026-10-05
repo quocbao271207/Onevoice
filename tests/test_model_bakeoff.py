@@ -20,6 +20,7 @@ from scripts.run_model_bakeoff import (
     selection_identity,
     selection_identity_sha256,
     validate_candidate_matrix,
+    validate_deployment_draft,
     validate_deployment_report,
     validate_resources,
     validate_selection_artifacts,
@@ -611,3 +612,34 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
     assert passed is False
     assert "winner:mt/en_to_vi:artifact_checksum_mismatch" in failures
     assert "winner:mt/en_to_vi:model_bytes_mismatch" in failures
+
+
+def test_deployment_draft_is_bound_to_current_selection_and_winners(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    comparison = tmp_path / "comparison.json"
+    comparison.write_text('{"status":"blind_complete"}', encoding="utf-8")
+    expected = deployment_expectations(
+        [("mt", "en_to_vi", {"candidate_id": "winner", "adapter": str(adapter)})]
+    )
+    draft = {
+        "version": 1,
+        "status": "pending_physical_measurement",
+        "target": "QCS6490",
+        "measurement_source": "physical_board",
+        "selection_comparison": {
+            "path": str(comparison.resolve()),
+            "sha256": bakeoff.sha256(comparison),
+        },
+        "winners": [{**expected[0], "latency_samples_ms": []}],
+    }
+
+    assert validate_deployment_draft(draft, expected, comparison) == (True, [])
+
+    draft["winners"][0]["candidate_id"] = "other"
+    comparison.write_text('{"status":"changed"}', encoding="utf-8")
+    passed, failures = validate_deployment_draft(draft, expected, comparison)
+    assert passed is False
+    assert "selection_comparison:checksum_mismatch" in failures
+    assert "winner:mt/en_to_vi:candidate_mismatch" in failures

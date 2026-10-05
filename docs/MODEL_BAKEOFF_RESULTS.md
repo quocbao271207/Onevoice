@@ -88,7 +88,7 @@ Dự án giữ immutable evidence QCS6490 đã đo ngày 26/09/2026. Tuy nhiên 
 
 `deployment_selected_winners.json` phải là schema version 1, ghi `measurement_source=physical_board`, timestamp có timezone và metadata board/chipset/OS. Mỗi winner phải khớp task, chiều, candidate ID và SHA-256 manifest của đúng adapter; artifact triển khai phải nằm dưới `models/`, có path/SHA-256/byte size khớp file thật. Report phải chứa ít nhất 30 latency samples để runner tự tính lại p50/p95; p95 không được thấp hơn p50 và mọi số đo phải hữu hạn/dương (VRAM được phép bằng 0 nếu chạy NPU/CPU). Report cloud cũ, report của model khác hoặc số đo giả/thiếu đều bị reject.
 
-Không soạn report cuối bằng tay. Khi selection snapshot đã chốt, tạo draft đã khóa đúng ba winner và checksum cây adapter:
+Không soạn report cuối bằng tay. Khi blind v2 pass, state machine tự tạo draft đã khóa đúng ba winner, checksum cây adapter và checksum `comparison.json`; lệnh tương đương để phục hồi thủ công là:
 
 ```bash
 python scripts/prepare_deployment_benchmark.py --action template \
