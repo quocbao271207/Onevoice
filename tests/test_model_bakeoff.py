@@ -20,6 +20,7 @@ from scripts.run_model_bakeoff import (
     run_stage,
     selection_identity,
     selection_identity_sha256,
+    strongest_eligible_challenger,
     validate_candidate_matrix,
     validate_deployment_draft,
     validate_deployment_report,
@@ -443,6 +444,42 @@ def test_mt_multi_metric_winner_rejects_significant_bleu_regression():
 
     assert multi_metric_stronger(bleu_regression, baseline) is False
     assert multi_metric_stronger(pareto_improvement, baseline) is True
+
+
+def test_winner_search_skips_higher_point_score_with_significant_regression():
+    required = ["dose"]
+
+    def score(sacrebleu, bleu_ci, chrf2, chrf_ci):
+        return report_score(
+            {
+                "directions": {
+                    "en_to_vi": {
+                        "sacrebleu": sacrebleu,
+                        "sacrebleu_bootstrap_95ci": bleu_ci,
+                        "chrf2": chrf2,
+                        "chrf2_bootstrap_95ci": chrf_ci,
+                    }
+                },
+                "categories": {"dose": {"samples": 1, "safety_failure_rate": 0.0}},
+            },
+            "mt",
+            "en_to_vi",
+            required,
+        )
+
+    baseline = score(31.0, [30.0, 32.0], 50.0, [49.0, 51.0])
+    point_ranked_first = {
+        "unit": "high-bleu-regressor",
+        "score": score(36.0, [35.0, 37.0], 45.0, [44.0, 46.0]),
+    }
+    valid_pareto_winner = {
+        "unit": "valid-pareto-winner",
+        "score": score(33.0, [32.1, 34.0], 54.0, [53.0, 55.0]),
+    }
+    ranked = bakeoff.rank_scores([valid_pareto_winner, point_ranked_first])
+
+    assert ranked[0]["unit"] == "high-bleu-regressor"
+    assert strongest_eligible_challenger(ranked, baseline)["unit"] == "valid-pareto-winner"
 
 
 def test_selection_identity_ignores_later_blind_results_but_binds_winners():

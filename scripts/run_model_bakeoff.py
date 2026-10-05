@@ -1097,6 +1097,24 @@ def rank_scores(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def strongest_eligible_challenger(
+    ranked: list[dict[str, Any]], baseline_score: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return the best ranked challenger that can actually replace Candidate A."""
+    if not ranked:
+        return None
+    if not baseline_score.get("clinical_safety_pass"):
+        return ranked[0]
+    return next(
+        (
+            entry
+            for entry in ranked
+            if multi_metric_stronger(entry["score"], baseline_score)
+        ),
+        None,
+    )
+
+
 def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
     """Return only immutable winner bindings from a selection comparison."""
     winners: dict[str, dict[str, dict[str, Any]]] = {}
@@ -1378,28 +1396,23 @@ def run_task_bakeoff(
             "score": baseline_score,
             "decision": "candidate_a_retained",
         }
-        if ranked:
-            challenger = ranked[0]
+        challenger = strongest_eligible_challenger(ranked, baseline_score)
+        if challenger is not None:
             challenger_score = challenger["score"]
-            stronger = (
-                not baseline_score["clinical_safety_pass"]
-                or multi_metric_stronger(challenger_score, baseline_score)
-            )
-            if stronger:
-                winner = {
-                    "candidate_id": challenger["candidate"]["id"],
-                    "adapter": challenger["adapter"],
-                    "adapter_manifest_sha256": tree_manifest(
-                        Path(challenger["adapter"])
-                    )["manifest_sha256"],
-                    "direction": direction,
-                    "score": challenger_score,
-                    "decision": (
-                        "challenger_selected_after_candidate_a_safety_failure"
-                        if not baseline_score["clinical_safety_pass"]
-                        else "challenger_stronger_beyond_95ci"
-                    ),
-                }
+            winner = {
+                "candidate_id": challenger["candidate"]["id"],
+                "adapter": challenger["adapter"],
+                "adapter_manifest_sha256": tree_manifest(Path(challenger["adapter"]))[
+                    "manifest_sha256"
+                ],
+                "direction": direction,
+                "score": challenger_score,
+                "decision": (
+                    "challenger_selected_after_candidate_a_safety_failure"
+                    if not baseline_score["clinical_safety_pass"]
+                    else "challenger_stronger_beyond_95ci"
+                ),
+            }
         winners[direction or "vi"] = winner
     return {
         "task": task,
