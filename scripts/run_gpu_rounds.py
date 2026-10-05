@@ -166,8 +166,8 @@ def process_group_pids(group_id: int) -> set[int]:
     }
 
 
-def process_gpu_memory_mib(group_id: int) -> float:
-    pids = process_group_pids(group_id)
+def gpu_process_memory_by_pid() -> dict[int, float]:
+    """Return compute-process memory keyed by the PID reported by NVIDIA."""
     result = subprocess.run(
         [
             "nvidia-smi",
@@ -178,15 +178,47 @@ def process_gpu_memory_mib(group_id: int) -> float:
         text=True,
         capture_output=True,
     )
-    total = 0.0
+    memory_by_pid: dict[int, float] = {}
     for line in result.stdout.splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) == 2 and fields[0].isdigit() and int(fields[0]) in pids:
-            try:
-                total += float(fields[1])
-            except ValueError:
-                continue
-    return total
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        try:
+            memory_by_pid[int(fields[0])] = float(fields[1])
+        except ValueError:
+            continue
+    return memory_by_pid
+
+
+def attributed_process_gpu_memory(
+    group_id: int,
+    gpu_memory_baseline: dict[int, float] | None = None,
+) -> dict[str, Any]:
+    """Attribute GPU memory despite host/container PID namespace differences.
+
+    NVIDIA may expose host PIDs while ``ps`` exposes container PIDs. Prefer an
+    exact process-group match; when that is impossible, attribute only GPU PIDs
+    that appeared after the pre-spawn baseline so pre-existing shared jobs are
+    never charged to this training round.
+    """
+    process_pids = process_group_pids(group_id)
+    current = gpu_process_memory_by_pid()
+    direct_gpu_pids = process_pids & set(current)
+    if direct_gpu_pids:
+        gpu_pids = direct_gpu_pids
+        attribution = "process_group_pid"
+    elif gpu_memory_baseline is not None:
+        gpu_pids = set(current) - set(gpu_memory_baseline)
+        attribution = "post_spawn_pid"
+    else:
+        gpu_pids = set()
+        attribution = "unattributed"
+    return {
+        "memory_mib": sum(current[pid] for pid in gpu_pids),
+        "attribution": attribution,
+        "gpu_pids": sorted(gpu_pids),
+        "process_pids": sorted(process_pids),
+    }
 
 
 def cli_args(values: dict[str, Any]) -> list[str]:
@@ -370,6 +402,7 @@ def monitor_process(
     process: subprocess.Popen[str],
     monitor_path: Path,
     limits: dict[str, Any],
+    gpu_memory_baseline: dict[int, float] | None = None,
 ) -> dict[str, Any]:
     memory_fraction, hard_memory_fraction = validate_resource_limits(limits)
     hard_utilization_limit = float(limits["hard_utilization_percent"])
@@ -379,6 +412,7 @@ def monitor_process(
     peak_process_memory = 0.0
     samples = 0
     throttles = 0
+    memory_attribution_modes: set[str] = set()
     started = time.monotonic()
     process_group = os.getpgid(process.pid)
     try:
@@ -386,7 +420,12 @@ def monitor_process(
             while process.poll() is None:
                 sample = read_gpu_sample()
                 utilization_limit, resume_percent, boosted_window = active_utilization_limits(limits)
-                process_memory = process_gpu_memory_mib(process_group)
+                process_memory_sample = attributed_process_gpu_memory(
+                    process_group,
+                    gpu_memory_baseline,
+                )
+                process_memory = float(process_memory_sample["memory_mib"])
+                memory_attribution_modes.add(str(process_memory_sample["attribution"]))
                 peak_process_memory = max(peak_process_memory, process_memory)
                 hard_memory_limit = sample["memory_total_mib"] * hard_memory_fraction
                 if process_memory > hard_memory_limit:
@@ -424,6 +463,9 @@ def monitor_process(
                     **sample,
                     "process_memory_mib": process_memory,
                     "process_memory_fraction": process_memory / max(1.0, sample["memory_total_mib"]),
+                    "process_memory_attribution": process_memory_sample["attribution"],
+                    "attributed_gpu_pids": process_memory_sample["gpu_pids"],
+                    "tracked_process_pids": process_memory_sample["process_pids"],
                     "configured_memory_fraction": memory_fraction,
                     "configured_hard_memory_fraction": hard_memory_fraction,
                     "hard_memory_limit_mib": hard_memory_limit,
@@ -447,6 +489,7 @@ def monitor_process(
         "samples": samples,
         "throttle_events": throttles,
         "peak_process_memory_mib": peak_process_memory,
+        "memory_attribution_modes": sorted(memory_attribution_modes),
         "configured_memory_fraction": memory_fraction,
         "configured_hard_memory_fraction": hard_memory_fraction,
         "configured_utilization_limit_percent": float(limits["utilization_percent"]),
@@ -541,6 +584,7 @@ def main() -> int:
         checkpoint_archive_dir = run_root / "checkpoint-archives" / round_dir.name
         watcher_log_path = round_dir / "checkpoint_watcher.log"
         with log_path.open("w", encoding="utf-8") as log:
+            gpu_memory_baseline = gpu_process_memory_by_pid()
             process = subprocess.Popen(
                 command,
                 cwd=ROOT,
@@ -565,7 +609,12 @@ def main() -> int:
                     text=True,
                 )
                 try:
-                    monitor_summary = monitor_process(process, monitor_path, limits)
+                    monitor_summary = monitor_process(
+                        process,
+                        monitor_path,
+                        limits,
+                        gpu_memory_baseline,
+                    )
                 finally:
                     try:
                         watcher.wait(timeout=90)

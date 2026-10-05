@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,9 +14,11 @@ from scripts.run_gpu_rounds import (
     active_utilization_limits,
     apply_round_overrides,
     archive_round,
+    attributed_process_gpu_memory,
     checkpoint_watcher_command,
     cli_args,
     configured_rounds,
+    gpu_process_memory_by_pid,
     resolve_adaptive_final,
     select_completed_round,
     utilization_throttle_reason,
@@ -97,6 +100,70 @@ def test_gpu_round_hard_utilization_guard_preempts_a_low_rolling_average():
         == "rolling_utilization"
     )
     assert utilization_throttle_reason(current=73.0, rolling=70.0, **common) is None
+
+
+def test_gpu_process_memory_parser_ignores_malformed_rows(monkeypatch: pytest.MonkeyPatch):
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout="101, 3130\ninvalid\n102, N/A\n103, 512.5\n",
+        stderr="",
+    )
+    monkeypatch.setattr("scripts.run_gpu_rounds.subprocess.run", lambda *args, **kwargs: completed)
+
+    assert gpu_process_memory_by_pid() == {101: 3130.0, 103: 512.5}
+
+
+def test_gpu_memory_prefers_exact_process_group_pids(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("scripts.run_gpu_rounds.process_group_pids", lambda group_id: {10, 11})
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.gpu_process_memory_by_pid",
+        lambda: {10: 100.0, 20: 4000.0},
+    )
+
+    sample = attributed_process_gpu_memory(10, {20: 3000.0})
+
+    assert sample == {
+        "memory_mib": 100.0,
+        "attribution": "process_group_pid",
+        "gpu_pids": [10],
+        "process_pids": [10, 11],
+    }
+
+
+def test_gpu_memory_uses_only_post_spawn_pids_when_namespaces_differ(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("scripts.run_gpu_rounds.process_group_pids", lambda group_id: {10, 11})
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.gpu_process_memory_by_pid",
+        lambda: {1001: 3130.0, 1002: 4678.0},
+    )
+
+    sample = attributed_process_gpu_memory(10, {1002: 4200.0})
+
+    assert sample == {
+        "memory_mib": 3130.0,
+        "attribution": "post_spawn_pid",
+        "gpu_pids": [1001],
+        "process_pids": [10, 11],
+    }
+
+
+def test_gpu_memory_without_pid_match_or_baseline_is_unattributed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("scripts.run_gpu_rounds.process_group_pids", lambda group_id: {10})
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.gpu_process_memory_by_pid",
+        lambda: {1001: 3130.0},
+    )
+
+    sample = attributed_process_gpu_memory(10)
+
+    assert sample["memory_mib"] == 0.0
+    assert sample["attribution"] == "unattributed"
+    assert sample["gpu_pids"] == []
 
 
 def test_gpu_round_cli_args_preserve_false_and_skip_none():
