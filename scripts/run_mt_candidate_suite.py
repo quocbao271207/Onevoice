@@ -136,6 +136,7 @@ def run_benchmark(
         name,
         "--output-dir",
         str(output_dir),
+        "--resume-scoring",
     ]
     log_path = output_dir / f"{name}.log"
     with log_path.open("w", encoding="utf-8") as log:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import scripts.run_baseline_benchmarks as benchmark
 from scripts.candidate_evidence import (
     archive_evidence,
     evidence_sidecars,
@@ -15,10 +17,14 @@ from scripts.candidate_evidence import (
 )
 from scripts.run_baseline_benchmarks import (
     attach_adapter,
+    load_verified_prediction_checkpoint,
     model_load_kwargs,
+    prediction_checkpoint_specification,
+    prediction_provenance_path,
     prepare_runtime,
     resolve_device,
     source_balanced_sample,
+    write_prediction_checkpoint,
     write_predictions_checkpoint,
 )
 from scripts.run_asr_candidate_suite import candidate_checks as asr_candidate_checks
@@ -72,6 +78,154 @@ def test_predictions_checkpoint_is_utf8_jsonl_and_replaces_stale_file(tmp_path: 
         '{"id": "thuốc", "hypothesis": "Không dùng 5 mg."}\n'
     )
     assert not path.with_suffix(".jsonl.tmp").exists()
+
+
+def checkpoint_args(tmp_path: Path, *, adapter: bool = True) -> SimpleNamespace:
+    manifest = tmp_path / "selection.jsonl"
+    manifest.write_text('{"id":"pair"}\n', encoding="utf-8")
+    adapter_path = None
+    if adapter:
+        adapter_path = tmp_path / "adapter"
+        adapter_path.mkdir()
+        (adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+        (adapter_path / "adapter_model.safetensors").write_bytes(b"weights")
+    return SimpleNamespace(
+        task="mt",
+        model="facebook/nllb-200-distilled-600M",
+        model_revision=benchmark.MODEL_REVISIONS["facebook/nllb-200-distilled-600M"],
+        adapter=adapter_path,
+        manifest=manifest,
+        samples=0,
+        seed=20260922,
+        batch_size=2,
+        num_beams=4,
+        device="cpu",
+        precision="fp32",
+        gpu_memory_fraction=0.35,
+        language="vi",
+        asr_prompt=None,
+        mt_model_family="nllb",
+        mt_direction="joint",
+    )
+
+
+def test_prediction_checkpoint_verifies_exact_inputs_and_payload(tmp_path: Path):
+    args = checkpoint_args(tmp_path)
+    path = tmp_path / "candidate_predictions.jsonl"
+    predictions = [{"id": "pair", "hypothesis": "Không dùng 5 mg."}]
+    specification = prediction_checkpoint_specification(args)
+
+    provenance = write_prediction_checkpoint(
+        path,
+        predictions,
+        specification,
+        {"num_beams": 4, "generation_seconds": 1.0},
+        {"resolved_device": "cpu"},
+    )
+    loaded = load_verified_prediction_checkpoint(path, specification)
+
+    assert loaded is not None
+    assert loaded[0] == predictions
+    assert loaded[1] == provenance
+    assert prediction_provenance_path(path).is_file()
+
+
+def test_prediction_checkpoint_fails_closed_on_tampering_and_spec_change(tmp_path: Path):
+    args = checkpoint_args(tmp_path)
+    path = tmp_path / "candidate_predictions.jsonl"
+    specification = prediction_checkpoint_specification(args)
+    write_prediction_checkpoint(
+        path,
+        [{"id": "pair", "hypothesis": "Dùng 5 mg."}],
+        specification,
+        {"num_beams": 4},
+        {"resolved_device": "cpu"},
+    )
+
+    path.write_text('{"id":"pair","hypothesis":"tampered"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        load_verified_prediction_checkpoint(path, specification)
+
+    write_prediction_checkpoint(
+        path,
+        [{"id": "pair", "hypothesis": "Dùng 5 mg."}],
+        specification,
+        {"num_beams": 4},
+        {"resolved_device": "cpu"},
+    )
+    args.seed += 1
+    with pytest.raises(ValueError, match="specification mismatch"):
+        load_verified_prediction_checkpoint(
+            path,
+            prediction_checkpoint_specification(args),
+        )
+
+    args.seed -= 1
+    assert args.adapter is not None
+    (args.adapter / "adapter_model.safetensors").write_bytes(b"changed-weights")
+    with pytest.raises(ValueError, match="specification mismatch"):
+        load_verified_prediction_checkpoint(
+            path,
+            prediction_checkpoint_specification(args),
+        )
+
+
+def test_prediction_checkpoint_rejects_incomplete_pair(tmp_path: Path):
+    args = checkpoint_args(tmp_path, adapter=False)
+    path = tmp_path / "orphan_predictions.jsonl"
+    write_predictions_checkpoint(path, [{"id": "pair"}])
+
+    with pytest.raises(ValueError, match="Incomplete prediction checkpoint"):
+        load_verified_prediction_checkpoint(
+            path,
+            prediction_checkpoint_specification(args),
+        )
+
+
+def test_resume_scoring_skips_model_loading_and_inference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    args = checkpoint_args(tmp_path, adapter=False)
+    output_dir = tmp_path / "reports"
+    prediction_path = output_dir / "resume_predictions.jsonl"
+    write_prediction_checkpoint(
+        prediction_path,
+        [{"id": "pair", "direction": "en_to_vi", "hypothesis": "Bản dịch"}],
+        prediction_checkpoint_specification(args),
+        {"num_beams": 4, "generation_seconds": 1.0, "samples_per_second": 1.0},
+        {"resolved_device": "cpu"},
+    )
+
+    def unexpected_inference(*_args, **_kwargs):
+        raise AssertionError("resume path must not load a model or rerun inference")
+
+    monkeypatch.setattr(benchmark, "run_mt", unexpected_inference)
+    monkeypatch.setattr(benchmark, "score_mt", lambda predictions: {"samples": len(predictions)})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_baseline_benchmarks.py",
+            "--task",
+            "mt",
+            "--manifest",
+            str(args.manifest),
+            "--samples",
+            "0",
+            "--name",
+            "resume",
+            "--output-dir",
+            str(output_dir),
+            "--resume-scoring",
+        ],
+    )
+
+    assert benchmark.main() == 0
+    report = json.loads((output_dir / "resume.json").read_text(encoding="utf-8"))
+    assert report["samples"] == 1
+    assert report["scoring_resumed"] is True
+    assert report["decoding"]["scoring_resumed_from_checkpoint"] is True
 
 
 def test_fullscale_mt_scoring_smoke_is_bound_to_locked_manifest():

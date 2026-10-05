@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -24,6 +25,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from scripts.candidate_evidence import sha256  # noqa: E402
 from scripts.evaluate_benchmarks import score_asr, score_mt  # noqa: E402
 from src.training.mt_model_adapter import (  # noqa: E402
     SUPPORTED_MT_FAMILIES,
@@ -45,6 +47,8 @@ MODEL_REVISIONS = {
     "openai/whisper-small": "973afd24965f72e36ca33b3055d56a652f456b4d",
     "vinai/PhoWhisper-base": "7ebdb9e88f5cc5271fb88f4d642c82ff9388650e",
 }
+
+PREDICTION_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -95,6 +99,151 @@ def write_predictions_checkpoint(path: Path, predictions: list[dict[str, Any]]) 
     temporary_path.replace(path)
 
 
+def _canonical_sha256(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, path)
+
+
+def prediction_provenance_path(prediction_path: Path) -> Path:
+    return prediction_path.with_suffix(prediction_path.suffix + ".provenance.json")
+
+
+def _adapter_identity(adapter: Path | None) -> dict[str, Any] | None:
+    if adapter is None:
+        return None
+    root = adapter.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Missing adapter directory: {root}")
+    files: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Adapter checkpoint cannot contain symlinks: {path}")
+        if path.is_file():
+            files.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+    if not files:
+        raise ValueError(f"Adapter checkpoint is empty: {root}")
+    return {
+        "path": str(root),
+        "file_count": len(files),
+        "bytes": sum(int(item["bytes"]) for item in files),
+        "manifest_sha256": _canonical_sha256(files),
+    }
+
+
+def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind resumable predictions to every input that can affect inference."""
+    manifest = args.manifest.resolve()
+    return {
+        "task": args.task,
+        "model": args.model,
+        "model_revision": args.model_revision,
+        "adapter": _adapter_identity(args.adapter),
+        "manifest": {
+            "path": str(manifest),
+            "bytes": manifest.stat().st_size,
+            "sha256": sha256(manifest),
+        },
+        "samples": args.samples,
+        "seed": args.seed,
+        "batch_size": args.batch_size,
+        "num_beams": args.num_beams,
+        "requested_device": args.device,
+        "precision": args.precision,
+        "gpu_memory_fraction": args.gpu_memory_fraction,
+        "language": args.language if args.task == "asr" else None,
+        "asr_prompt": args.asr_prompt if args.task == "asr" else None,
+        "mt_model_family": args.mt_model_family if args.task == "mt" else None,
+        "mt_direction": args.mt_direction if args.task == "mt" else None,
+    }
+
+
+def write_prediction_checkpoint(
+    prediction_path: Path,
+    predictions: list[dict[str, Any]],
+    specification: dict[str, Any],
+    decoding: dict[str, Any],
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist predictions plus immutable provenance before CPU scoring starts."""
+    write_predictions_checkpoint(prediction_path, predictions)
+    provenance = {
+        "schema_version": PREDICTION_CHECKPOINT_SCHEMA_VERSION,
+        "specification": specification,
+        "specification_sha256": _canonical_sha256(specification),
+        "predictions": {
+            "path": str(prediction_path.resolve()),
+            "bytes": prediction_path.stat().st_size,
+            "sha256": sha256(prediction_path),
+            "rows": len(predictions),
+        },
+        "decoding": decoding,
+        "runtime": runtime,
+    }
+    provenance_path = prediction_provenance_path(prediction_path)
+    _atomic_json(provenance_path, provenance)
+    verified = load_verified_prediction_checkpoint(prediction_path, specification)
+    if verified is None:  # pragma: no cover - the files were just written above
+        raise RuntimeError(f"Prediction checkpoint disappeared: {prediction_path}")
+    return provenance
+
+
+def load_verified_prediction_checkpoint(
+    prediction_path: Path,
+    expected_specification: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Return an exact checkpoint or fail closed on incomplete/tampered evidence."""
+    provenance_path = prediction_provenance_path(prediction_path)
+    prediction_exists = prediction_path.is_file()
+    provenance_exists = provenance_path.is_file()
+    if not prediction_exists and not provenance_exists:
+        return None
+    if not prediction_exists or not provenance_exists:
+        raise ValueError(f"Incomplete prediction checkpoint: {prediction_path}")
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    expected_sha256 = _canonical_sha256(expected_specification)
+    if (
+        provenance.get("schema_version") != PREDICTION_CHECKPOINT_SCHEMA_VERSION
+        or provenance.get("specification") != expected_specification
+        or provenance.get("specification_sha256") != expected_sha256
+    ):
+        raise ValueError(f"Prediction checkpoint specification mismatch: {prediction_path}")
+    prediction_record = provenance.get("predictions")
+    if not isinstance(prediction_record, dict):
+        raise ValueError(f"Invalid prediction checkpoint provenance: {provenance_path}")
+    if (
+        prediction_record.get("path") != str(prediction_path.resolve())
+        or int(prediction_record.get("bytes", -1)) != prediction_path.stat().st_size
+        or prediction_record.get("sha256") != sha256(prediction_path)
+    ):
+        raise ValueError(f"Prediction checkpoint checksum mismatch: {prediction_path}")
+    predictions = read_jsonl(prediction_path)
+    if (
+        any(not isinstance(row, dict) for row in predictions)
+        or int(prediction_record.get("rows", -1)) != len(predictions)
+        or not isinstance(provenance.get("decoding"), dict)
+        or not isinstance(provenance.get("runtime"), dict)
+    ):
+        raise ValueError(f"Prediction checkpoint structure mismatch: {prediction_path}")
+    return predictions, provenance
+
+
 def resolve_device(requested: str) -> str:
     """Resolve ``auto`` lazily so importing this module stays CPU-test friendly."""
     if requested != "auto":
@@ -139,6 +288,7 @@ def prepare_runtime(args: argparse.Namespace) -> str:
 def run_asr(
     args: argparse.Namespace,
     prediction_path: Path | None = None,
+    checkpoint_specification: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
@@ -217,22 +367,30 @@ def run_asr(
                 )
             print(f"[ASR] {len(predictions)}/{len(rows)}", flush=True)
     generation_seconds = time.perf_counter() - generation_started
-    if prediction_path is not None:
-        write_predictions_checkpoint(prediction_path, predictions)
-        print(f"[artifact] wrote predictions checkpoint: {prediction_path}", flush=True)
-    report = score_asr(predictions)
-    report["decoding"] = {
+    decoding = {
         "num_beams": args.num_beams,
         "prompt": args.asr_prompt,
         "generation_seconds": round(generation_seconds, 3),
         "samples_per_second": round(len(predictions) / generation_seconds, 6),
     }
+    if prediction_path is not None:
+        write_prediction_checkpoint(
+            prediction_path,
+            predictions,
+            checkpoint_specification or prediction_checkpoint_specification(args),
+            decoding,
+            {"resolved_device": device},
+        )
+        print(f"[artifact] wrote predictions checkpoint: {prediction_path}", flush=True)
+    report = score_asr(predictions)
+    report["decoding"] = decoding
     return predictions, report
 
 
 def run_mt(
     args: argparse.Namespace,
     prediction_path: Path | None = None,
+    checkpoint_specification: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -298,15 +456,22 @@ def run_mt(
                     flush=True,
                 )
     generation_seconds = time.perf_counter() - generation_started
-    if prediction_path is not None:
-        write_predictions_checkpoint(prediction_path, predictions)
-        print(f"[artifact] wrote predictions checkpoint: {prediction_path}", flush=True)
-    report = score_mt(predictions)
-    report["decoding"] = {
+    decoding = {
         "num_beams": args.num_beams,
         "generation_seconds": round(generation_seconds, 3),
         "samples_per_second": round(len(predictions) / generation_seconds, 6),
     }
+    if prediction_path is not None:
+        write_prediction_checkpoint(
+            prediction_path,
+            predictions,
+            checkpoint_specification or prediction_checkpoint_specification(args),
+            decoding,
+            {"resolved_device": device},
+        )
+        print(f"[artifact] wrote predictions checkpoint: {prediction_path}", flush=True)
+    report = score_mt(predictions)
+    report["decoding"] = decoding
     return predictions, report
 
 
@@ -335,6 +500,11 @@ def main() -> int:
     parser.add_argument("--num-beams", type=int, help="Beam width; defaults to 1 for ASR and 4 for MT.")
     parser.add_argument("--asr-prompt", help="Optional Whisper prompt for domain vocabulary experiments.")
     parser.add_argument("--seed", type=int, default=20260922)
+    parser.add_argument(
+        "--resume-scoring",
+        action="store_true",
+        help="Reuse an exact checksum-verified prediction checkpoint and rerun CPU scoring only.",
+    )
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data" / "reports" / "baselines")
     args = parser.parse_args()
     if args.num_beams is None:
@@ -366,11 +536,39 @@ def main() -> int:
 
     stem = args.name or (f"asr_{args.language}_base" if args.task == "asr" else "mt_base")
     prediction_path = args.output_dir / f"{stem}_predictions.jsonl"
-    predictions, report = (
-        run_asr(args, prediction_path=prediction_path)
-        if args.task == "asr"
-        else run_mt(args, prediction_path=prediction_path)
+    checkpoint_specification = prediction_checkpoint_specification(args)
+    checkpoint = (
+        load_verified_prediction_checkpoint(prediction_path, checkpoint_specification)
+        if args.resume_scoring
+        else None
     )
+    if checkpoint is None:
+        predictions, report = (
+            run_asr(
+                args,
+                prediction_path=prediction_path,
+                checkpoint_specification=checkpoint_specification,
+            )
+            if args.task == "asr"
+            else run_mt(
+                args,
+                prediction_path=prediction_path,
+                checkpoint_specification=checkpoint_specification,
+            )
+        )
+        report_device = resolve_device(args.device)
+        scoring_resumed = False
+    else:
+        predictions, provenance = checkpoint
+        report = score_asr(predictions) if args.task == "asr" else score_mt(predictions)
+        report["decoding"] = dict(provenance["decoding"])
+        report["decoding"]["scoring_resumed_from_checkpoint"] = True
+        report_device = str(provenance["runtime"]["resolved_device"])
+        scoring_resumed = True
+        print(
+            f"[resume] verified predictions; skipped model loading and inference: {prediction_path}",
+            flush=True,
+        )
     report.update(
         {
             "model": args.model,
@@ -378,12 +576,14 @@ def main() -> int:
             "mt_model_family": args.mt_model_family if args.task == "mt" else None,
             "mt_direction": args.mt_direction if args.task == "mt" else None,
             "adapter": str(args.adapter) if args.adapter else None,
-            "device": resolve_device(args.device),
+            "device": report_device,
             "precision": args.precision,
-            "gpu_memory_fraction": args.gpu_memory_fraction if resolve_device(args.device) == "cuda" else None,
+            "gpu_memory_fraction": args.gpu_memory_fraction if report_device == "cuda" else None,
             "manifest": str(args.manifest),
             "seed": args.seed,
             "predictions": str(prediction_path),
+            "prediction_provenance": str(prediction_provenance_path(prediction_path)),
+            "scoring_resumed": scoring_resumed,
         }
     )
     report_path = args.output_dir / f"{stem}.json"

@@ -529,6 +529,7 @@ def evaluate(
             stem,
             "--output-dir",
             str(output_dir),
+            "--resume-scoring",
         ]
         if args.task == "mt":
             command += [

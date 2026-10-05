@@ -133,6 +133,27 @@ def command_digest(command: list[str]) -> str:
     return hashlib.sha256(json.dumps(command, separators=(",", ":")).encode()).hexdigest()
 
 
+def resume_scoring_command_compatible(
+    previous_command: Any,
+    current_command: list[str],
+) -> bool:
+    """Permit the recovery-only flag without invalidating completed GPU work."""
+    if not isinstance(previous_command, list) or not all(
+        isinstance(item, str) for item in previous_command
+    ):
+        return False
+    if not any(Path(item).name == "run_baseline_benchmarks.py" for item in current_command):
+        return False
+    previous_flags = previous_command.count("--resume-scoring")
+    current_flags = current_command.count("--resume-scoring")
+    if {previous_flags, current_flags} != {0, 1}:
+        return False
+    return (
+        [item for item in previous_command if item != "--resume-scoring"]
+        == [item for item in current_command if item != "--resume-scoring"]
+    )
+
+
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -609,7 +630,10 @@ def run_stage(
     digest = command_digest(command)
     previous = state.setdefault("stages", {}).get(name)
     if previous and previous.get("status") == "complete":
-        if previous.get("command_sha256") != digest:
+        if (
+            previous.get("command_sha256") != digest
+            and not resume_scoring_command_compatible(previous.get("command"), command)
+        ):
             raise ValueError(f"Cannot resume {name}: command changed")
         if not all(path.exists() for path in expected_outputs):
             raise FileNotFoundError(f"Cannot resume {name}: expected output is missing")
@@ -688,6 +712,7 @@ def benchmark_command(
         stem,
         "--output-dir",
         str(output_dir),
+        "--resume-scoring",
     ]
     if adapter:
         command += ["--adapter", str(adapter)]

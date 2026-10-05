@@ -427,6 +427,54 @@ def test_resume_skips_identical_completed_stage_and_rejects_changed_command(tmp_
         run_stage("stage", command + ["changed"], state_path, state, log, [output])
 
 
+def test_resume_scoring_flag_preserves_completed_benchmark_stage(tmp_path: Path):
+    state_path = tmp_path / "state.json"
+    output = tmp_path / "output.json"
+    output.write_text("ok", encoding="utf-8")
+    log = tmp_path / "stage.log"
+    old_command = [
+        sys.executable,
+        str(ROOT / "scripts/run_baseline_benchmarks.py"),
+        "--task",
+        "mt",
+    ]
+    state = {
+        "stages": {
+            "stage": {
+                "status": "complete",
+                "command": old_command,
+                "command_sha256": bakeoff.command_digest(old_command),
+            }
+        }
+    }
+
+    run_stage(
+        "stage",
+        old_command + ["--resume-scoring"],
+        state_path,
+        state,
+        log,
+        [output],
+    )
+
+    assert not log.exists()
+
+
+def test_bakeoff_benchmarks_enable_verified_scoring_resume(tmp_path: Path):
+    command = bakeoff.benchmark_command(
+        sys.executable,
+        "mt",
+        candidate("mt_m2m100_418m"),
+        tmp_path / "selection.jsonl",
+        tmp_path / "reports",
+        "pilot",
+        None,
+        "en_to_vi",
+    )
+
+    assert command.count("--resume-scoring") == 1
+
+
 def test_m2m100_runtime_round_builds_a_dry_run_command(tmp_path: Path):
     data = config()
     item = candidate("mt_m2m100_418m")
