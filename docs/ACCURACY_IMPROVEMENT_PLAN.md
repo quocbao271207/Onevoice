@@ -57,3 +57,5 @@ Sau Candidate A, `scripts/run_model_bakeoff.py` đóng băng adapter/checksum r�
 ## Backup và phục hồi
 
 `scripts/create_verified_backup.py` tạo ba tar độc lập cho data (không lặp reports), models và reports, sinh `SHA256SUMS.txt`, rồi đọc lại toàn bộ archive để xác minh checksum, số file, tổng byte và cấu trúc đường dẫn an toàn. Archive rỗng, tên trùng, path traversal hoặc checksum manifest lệch đều fail-closed. Backup nằm trong `.backups/`, không push lên Git vì chứa dữ liệu/model lớn và có ràng buộc license.
+
+Bundle từ runner legacy có thể chỉ gồm archive và sidecar SHA-256. Không tự coi bundle đó là đủ điều kiện resume. `scripts/derive_legacy_evidence_manifest.py` chỉ tạo bản kê forensic `*.derived-manifest.json` sau khi xác minh sidecar, từng member, path traversal, symlink/non-file và duplicate; bản kê luôn ghi `resume_eligible=false` và không bao giờ thay thế canonical `.manifest.json`.

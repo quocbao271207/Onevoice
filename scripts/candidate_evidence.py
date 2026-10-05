@@ -165,6 +165,125 @@ def verify_evidence_archive(archive_path: Path) -> dict[str, Any]:
     return manifest
 
 
+def derive_legacy_evidence_manifest(
+    archive_path: Path,
+    output_path: Path | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Inventory a checksum-verified legacy archive without making it resume-eligible.
+
+    Older runners emitted an archive and SHA-256 sidecar but no content manifest.
+    This forensic record preserves what was actually downloaded while remaining
+    deliberately distinct from the canonical ``.manifest.json`` contract.
+    """
+    if archive_path.is_symlink():
+        raise ValueError(f"Legacy evidence archive must not be a symlink: {archive_path}")
+    archive_path = archive_path.resolve()
+    checksum_path, canonical_manifest_path = evidence_sidecars(archive_path)
+    if canonical_manifest_path.exists():
+        raise ValueError(
+            f"Canonical evidence manifest already exists; verify it instead: "
+            f"{canonical_manifest_path}"
+        )
+    if not archive_path.is_file() or not checksum_path.is_file():
+        raise FileNotFoundError(f"Incomplete legacy evidence bundle for {archive_path}")
+    if checksum_path.is_symlink():
+        raise ValueError(f"Evidence checksum sidecar must not be a symlink: {checksum_path}")
+    fields = checksum_path.read_text(encoding="utf-8").split()
+    if len(fields) != 2 or fields[1] != archive_path.name:
+        raise ValueError(f"Invalid evidence checksum sidecar: {checksum_path}")
+    digest = sha256(archive_path)
+    if fields[0].lower() != digest:
+        raise ValueError(f"Evidence archive checksum mismatch: {archive_path}")
+
+    records: list[dict[str, Any]] = []
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        if len(names) != len(set(names)):
+            raise ValueError("Evidence archive contains duplicate member paths")
+        if any(not member.isfile() or not _safe_member_name(member.name) for member in members):
+            raise ValueError("Evidence archive contains an unsafe or non-file member")
+        for member in members:
+            handle = archive.extractfile(member)
+            if handle is None:
+                raise ValueError(f"Cannot read evidence archive member: {member.name}")
+            member_digest = hashlib.sha256()
+            size = 0
+            while chunk := handle.read(8 * 1024 * 1024):
+                size += len(chunk)
+                member_digest.update(chunk)
+            records.append(
+                {
+                    "path": member.name,
+                    "bytes": size,
+                    "sha256": member_digest.hexdigest(),
+                }
+            )
+    records.sort(key=lambda record: str(record["path"]))
+    _verify_payload(archive_path, records)
+
+    requested_output = (
+        output_path
+        if output_path is not None
+        else archive_path.with_name(f"{archive_path.name}.derived-manifest.json")
+    )
+    if requested_output.is_symlink():
+        raise ValueError(f"Derived manifest output must not be a symlink: {requested_output}")
+    derived_path = requested_output.resolve()
+    reserved_paths = {
+        archive_path,
+        checksum_path.resolve(),
+        canonical_manifest_path.resolve(),
+    }
+    if derived_path in reserved_paths or not derived_path.name.endswith(
+        ".derived-manifest.json"
+    ):
+        raise ValueError(
+            "Derived manifest output must use a distinct *.derived-manifest.json path"
+        )
+    payload = {
+        "schema_version": 1,
+        "evidence_status": "forensic_derived_from_legacy_archive",
+        "resume_eligible": False,
+        "original_manifest_present": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "archive": archive_path.name,
+        "archive_bytes": archive_path.stat().st_size,
+        "archive_sha256": digest,
+        "checksum_sidecar": {
+            "path": checksum_path.name,
+            "bytes": checksum_path.stat().st_size,
+            "sha256": sha256(checksum_path),
+        },
+        "file_count": len(records),
+        "content_bytes": sum(int(record["bytes"]) for record in records),
+        "files": records,
+    }
+    if derived_path.exists():
+        if not derived_path.is_file():
+            raise ValueError(f"Derived manifest output is not a regular file: {derived_path}")
+        existing = json.loads(derived_path.read_text(encoding="utf-8"))
+        comparable_keys = {
+            "schema_version",
+            "evidence_status",
+            "resume_eligible",
+            "original_manifest_present",
+            "archive",
+            "archive_bytes",
+            "archive_sha256",
+            "checksum_sidecar",
+            "file_count",
+            "content_bytes",
+            "files",
+        }
+        if any(existing.get(key) != payload.get(key) for key in comparable_keys):
+            raise ValueError(f"Existing derived manifest does not match archive: {derived_path}")
+        return derived_path, existing
+    derived_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(derived_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return derived_path, payload
+
+
 def _atomic_write(path: Path, content: str) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(content, encoding="utf-8")

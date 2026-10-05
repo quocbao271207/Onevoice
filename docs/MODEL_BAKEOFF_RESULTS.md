@@ -6,12 +6,12 @@ Ngày mở vòng: 05/10/2026.
 
 Chưa model bổ sung nào được gọi là `benchmarked`. Candidate A vẫn đang được tạo bởi pipeline hiện hữu và không bị restart hay thay đổi process đang chạy:
 
-- MT Candidate A: `facebook/nllb-200-distilled-600M`, full-data LoRA đã hoàn tất 33.521 bước; candidate suite đang chạy.
-- ASR Candidate A: `vinai/PhoWhisper-small`, chờ candidate suite MT hoàn tất trong state machine hiện hữu.
+- MT Candidate A: `facebook/nllb-200-distilled-600M`, full-data LoRA đã hoàn tất 33.521 bước; candidate suite kết thúc ngày 06/10/2026 với `status=fail`, `error=null`. Hard gate phát hiện lỗi liều 11,11%, số 8,33%, phủ định 5,56%, thuật ngữ 27,78% và code-switch 50%; model không được promotion.
+- ASR Candidate A: `vinai/PhoWhisper-small`, state machine hiện hữu đã tự chuyển sang `asr_training` và đang chạy pilot đầu tiên; không có controller hoặc GPU child trùng được khởi động.
 - Các challenger đều là `planned`; `data/reports/model_bakeoff/comparison.json` là nguồn trạng thái máy đọc được.
 - Candidate A đạt gate cũ vẫn chỉ được đóng băng làm chuẩn tham chiếu. `promotion_allowed` luôn là `false` cho đến khi hoàn tất bake-off, blind v2 và deployment gate.
 
-Tại lần chụp trạng thái gần nhất ngày 05/10/2026, MT đã hoàn tất 33.521/33.521 bước. Toàn bộ 68 checkpoint archive, archive cuối và summary đã có checksum xác minh trên local; `program_state.json` đã chuyển sang `mt_candidate`. Đây chỉ là hoàn tất huấn luyện MT Candidate A, không phải hoàn tất chương trình: ASR Candidate A, challenger training, blind v2 và deployment benchmark còn ở phía sau. Tiến độ end-to-end ước khoảng 35%; đây là ước lượng theo stage, không phải accuracy.
+Artifact MT legacy đã được tải về `test/program-20261005-014500`: archive 3.938.906 byte có SHA-256 `d908ddc739acb9067514b0139a291bb67c91c465b7f096418064ebc5bf83cf81`, khớp sidecar gốc. Runner cũ không phát hành canonical `.manifest.json` và archive thiếu provenance cho full predictions, nên artifact này không đủ điều kiện resume/promotion theo runner mới. Bản kê `mt-candidate.tar.gz.derived-manifest.json` chỉ xác minh forensic 12 member/22.861.924 byte và luôn ghi `resume_eligible=false`; `download_manifest.json` khóa lại toàn bộ file đã tải. Đây vẫn chỉ là một phần chương trình: ASR Candidate A, challenger training, blind v2 và deployment benchmark còn ở phía sau.
 
 ## Candidate và license gate
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ import torch
 import scripts.run_baseline_benchmarks as benchmark
 from scripts.candidate_evidence import (
     archive_evidence,
+    derive_legacy_evidence_manifest,
     evidence_sidecars,
     sha256,
     verify_evidence_archive,
@@ -329,3 +332,61 @@ def test_candidate_evidence_verification_rejects_duplicate_manifest_paths(tmp_pa
 
     with pytest.raises(ValueError, match="duplicate paths"):
         verify_evidence_archive(archive)
+
+
+def test_legacy_evidence_manifest_is_forensic_and_not_resume_eligible(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"fail"}', encoding="utf-8")
+    archive, digest = archive_evidence(output)
+    _, canonical_manifest = evidence_sidecars(archive)
+    canonical_manifest.unlink()
+
+    derived_path, derived = derive_legacy_evidence_manifest(archive)
+
+    assert derived_path.name == f"{archive.name}.derived-manifest.json"
+    assert derived["evidence_status"] == "forensic_derived_from_legacy_archive"
+    assert derived["resume_eligible"] is False
+    assert derived["original_manifest_present"] is False
+    assert derived["archive_sha256"] == digest
+    assert derived["file_count"] == 1
+    assert derived["files"][0]["path"] == "candidate/candidate_gate.json"
+    with pytest.raises(FileNotFoundError, match="Incomplete evidence bundle"):
+        verify_evidence_archive(archive)
+
+
+def test_legacy_evidence_manifest_refuses_canonical_bundle(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+
+    with pytest.raises(ValueError, match="Canonical evidence manifest already exists"):
+        derive_legacy_evidence_manifest(archive)
+
+
+def test_legacy_evidence_manifest_refuses_reserved_output_path(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"fail"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+    checksum, canonical_manifest = evidence_sidecars(archive)
+    canonical_manifest.unlink()
+
+    for reserved in (archive, checksum, canonical_manifest):
+        with pytest.raises(ValueError, match="distinct .*derived-manifest.json"):
+            derive_legacy_evidence_manifest(archive, reserved)
+
+
+def test_legacy_evidence_manifest_rejects_unsafe_archive_member(tmp_path: Path):
+    archive = tmp_path / "legacy.tar.gz"
+    payload = b"unsafe"
+    with tarfile.open(archive, "w:gz") as bundle:
+        member = tarfile.TarInfo("../escape.txt")
+        member.size = len(payload)
+        bundle.addfile(member, io.BytesIO(payload))
+    checksum, _ = evidence_sidecars(archive)
+    checksum.write_text(f"{sha256(archive)}  {archive.name}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsafe or non-file"):
+        derive_legacy_evidence_manifest(archive)
