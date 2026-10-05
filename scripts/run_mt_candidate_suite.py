@@ -20,7 +20,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_evidence import archive_evidence, read_json, sha256  # noqa: E402
+from scripts.candidate_evidence import (  # noqa: E402
+    archive_evidence,
+    evidence_sidecars,
+    read_json,
+    sha256,
+)
 from scripts.run_gpu_rounds import monitor_process  # noqa: E402
 
 
@@ -261,9 +266,17 @@ def main() -> int:
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     archive_path, archive_sha256 = archive_evidence(output_dir)
+    archive_checksum, archive_manifest = evidence_sidecars(archive_path)
     print(
         json.dumps(
-            {**summary, "archive": str(archive_path), "archive_sha256": archive_sha256},
+            {
+                **summary,
+                "archive": str(archive_path),
+                "archive_bytes": archive_path.stat().st_size,
+                "archive_sha256": archive_sha256,
+                "archive_checksum": str(archive_checksum),
+                "archive_manifest": str(archive_manifest),
+            },
             ensure_ascii=False,
             indent=2,
         )

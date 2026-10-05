@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from scripts.candidate_evidence import (
+    archive_evidence,
+    evidence_sidecars,
+    verify_evidence_archive,
+)
 from scripts.run_baseline_benchmarks import (
     attach_adapter,
     model_load_kwargs,
@@ -99,3 +105,54 @@ def test_asr_candidate_gate_requires_code_switch_and_every_clinical_slice():
     )
     assert any(check["name"] == "clinical_dose" and not check["pass"] for check in checks)
     assert all(check["pass"] for check in checks if check["name"] != "clinical_dose")
+
+
+def test_candidate_evidence_bundle_has_verified_content_manifest(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    nested = output / "predictions"
+    nested.mkdir()
+    (nested / "clinical.jsonl").write_text('{"id":"thuốc"}\n', encoding="utf-8")
+
+    archive, digest = archive_evidence(output)
+    checksum, manifest_path = evidence_sidecars(archive)
+    manifest = verify_evidence_archive(archive)
+
+    assert checksum.read_text(encoding="utf-8") == f"{digest}  {archive.name}\n"
+    assert manifest_path.is_file()
+    assert manifest["archive_bytes"] == archive.stat().st_size
+    assert manifest["archive_sha256"] == digest
+    assert manifest["file_count"] == 2
+    assert manifest["content_bytes"] == sum(item["bytes"] for item in manifest["files"])
+    assert {item["path"] for item in manifest["files"]} == {
+        "candidate/candidate_gate.json",
+        "candidate/predictions/clinical.jsonl",
+    }
+
+
+def test_candidate_evidence_verification_rejects_tampered_archive(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+    archive.write_bytes(archive.read_bytes() + b"tampered")
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        verify_evidence_archive(archive)
+
+
+def test_candidate_evidence_verification_rejects_duplicate_manifest_paths(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+    _, manifest_path = evidence_sidecars(archive)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].append(dict(manifest["files"][0]))
+    manifest["file_count"] = 2
+    manifest["content_bytes"] *= 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate paths"):
+        verify_evidence_archive(archive)

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tarfile
+from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 
@@ -21,15 +24,154 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def archive_evidence(output_dir: Path) -> tuple[Path, str]:
-    """Archive a completed evidence directory and write a SHA-256 sidecar."""
-    archive_path = output_dir.with_suffix(".tar.gz")
-    with tarfile.open(archive_path, "w:gz") as tar:
-        for path in sorted(output_dir.rglob("*")):
-            if path.is_file():
-                tar.add(path, arcname=path.relative_to(output_dir.parent), recursive=False)
+def evidence_sidecars(archive_path: Path) -> tuple[Path, Path]:
+    """Return the checksum and content-manifest paths for an evidence archive."""
+    checksum_path = archive_path.with_suffix(archive_path.suffix + ".sha256")
+    manifest_path = archive_path.with_suffix(archive_path.suffix + ".manifest.json")
+    return checksum_path, manifest_path
+
+
+def _safe_member_name(name: str) -> bool:
+    path = PurePosixPath(name)
+    return bool(name) and not path.is_absolute() and ".." not in path.parts and "\\" not in name
+
+
+def _archive_files(output_dir: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for path in sorted(output_dir.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Evidence bundle cannot contain symlinks: {path}")
+        if not path.is_file():
+            continue
+        archive_name = (Path(output_dir.name) / path.relative_to(output_dir)).as_posix()
+        if not _safe_member_name(archive_name):
+            raise ValueError(f"Unsafe evidence archive member: {archive_name!r}")
+        records.append(
+            {
+                "path": archive_name,
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+                "source": path,
+            }
+        )
+    if not records:
+        raise ValueError(f"Evidence directory is empty: {output_dir}")
+    return records
+
+
+def _verify_payload(archive_path: Path, expected_files: list[dict[str, Any]]) -> None:
+    paths = [str(item.get("path", "")) for item in expected_files]
+    if len(paths) != len(set(paths)):
+        raise ValueError("Evidence content manifest contains duplicate paths")
+    for item, path in zip(expected_files, paths):
+        digest = item.get("sha256")
+        try:
+            size = int(item.get("bytes", -1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid evidence content size: {path}") from exc
+        if (
+            not _safe_member_name(path)
+            or size < 0
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest.lower())
+        ):
+            raise ValueError(f"Invalid evidence content record: {path!r}")
+    expected = {str(item["path"]): item for item in expected_files}
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name for member in members]
+        if len(names) != len(set(names)):
+            raise ValueError("Evidence archive contains duplicate member paths")
+        if any(not member.isfile() or not _safe_member_name(member.name) for member in members):
+            raise ValueError("Evidence archive contains an unsafe or non-file member")
+        if set(names) != set(expected):
+            raise ValueError("Evidence archive members do not match the content manifest")
+        for member in members:
+            handle = archive.extractfile(member)
+            if handle is None:
+                raise ValueError(f"Cannot read evidence archive member: {member.name}")
+            member_digest = hashlib.sha256()
+            size = 0
+            while chunk := handle.read(8 * 1024 * 1024):
+                size += len(chunk)
+                member_digest.update(chunk)
+            record = expected[member.name]
+            if size != int(record["bytes"]) or member_digest.hexdigest() != record["sha256"]:
+                raise ValueError(f"Evidence archive member verification failed: {member.name}")
+
+
+def verify_evidence_archive(archive_path: Path) -> dict[str, Any]:
+    """Verify archive bytes, checksum sidecar, and every manifest member."""
+    checksum_path, manifest_path = evidence_sidecars(archive_path)
+    if not archive_path.is_file() or not checksum_path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"Incomplete evidence bundle for {archive_path}")
+    fields = checksum_path.read_text(encoding="utf-8").split()
+    if len(fields) != 2 or fields[1] != archive_path.name:
+        raise ValueError(f"Invalid evidence checksum sidecar: {checksum_path}")
     digest = sha256(archive_path)
-    archive_path.with_suffix(archive_path.suffix + ".sha256").write_text(
-        f"{digest}  {archive_path.name}\n", encoding="utf-8"
-    )
+    if fields[0].lower() != digest:
+        raise ValueError(f"Evidence archive checksum mismatch: {archive_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("archive") != archive_path.name
+        or int(manifest.get("archive_bytes", -1)) != archive_path.stat().st_size
+        or manifest.get("archive_sha256") != digest
+    ):
+        raise ValueError(f"Evidence archive metadata mismatch: {manifest_path}")
+    files = manifest.get("files")
+    if not isinstance(files, list) or int(manifest.get("file_count", -1)) != len(files):
+        raise ValueError(f"Invalid evidence content manifest: {manifest_path}")
+    if int(manifest.get("content_bytes", -1)) != sum(int(item["bytes"]) for item in files):
+        raise ValueError(f"Evidence content byte count mismatch: {manifest_path}")
+    _verify_payload(archive_path, files)
+    return manifest
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def archive_evidence(output_dir: Path) -> tuple[Path, str]:
+    """Create and fully verify an immutable archive/checksum/manifest bundle."""
+    if not output_dir.is_dir():
+        raise FileNotFoundError(output_dir)
+    archive_path = output_dir.with_suffix(".tar.gz")
+    checksum_path, manifest_path = evidence_sidecars(archive_path)
+    records = _archive_files(output_dir)
+    temporary = archive_path.with_name(f".{archive_path.name}.part")
+    temporary.unlink(missing_ok=True)
+    try:
+        with tarfile.open(temporary, "w:gz") as archive:
+            for record in records:
+                archive.add(
+                    record["source"],
+                    arcname=record["path"],
+                    recursive=False,
+                )
+        public_records = [
+            {key: record[key] for key in ("path", "bytes", "sha256")} for record in records
+        ]
+        _verify_payload(temporary, public_records)
+        os.replace(temporary, archive_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    digest = sha256(archive_path)
+    manifest = {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "archive": archive_path.name,
+        "archive_bytes": archive_path.stat().st_size,
+        "archive_sha256": digest,
+        "file_count": len(public_records),
+        "content_bytes": sum(int(record["bytes"]) for record in public_records),
+        "files": public_records,
+    }
+    _atomic_write(checksum_path, f"{digest}  {archive_path.name}\n")
+    _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    verify_evidence_archive(archive_path)
     return archive_path, digest
