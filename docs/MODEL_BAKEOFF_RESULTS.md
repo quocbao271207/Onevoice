@@ -80,7 +80,7 @@ python scripts/run_blind_candidate_suite.py --action lock \
   --asr-manifest /secure/blind_v2_asr.jsonl
 ```
 
-Runner có resume theo command digest, checkpoint watcher, archive/checksum từng round và từ chối chạy hai command khác nhau dưới cùng stage. Trước khi bất kỳ adapter bake-off nào được benchmark, runner đọc lại tar, sidecar và content manifest của mọi round rồi đối chiếu toàn bộ cây adapter sống theo path/bytes/SHA-256; chỉ có `adapter_config.json` là không đủ. Khi blind v2 chưa sẵn sàng, nó dừng ở trạng thái chờ thay vì tự mở test cũ.
+Runner có resume theo command digest, checkpoint watcher, archive/checksum từng round và từ chối chạy hai command khác nhau dưới cùng stage. Mỗi file đầu ra của stage còn được khóa path/bytes/SHA-256 trong state; file bị thay thế sau khi hoàn tất sẽ làm resume fail-closed. Benchmark do waiter cũ hoàn tất nhưng chưa có khóa output sẽ tự chạy lại đúng đường CPU scoring từ prediction checkpoint đã xác minh bằng `--resume-scoring`, không nạp model hoặc suy luận GPU lần nữa. Trước khi bất kỳ adapter bake-off nào được benchmark, runner đọc lại tar, sidecar và content manifest của mọi round rồi đối chiếu toàn bộ cây adapter sống theo path/bytes/SHA-256; chỉ có `adapter_config.json` là không đủ. Khi blind v2 chưa sẵn sàng, nó dừng ở trạng thái chờ thay vì tự mở test cũ.
 
 ## Deployment reference
 

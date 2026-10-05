@@ -134,6 +134,32 @@ def command_digest(command: list[str]) -> str:
     return hashlib.sha256(json.dumps(command, separators=(",", ":")).encode()).hexdigest()
 
 
+def output_evidence(paths: list[Path]) -> list[dict[str, Any]]:
+    """Fingerprint file outputs while retaining directory existence checks.
+
+    Training directories are verified by ``completed_adapter`` against their
+    signed round archives. Small stage products such as benchmark reports,
+    blind gates and deployment drafts are hashed here so a completed stage
+    cannot silently trust a replaced file on resume.
+    """
+    evidence = []
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError(path)
+        if path.is_symlink():
+            raise ValueError(f"Stage output must not be a symlink: {path}")
+        if not path.is_file() and not path.is_dir():
+            raise ValueError(f"Stage output must be a regular file or directory: {path}")
+        record: dict[str, Any] = {
+            "path": str(path.resolve()),
+            "kind": "directory" if path.is_dir() else "file",
+        }
+        if path.is_file():
+            record.update({"bytes": path.stat().st_size, "sha256": sha256(path)})
+        evidence.append(record)
+    return evidence
+
+
 def resume_scoring_command_compatible(
     previous_command: Any,
     current_command: list[str],
@@ -710,14 +736,21 @@ def run_stage(
     digest = command_digest(command)
     previous = state.setdefault("stages", {}).get(name)
     if previous and previous.get("status") == "complete":
-        if (
+        recovery_only_upgrade = (
             previous.get("command_sha256") != digest
-            and not resume_scoring_command_compatible(previous.get("command"), command)
-        ):
+            and resume_scoring_command_compatible(previous.get("command"), command)
+        )
+        if previous.get("command_sha256") != digest and not recovery_only_upgrade:
             raise ValueError(f"Cannot resume {name}: command changed")
-        if not all(path.exists() for path in expected_outputs):
-            raise FileNotFoundError(f"Cannot resume {name}: expected output is missing")
-        return
+        current_evidence = output_evidence(expected_outputs)
+        recorded_evidence = previous.get("output_evidence")
+        if recorded_evidence is not None and recorded_evidence != current_evidence:
+            raise ValueError(f"Cannot resume {name}: output evidence changed")
+        if not recovery_only_upgrade:
+            return
+        # A legacy benchmark did not bind its report to verified predictions.
+        # Re-run only the CPU scoring path; --resume-scoring verifies the exact
+        # prediction checkpoint and skips model loading and inference.
     state["stage"] = name
     state["stages"][name] = {
         "status": "running",
@@ -751,6 +784,12 @@ def run_stage(
         record["status"] = "error"
         atomic_json(state_path, state)
         raise RuntimeError(f"Stage {name} failed; see {log_path}")
+    try:
+        record["output_evidence"] = output_evidence(expected_outputs)
+    except (FileNotFoundError, ValueError):
+        record["status"] = "error"
+        atomic_json(state_path, state)
+        raise
     record["status"] = "complete"
     atomic_json(state_path, state)
 

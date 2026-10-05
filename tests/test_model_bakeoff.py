@@ -557,14 +557,22 @@ def test_resume_skips_identical_completed_stage_and_rejects_changed_command(tmp_
         run_stage("stage", command + ["changed"], state_path, state, log, [output])
 
 
-def test_resume_scoring_flag_preserves_completed_benchmark_stage(tmp_path: Path):
+def test_resume_scoring_upgrade_revalidates_completed_benchmark_stage(tmp_path: Path):
     state_path = tmp_path / "state.json"
     output = tmp_path / "output.json"
-    output.write_text("ok", encoding="utf-8")
+    output.write_text("legacy", encoding="utf-8")
     log = tmp_path / "stage.log"
+    scorer = tmp_path / "run_baseline_benchmarks.py"
+    scorer.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "assert '--resume-scoring' in sys.argv\n"
+        f"Path({str(output)!r}).write_text('verified', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
     old_command = [
         sys.executable,
-        str(ROOT / "scripts/run_baseline_benchmarks.py"),
+        str(scorer),
         "--task",
         "mt",
     ]
@@ -587,7 +595,34 @@ def test_resume_scoring_flag_preserves_completed_benchmark_stage(tmp_path: Path)
         [output],
     )
 
-    assert not log.exists()
+    assert output.read_text(encoding="utf-8") == "verified"
+    assert log.exists()
+    assert state["stages"]["stage"]["output_evidence"] == [
+        {
+            "path": str(output.resolve()),
+            "kind": "file",
+            "bytes": len("verified"),
+            "sha256": bakeoff.sha256(output),
+        }
+    ]
+
+
+def test_completed_stage_rejects_modified_file_output(tmp_path: Path):
+    state_path = tmp_path / "state.json"
+    output = tmp_path / "output.json"
+    log = tmp_path / "stage.log"
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(output)!r}).write_text('trusted')",
+    ]
+    state: dict = {}
+
+    run_stage("stage", command, state_path, state, log, [output])
+    output.write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="output evidence changed"):
+        run_stage("stage", command, state_path, state, log, [output])
 
 
 def test_bakeoff_benchmarks_enable_verified_scoring_resume(tmp_path: Path):
