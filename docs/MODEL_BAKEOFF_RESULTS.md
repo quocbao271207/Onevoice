@@ -6,12 +6,12 @@ Ngày mở vòng: 05/10/2026.
 
 Chưa model bổ sung nào được gọi là `benchmarked`. Candidate A vẫn đang được tạo bởi pipeline hiện hữu và không bị restart hay thay đổi process đang chạy:
 
-- MT Candidate A: `facebook/nllb-200-distilled-600M`, full-data LoRA đang chạy.
-- ASR Candidate A: `vinai/PhoWhisper-small`, sẽ chạy sau MT trong state machine hiện hữu.
+- MT Candidate A: `facebook/nllb-200-distilled-600M`, full-data LoRA đã hoàn tất 33.521 bước; candidate suite đang chạy.
+- ASR Candidate A: `vinai/PhoWhisper-small`, chờ candidate suite MT hoàn tất trong state machine hiện hữu.
 - Các challenger đều là `planned`; `data/reports/model_bakeoff/comparison.json` là nguồn trạng thái máy đọc được.
 - Candidate A đạt gate cũ vẫn chỉ được đóng băng làm chuẩn tham chiếu. `promotion_allowed` luôn là `false` cho đến khi hoàn tất bake-off, blind v2 và deployment gate.
 
-Tại lần chụp trạng thái gần nhất, MT đạt 18.127/33.521 bước (54,08% riêng full-run MT); checkpoint 17.500 và 18.000 đã có archive/checksum local. Con số này không phải phần trăm của toàn chương trình mở rộng. Với ASR Candidate A, challenger training, blind v2 và deployment benchmark còn ở phía sau, tiến độ end-to-end ước khoảng 30%; đây là ước lượng theo stage, không phải accuracy.
+Tại lần chụp trạng thái gần nhất ngày 05/10/2026, MT đã hoàn tất 33.521/33.521 bước. Toàn bộ 68 checkpoint archive, archive cuối và summary đã có checksum xác minh trên local; `program_state.json` đã chuyển sang `mt_candidate`. Đây chỉ là hoàn tất huấn luyện MT Candidate A, không phải hoàn tất chương trình: ASR Candidate A, challenger training, blind v2 và deployment benchmark còn ở phía sau. Tiến độ end-to-end ước khoảng 35%; đây là ước lượng theo stage, không phải accuracy.
 
 ## Candidate và license gate
 
