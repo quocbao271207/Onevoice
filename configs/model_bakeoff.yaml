@@ -26,6 +26,7 @@ resources:
   invariant: "All limits are below 75%; never run two GPU children concurrently."
 
 data:
+  accuracy_program: configs/accuracy_program.yaml
   train:
     mt: data/processed/manifests/mt--train.jsonl
     asr: data/processed/manifests/asr--train-local.jsonl

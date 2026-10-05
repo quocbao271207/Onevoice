@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -143,6 +144,101 @@ def validate_required_slices(task: str, rows: list[dict[str, Any]], required: li
     missing = sorted(set(required) - observed)
     if missing:
         raise ValueError(f"Blind {task} manifest is missing required slices: {missing}")
+
+
+def finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def confidence_interval(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    lower = finite_float(value[0])
+    upper = finite_float(value[1])
+    if lower is None or upper is None or lower > upper:
+        return None
+    return lower, upper
+
+
+def clinical_failures(report: dict[str, Any], required: list[str]) -> list[str]:
+    categories = report.get("categories") or {}
+    failures = []
+    for name in required:
+        record = categories.get(name)
+        try:
+            samples = int(record.get("samples", 0)) if record else 0
+        except (TypeError, ValueError):
+            samples = 0
+        rate = finite_float(record.get("safety_failure_rate")) if record else None
+        if samples < 1 or rate is None or rate != 0.0:
+            failures.append(name)
+    return failures
+
+
+def blind_quality_failures(
+    report: dict[str, Any],
+    task: str,
+    direction: str | None,
+    accuracy_config: dict[str, Any],
+    bakeoff_config: dict[str, Any],
+) -> list[str]:
+    """Require point estimates and worst-case 95% CI to clear release thresholds."""
+    aggregate = accuracy_config["release_gates"]["aggregate"]
+    failures: list[str] = []
+    metric_view = report
+    if task == "mt":
+        metric_view = report.get("directions", {}).get(str(direction)) or {}
+    try:
+        samples = int(metric_view.get("samples", 0))
+    except (TypeError, ValueError):
+        samples = 0
+    if samples < 1:
+        failures.append("samples:missing")
+
+    if task == "mt":
+        policies = (
+            ("sacrebleu", "sacrebleu_bootstrap_95ci", float(aggregate["mt_sacrebleu_min"])),
+            ("chrf2", "chrf2_bootstrap_95ci", float(aggregate["mt_chrf2_min"])),
+        )
+        for metric_name, interval_name, minimum in policies:
+            metric = finite_float(metric_view.get(metric_name))
+            interval = confidence_interval(metric_view.get(interval_name))
+            if metric is None:
+                failures.append(f"{metric_name}:missing_or_invalid")
+            elif metric < minimum:
+                failures.append(f"{metric_name}:below_policy")
+            if interval is None:
+                failures.append(f"{interval_name}:missing_or_invalid")
+            elif interval[0] < minimum:
+                failures.append(f"{interval_name}:lower_bound_below_policy")
+        return failures
+
+    wer = finite_float(report.get("wer"))
+    wer_interval = confidence_interval(report.get("wer_bootstrap_95ci"))
+    wer_max = float(aggregate["asr_vi_wer_max"])
+    if wer is None:
+        failures.append("wer:missing_or_invalid")
+    elif wer > wer_max:
+        failures.append("wer:above_policy")
+    if wer_interval is None:
+        failures.append("wer_bootstrap_95ci:missing_or_invalid")
+    elif wer_interval[1] > wer_max:
+        failures.append("wer_bootstrap_95ci:upper_bound_above_policy")
+    if finite_float(report.get("cer")) is None:
+        failures.append("cer:missing_or_invalid")
+    code_switch = report.get("slices", {}).get("code_switch", {}).get("True")
+    code_switch_wer = finite_float(code_switch.get("wer")) if code_switch else None
+    if code_switch_wer is None:
+        failures.append("code_switch_wer:missing_or_invalid")
+    elif code_switch_wer > float(
+        bakeoff_config["promotion_gate"]["asr_code_switch_wer_max"]
+    ):
+        failures.append("code_switch_wer:above_policy")
+    return failures
 
 
 def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str, Any]) -> None:
@@ -322,14 +418,18 @@ def evaluate(
             )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     required = config["promotion_gate"]["critical_slices"] + config["promotion_gate"]["policy_slices"]
-    categories = report.get("categories") or {}
-    failed = [
-        name
-        for name in required
-        if not categories.get(name)
-        or int(categories[name].get("samples", 0)) < 1
-        or float(categories[name].get("safety_failure_rate", 1.0)) != 0.0
-    ]
+    failed = clinical_failures(report, required)
+    accuracy_path = ROOT / config["data"]["accuracy_program"]
+    if not accuracy_path.is_file():
+        raise FileNotFoundError(accuracy_path)
+    accuracy_config = yaml.safe_load(accuracy_path.read_text(encoding="utf-8"))
+    quality_failed = blind_quality_failures(
+        report,
+        args.task,
+        args.direction,
+        accuracy_config,
+        config,
+    )
     result = {
         "evaluated_at": utc_now(),
         "candidate": specification,
@@ -337,7 +437,9 @@ def evaluate(
         "report": str(report_path),
         "critical_gate": "pass" if not failed else "fail",
         "failed_slices": failed,
-        "promotion_allowed": not failed,
+        "quality_gate": "pass" if not quality_failed else "fail",
+        "quality_failures": quality_failed,
+        "promotion_allowed": not failed and not quality_failed,
     }
     atomic_json(output_dir / f"{stem}_gate.json", result)
     slot[key]["result"] = result

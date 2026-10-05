@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from scripts.run_blind_candidate_suite import (
+    blind_quality_failures,
     sha256,
     validate_content_integrity,
     validate_identifiers,
@@ -189,3 +190,64 @@ def test_blind_asr_requires_existing_audio(tmp_path: Path):
     }
     with pytest.raises(FileNotFoundError, match="audio is missing"):
         validate_content_integrity("asr", [row])
+
+
+def accuracy_config():
+    return {
+        "release_gates": {
+            "aggregate": {
+                "asr_vi_wer_max": 0.19,
+                "mt_sacrebleu_min": 25.0,
+                "mt_chrf2_min": 46.0,
+            }
+        }
+    }
+
+
+def bakeoff_config():
+    return {"promotion_gate": {"asr_code_switch_wer_max": 0.21}}
+
+
+def test_blind_mt_quality_requires_lower_ci_bounds_above_policy():
+    report = {
+        "directions": {
+            "en_to_vi": {
+                "samples": 100,
+                "sacrebleu": 30.0,
+                "sacrebleu_bootstrap_95ci": [26.0, 34.0],
+                "chrf2": 50.0,
+                "chrf2_bootstrap_95ci": [47.0, 53.0],
+            }
+        }
+    }
+    assert blind_quality_failures(
+        report, "mt", "en_to_vi", accuracy_config(), bakeoff_config()
+    ) == []
+
+    report["directions"]["en_to_vi"]["chrf2_bootstrap_95ci"] = [45.0, 53.0]
+    assert blind_quality_failures(
+        report, "mt", "en_to_vi", accuracy_config(), bakeoff_config()
+    ) == ["chrf2_bootstrap_95ci:lower_bound_below_policy"]
+
+
+def test_blind_asr_quality_requires_upper_ci_and_code_switch_policy():
+    report = {
+        "samples": 100,
+        "wer": 0.15,
+        "cer": 0.10,
+        "wer_bootstrap_95ci": [0.13, 0.18],
+        "slices": {"code_switch": {"True": {"wer": 0.20}}},
+    }
+    assert blind_quality_failures(
+        report, "asr", None, accuracy_config(), bakeoff_config()
+    ) == []
+
+    report["wer_bootstrap_95ci"] = [0.13, 0.20]
+    report["slices"]["code_switch"]["True"]["wer"] = float("nan")
+    failures = blind_quality_failures(
+        report, "asr", None, accuracy_config(), bakeoff_config()
+    )
+    assert failures == [
+        "wer_bootstrap_95ci:upper_bound_above_policy",
+        "code_switch_wer:missing_or_invalid",
+    ]
