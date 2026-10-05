@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
 import yaml
 
 from scripts.run_gpu_rounds import (
@@ -16,6 +18,7 @@ from scripts.run_gpu_rounds import (
     resolve_adaptive_final,
     select_completed_round,
     utilization_throttle_reason,
+    validate_resource_limits,
 )
 
 
@@ -52,6 +55,28 @@ def test_gpu_round_policy_keeps_uniform_headroom_below_75_percent():
         < limits["hard_utilization_percent"]
         < 75.0
     )
+    assert validate_resource_limits(limits) == (0.35, 0.40)
+    assert limits["sample_seconds"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("gpu_memory_fraction", 0.3501, "gpu_memory_fraction"),
+        ("gpu_memory_hard_fraction", 0.4001, "memory thresholds"),
+        ("gpu_memory_hard_fraction", 0.34, "memory thresholds"),
+        ("utilization_percent", math.nan, "finite"),
+        ("sample_seconds", 0.0, "sample_seconds"),
+        ("rolling_samples", 0, "rolling_samples"),
+    ],
+)
+def test_gpu_round_resource_limits_fail_closed(key: str, value: float, message: str):
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    limits[key] = value
+    with pytest.raises(ValueError, match=message):
+        validate_resource_limits(limits)
 
 
 def test_gpu_round_hard_utilization_guard_preempts_a_low_rolling_average():

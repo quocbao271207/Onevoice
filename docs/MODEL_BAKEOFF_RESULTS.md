@@ -43,7 +43,7 @@ Mỗi slot blind chỉ được mở cho winner đúng task/chiều trong snapsh
 
 ## Successive halving và winner gate
 
-Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling utilization 70%, resume 55% và hard reaction 74% — luôn dưới 75%.
+Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling utilization 70%, resume 55% và hard reaction 74% — luôn dưới 75%. Stage mới lấy mẫu tài nguyên mỗi 1 giây; preflight từ chối ngưỡng không hữu hạn, sai thứ tự hoặc vượt trần trước khi khởi chạy child.
 
 1. Zero-shot trên cùng selection dev.
 2. Pilot 400 steps, effective batch 32.

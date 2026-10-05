@@ -2,10 +2,11 @@ version: 1
 
 limits:
   gpu_memory_fraction: 0.35
+  gpu_memory_hard_fraction: 0.40
   utilization_percent: 70.0
   hard_utilization_percent: 74.0
   resume_percent: 55.0
-  sample_seconds: 2.0
+  sample_seconds: 1.0
   rolling_samples: 10
   checkpoint_archive_poll_seconds: 15.0
 

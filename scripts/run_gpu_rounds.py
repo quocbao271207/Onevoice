@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -21,6 +22,82 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def validate_resource_limits(limits: dict[str, Any]) -> tuple[float, float]:
+    """Validate shared GPU limits and return soft/hard memory fractions."""
+    required = {
+        "gpu_memory_fraction",
+        "gpu_memory_hard_fraction",
+        "utilization_percent",
+        "hard_utilization_percent",
+        "resume_percent",
+        "sample_seconds",
+        "rolling_samples",
+    }
+    missing = sorted(required - set(limits))
+    if missing:
+        raise ValueError(f"GPU resource limits are missing: {missing}")
+
+    memory_fraction = float(limits["gpu_memory_fraction"])
+    hard_memory_fraction = float(limits["gpu_memory_hard_fraction"])
+    utilization_limit = float(limits["utilization_percent"])
+    hard_utilization_limit = float(limits["hard_utilization_percent"])
+    resume_percent = float(limits["resume_percent"])
+    sample_seconds = float(limits["sample_seconds"])
+    numeric_values = (
+        memory_fraction,
+        hard_memory_fraction,
+        utilization_limit,
+        hard_utilization_limit,
+        resume_percent,
+        sample_seconds,
+    )
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError("GPU resource limits must be finite")
+    if not 0.0 < memory_fraction <= 0.35:
+        raise ValueError("gpu_memory_fraction must be in (0, 0.35]")
+    if not memory_fraction <= hard_memory_fraction <= 0.40:
+        raise ValueError(
+            "GPU memory thresholds must satisfy process fraction <= hard fraction <= 0.40"
+        )
+    if not 0.0 < resume_percent < utilization_limit < hard_utilization_limit < 75.0:
+        raise ValueError("utilization thresholds must satisfy 0 < resume < rolling < hard < 75")
+    if sample_seconds <= 0.0:
+        raise ValueError("sample_seconds must be positive")
+
+    rolling_samples = limits["rolling_samples"]
+    if (
+        isinstance(rolling_samples, bool)
+        or not isinstance(rolling_samples, int)
+        or rolling_samples < 1
+    ):
+        raise ValueError("rolling_samples must be a positive integer")
+
+    boosted = limits.get("boosted_window")
+    if boosted:
+        boosted_utilization = float(boosted["utilization_percent"])
+        boosted_resume = float(boosted["resume_percent"])
+        if not all(math.isfinite(value) for value in (boosted_utilization, boosted_resume)):
+            raise ValueError("boosted utilization limits must be finite")
+        if not utilization_limit < boosted_utilization < hard_utilization_limit:
+            raise ValueError(
+                "boosted utilization must be above the base limit and below the hard limit"
+            )
+        if not 0.0 < boosted_resume < boosted_utilization:
+            raise ValueError("boosted resume must be positive and below boosted utilization")
+        start_hour = boosted["start_hour"]
+        end_hour = boosted["end_hour"]
+        if any(
+            isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23
+            for hour in (start_hour, end_hour)
+        ):
+            raise ValueError("boosted window hours must be integers in [0, 23]")
+        if start_hour == end_hour:
+            raise ValueError("boosted window must not cover the entire day")
+        ZoneInfo(str(boosted["timezone"]))
+
+    return memory_fraction, hard_memory_fraction
 
 
 def read_gpu_sample() -> dict[str, float]:
@@ -300,7 +377,7 @@ def monitor_process(
     monitor_path: Path,
     limits: dict[str, Any],
 ) -> dict[str, Any]:
-    memory_fraction = float(limits["gpu_memory_fraction"])
+    memory_fraction, hard_memory_fraction = validate_resource_limits(limits)
     hard_utilization_limit = float(limits["hard_utilization_percent"])
     sample_seconds = float(limits["sample_seconds"])
     window = deque(maxlen=int(limits["rolling_samples"]))
@@ -317,7 +394,7 @@ def monitor_process(
                 utilization_limit, resume_percent, boosted_window = active_utilization_limits(limits)
                 process_memory = process_gpu_memory_mib(process_group)
                 peak_process_memory = max(peak_process_memory, process_memory)
-                hard_memory_limit = sample["memory_total_mib"] * 0.40
+                hard_memory_limit = sample["memory_total_mib"] * hard_memory_fraction
                 if process_memory > hard_memory_limit:
                     os.killpg(process_group, signal.SIGCONT)
                     stopped = False
@@ -328,7 +405,8 @@ def monitor_process(
                         os.killpg(process_group, signal.SIGKILL)
                         process.wait(timeout=10)
                     raise RuntimeError(
-                        f"Training exceeded the hard 40% GPU-memory limit: {process_memory:.0f} MiB"
+                        "Training exceeded the hard "
+                        f"{hard_memory_fraction:.0%} GPU-memory limit: {process_memory:.0f} MiB"
                     )
                 window.append(sample["utilization"])
                 rolling = sum(window) / len(window)
@@ -352,6 +430,9 @@ def monitor_process(
                     **sample,
                     "process_memory_mib": process_memory,
                     "process_memory_fraction": process_memory / max(1.0, sample["memory_total_mib"]),
+                    "configured_memory_fraction": memory_fraction,
+                    "configured_hard_memory_fraction": hard_memory_fraction,
+                    "hard_memory_limit_mib": hard_memory_limit,
                     "rolling_utilization": rolling,
                     "training_stopped": stopped,
                     "active_utilization_limit_percent": utilization_limit,
@@ -373,6 +454,7 @@ def monitor_process(
         "throttle_events": throttles,
         "peak_process_memory_mib": peak_process_memory,
         "configured_memory_fraction": memory_fraction,
+        "configured_hard_memory_fraction": hard_memory_fraction,
         "configured_utilization_limit_percent": float(limits["utilization_percent"]),
         "hard_utilization_limit_percent": hard_utilization_limit,
         "daytime_utilization_limit_percent": float(limits["utilization_percent"]),
@@ -415,22 +497,7 @@ def main() -> int:
 
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     limits = config["limits"]
-    if not 0.0 < float(limits["gpu_memory_fraction"]) <= 0.40:
-        raise ValueError("gpu_memory_fraction must be in (0, 0.40]")
-    utilization_limit = float(limits["utilization_percent"])
-    hard_utilization_limit = float(limits["hard_utilization_percent"])
-    resume_percent = float(limits["resume_percent"])
-    if not 0.0 < resume_percent < utilization_limit < hard_utilization_limit < 75.0:
-        raise ValueError(
-            "utilization thresholds must satisfy 0 < resume < rolling < hard < 75"
-        )
-    boosted = limits.get("boosted_window", {})
-    if boosted and not (
-        utilization_limit
-        < float(boosted["utilization_percent"])
-        < hard_utilization_limit
-    ):
-        raise ValueError("boosted utilization must be above the base limit and below the hard limit")
+    validate_resource_limits(limits)
     task = config["tasks"][args.task]
     rounds = configured_rounds(task, args.max_rounds, args.round_name)
     rounds = apply_round_overrides(

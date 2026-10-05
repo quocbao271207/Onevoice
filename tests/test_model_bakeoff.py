@@ -50,6 +50,9 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
     assert set(hashes) == {"mt", "asr", "accuracy_program"}
     assert data["successive_halving"]["comparison_unit"] == "effective_train_samples"
     assert data["principles"]["one_gpu_child_at_a_time"] is True
+    assert data["resources"]["gpu_memory_fraction"] == 0.35
+    assert data["resources"]["gpu_memory_hard_fraction"] == 0.40
+    assert data["resources"]["sample_seconds"] == 1.0
     required = set(data["promotion_gate"]["critical_slices"] + data["promotion_gate"]["policy_slices"])
     for task in ("mt", "asr"):
         rows = [
@@ -159,6 +162,13 @@ def test_bakeoff_metric_policy_rejects_duplicates_and_invalid_code_switch_limit(
     data = config()
     data["promotion_gate"]["asr_code_switch_wer_max"] = float("nan")
     with pytest.raises(ValueError, match="code-switch WER limit"):
+        validate_resources(data)
+
+
+def test_bakeoff_rejects_hard_memory_limit_below_process_limit():
+    data = config()
+    data["resources"]["gpu_memory_hard_fraction"] = 0.34
+    with pytest.raises(ValueError, match="memory thresholds"):
         validate_resources(data)
 
 

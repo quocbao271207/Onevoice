@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data.quality import fingerprint_text  # noqa: E402
+from scripts.run_gpu_rounds import validate_resource_limits  # noqa: E402
 
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
@@ -163,15 +164,7 @@ def license_gate(candidate: dict[str, Any], research_approvals: set[str]) -> tup
 
 def validate_resources(config: dict[str, Any]) -> None:
     resources = config["resources"]
-    if not 0 < float(resources["gpu_memory_fraction"]) <= 0.35:
-        raise ValueError("Bake-off GPU memory fraction must stay at or below 35%")
-    if not 0 < float(resources["gpu_memory_hard_fraction"]) <= 0.40:
-        raise ValueError("Hard GPU memory fraction must stay at or below 40%")
-    resume = float(resources["resume_percent"])
-    rolling = float(resources["utilization_percent"])
-    hard = float(resources["hard_utilization_percent"])
-    if not 0 < resume < rolling < hard < 75:
-        raise ValueError("GPU utilization policy must satisfy 0 < resume < rolling < hard < 75")
+    validate_resource_limits(resources)
     if not config["principles"].get("one_gpu_child_at_a_time"):
         raise ValueError("Bake-off requires one GPU child at a time")
     deployment_min_runs = config["promotion_gate"].get("deployment_min_runs")
