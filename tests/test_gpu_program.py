@@ -10,15 +10,18 @@ from scripts.run_gpu_program import (
     newest_complete_run,
     read_complete_run,
     record_recovered_candidate,
+    record_recovered_training,
     resume_kind,
     run_stage,
     selected_adapter,
     should_extend_mt,
     validation_history,
     verified_candidate_result,
+    verified_training_result,
     write_state,
 )
 from scripts.candidate_evidence import archive_evidence, evidence_sidecars
+from scripts.run_gpu_rounds import archive_round
 from scripts.run_mt_candidate_suite import DEFAULT_NUM_BEAMS
 
 
@@ -136,6 +139,22 @@ def test_resume_kind_accepts_only_idle_wait_or_running_mt_candidate(tmp_path: Pa
         },
         mt_run,
     ) == "after_recovered_mt_candidate"
+    assert resume_kind(
+        {
+            "mt_run": str(mt_run),
+            "stage": "asr_training",
+            "stages": {"asr_training": {"status": "running"}},
+        },
+        mt_run,
+    ) == "after_recovered_asr_training"
+    assert resume_kind(
+        {
+            "mt_run": str(mt_run),
+            "stage": "asr_candidate",
+            "stages": {"asr_candidate": {"status": "running"}},
+        },
+        mt_run,
+    ) == "after_recovered_asr_candidate"
     with pytest.raises(ValueError, match="only safe"):
         resume_kind(
             {
@@ -230,3 +249,50 @@ def test_recovered_candidate_rejects_mutated_prediction(tmp_path: Path):
 
     with pytest.raises(ValueError, match="does not match archive"):
         verified_candidate_result(output, task="mt", expected_adapter=adapter)
+
+
+def test_recovered_training_requires_verified_round_archives(tmp_path: Path):
+    output_root = tmp_path / "asr-runs"
+    run = output_root / "asr-20261006-000000"
+    round_dir = run / "01-final"
+    model = round_dir / "model"
+    model.mkdir(parents=True)
+    (model / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (model / "training_run.json").write_text("{}", encoding="utf-8")
+    archive = archive_round(round_dir)
+    (run / "summary.json").write_text(
+        json.dumps(
+            {
+                "task": "asr",
+                "status": "complete",
+                "selected_round": "final",
+                "rounds": [
+                    {
+                        "name": "final",
+                        "status": "complete",
+                        "metric": 0.15,
+                        "archive": archive,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    evidence = verified_training_result(output_root, task="asr")
+
+    assert Path(evidence["adapter"]) == model
+    assert evidence["verified_archives"][0]["sha256"] == archive["sha256"]
+    state_path = tmp_path / "program_state.json"
+    state = {"stage": "asr_training", "stages": {"asr_training": {"status": "running"}}}
+    record_recovered_training(
+        name="asr_training", evidence=evidence, state_path=state_path, state=state
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["stages"]["asr_training"]["recovered_out_of_band"] is True
+
+    Path(archive["checksum"]).write_text(
+        "0" * 64 + f"  {Path(archive['path']).name}\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        verified_training_result(output_root, task="asr")

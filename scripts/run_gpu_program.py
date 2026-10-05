@@ -204,10 +204,34 @@ def resume_kind(state: dict[str, Any], mt_run: Path) -> str:
         and mt_stage.get("status") == "running"
     ):
         return "after_recovered_mt_candidate"
+    asr_training = stages.get("asr_training") if isinstance(stages, dict) else None
+    if (
+        state.get("stage") == "asr_training"
+        and isinstance(asr_training, dict)
+        and asr_training.get("status") == "running"
+    ):
+        return "after_recovered_asr_training"
+    asr_candidate = stages.get("asr_candidate") if isinstance(stages, dict) else None
+    if (
+        state.get("stage") == "asr_candidate"
+        and isinstance(asr_candidate, dict)
+        and asr_candidate.get("status") == "running"
+    ):
+        return "after_recovered_asr_candidate"
     raise ValueError(
         "automatic resume is only safe from waiting_for_mt or a verified out-of-band "
-        "mt_candidate result"
+        "MT/ASR stage result"
     )
+
+
+def completed_candidate_code(state: dict[str, Any], name: str) -> int:
+    stage = state.get("stages", {}).get(name)
+    if not isinstance(stage, dict) or stage.get("status") != "complete":
+        raise ValueError(f"required candidate stage is not complete: {name}")
+    code = stage.get("return_code")
+    if code not in {0, 2}:
+        raise ValueError(f"candidate stage has invalid return code: {name}={code!r}")
+    return int(code)
 
 
 def verified_candidate_result(
@@ -294,6 +318,101 @@ def record_recovered_candidate(
     return int(evidence["return_code"])
 
 
+def verified_training_result(output_root: Path, *, task: str) -> dict[str, Any]:
+    run_root, summary = newest_complete_run(output_root, task)
+    adapter = selected_adapter(run_root, summary)
+    rounds = summary.get("rounds")
+    if not isinstance(rounds, list) or not rounds:
+        raise ValueError(f"training summary has no rounds: {run_root}")
+    verified_archives = []
+    for index, round_record in enumerate(rounds, start=1):
+        if not isinstance(round_record, dict) or round_record.get("status") != "complete":
+            raise ValueError(f"training round is not complete: {run_root} row {index}")
+        archive_record = round_record.get("archive")
+        if not isinstance(archive_record, dict):
+            raise ValueError(f"training round has no archive evidence: {run_root} row {index}")
+        round_name = str(round_record.get("name") or "")
+        matches = list(run_root.glob(f"{index:02d}-{round_name}.tar.gz"))
+        if len(matches) != 1:
+            raise FileNotFoundError(
+                f"expected one archive for training round {index}: {round_name}"
+            )
+        archive_path = matches[0].resolve()
+        if Path(str(archive_record.get("path") or "")).resolve() != archive_path:
+            raise ValueError(f"training archive path mismatch: {archive_path}")
+        manifest = verify_evidence_archive(archive_path)
+        checksum_path = archive_path.with_suffix(archive_path.suffix + ".sha256")
+        manifest_path = archive_path.with_suffix(archive_path.suffix + ".manifest.json")
+        if (
+            int(archive_record.get("bytes", -1)) != int(manifest["archive_bytes"])
+            or str(archive_record.get("sha256") or "") != manifest["archive_sha256"]
+            or Path(str(archive_record.get("checksum") or "")).resolve()
+            != checksum_path.resolve()
+            or Path(str(archive_record.get("manifest") or "")).resolve()
+            != manifest_path.resolve()
+        ):
+            raise ValueError(f"training archive metadata mismatch: {archive_path}")
+        verified_archives.append(
+            {
+                "path": str(archive_path),
+                "bytes": int(manifest["archive_bytes"]),
+                "sha256": str(manifest["archive_sha256"]),
+            }
+        )
+
+    selected_round_dir = adapter.parent
+    selected_archive = next(
+        (
+            item
+            for item in verified_archives
+            if Path(item["path"]).name == f"{selected_round_dir.name}.tar.gz"
+        ),
+        None,
+    )
+    if selected_archive is None:
+        raise ValueError(f"selected adapter round has no verified archive: {adapter}")
+    selected_manifest = verify_evidence_archive(Path(selected_archive["path"]))
+    adapter_name = f"{selected_round_dir.name}/model/adapter_config.json"
+    adapter_record = next(
+        (item for item in selected_manifest["files"] if item["path"] == adapter_name),
+        None,
+    )
+    adapter_config = adapter / "adapter_config.json"
+    if (
+        adapter_record is None
+        or int(adapter_record["bytes"]) != adapter_config.stat().st_size
+        or str(adapter_record["sha256"]) != sha256(adapter_config)
+    ):
+        raise ValueError(f"selected adapter does not match verified archive: {adapter}")
+    return {
+        "run_root": str(run_root),
+        "adapter": str(adapter),
+        "verified_archives": verified_archives,
+    }
+
+
+def record_recovered_training(
+    *,
+    name: str,
+    evidence: dict[str, Any],
+    state_path: Path,
+    state: dict[str, Any],
+) -> None:
+    state["stages"][name].update(
+        {
+            "status": "complete",
+            "completed_at": utc_now(),
+            "return_code": 0,
+            "recovered_out_of_band": True,
+            "run_root": evidence["run_root"],
+            "adapter": evidence["adapter"],
+            "verified_archives": evidence["verified_archives"],
+        }
+    )
+    state["stage"] = name
+    write_state(state_path, state)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -321,6 +440,8 @@ def main() -> int:
     state_path = state_dir / "program_state.json"
     resume_from = "new"
     recovered_mt: dict[str, Any] | None = None
+    recovered_asr_training: dict[str, Any] | None = None
+    recovered_asr_candidate: dict[str, Any] | None = None
     if args.resume:
         if not state_path.is_file():
             raise FileNotFoundError(f"cannot resume without {state_path}")
@@ -334,6 +455,21 @@ def main() -> int:
                 state_dir / "mt-candidate",
                 task="mt",
                 expected_adapter=mt_adapter,
+            )
+        elif resume_from == "after_recovered_asr_training":
+            completed_candidate_code(state, "mt_candidate")
+            recovered_asr_training = verified_training_result(
+                state_dir / "asr-runs", task="asr"
+            )
+        elif resume_from == "after_recovered_asr_candidate":
+            completed_candidate_code(state, "mt_candidate")
+            asr_adapter = Path(str(state.get("asr_adapter") or "")).resolve()
+            if not (asr_adapter / "adapter_config.json").is_file():
+                raise FileNotFoundError(f"recorded ASR adapter is incomplete: {asr_adapter}")
+            recovered_asr_candidate = verified_candidate_result(
+                state_dir / "asr-candidate",
+                task="asr",
+                expected_adapter=asr_adapter,
             )
         state["execution_status"] = "running"
         state.pop("error", None)
@@ -361,6 +497,11 @@ def main() -> int:
                 state_path=state_path,
                 state=state,
             )
+        elif resume_from in {
+            "after_recovered_asr_training",
+            "after_recovered_asr_candidate",
+        }:
+            mt_gate_code = completed_candidate_code(state, "mt_candidate")
         else:
             if args.wait_pid is not None:
                 wait_for_process(args.wait_pid, args.poll_seconds, state_path, state)
@@ -438,55 +579,75 @@ def main() -> int:
                 accepted_codes={0, 2},
             )
 
-        asr_output_root = state_dir / "asr-runs"
-        asr_output_root.mkdir()
-        run_stage(
-            name="asr_training",
-            command=[
-                args.python,
-                str(ROOT / "scripts" / "run_gpu_rounds.py"),
-                "--task",
-                "asr",
-                "--config",
-                str(ROOT / "configs" / "gpu_rounds.yaml"),
-                "--output-root",
-                str(asr_output_root),
-            ],
-            log_path=state_dir / "asr_training_stage.log",
-            state_path=state_path,
-            state=state,
-            accepted_codes={0},
-        )
-        asr_run, asr_summary = newest_complete_run(asr_output_root, "asr")
-        asr_adapter = selected_adapter(asr_run, asr_summary)
-        state["asr_run"] = str(asr_run)
-        state["asr_adapter"] = str(asr_adapter)
-        write_state(state_path, state)
+        if resume_from == "after_recovered_asr_candidate":
+            assert recovered_asr_candidate is not None
+            asr_gate_code = record_recovered_candidate(
+                name="asr_candidate",
+                evidence=recovered_asr_candidate,
+                state_path=state_path,
+                state=state,
+            )
+        else:
+            asr_output_root = state_dir / "asr-runs"
+            if resume_from == "after_recovered_asr_training":
+                assert recovered_asr_training is not None
+                record_recovered_training(
+                    name="asr_training",
+                    evidence=recovered_asr_training,
+                    state_path=state_path,
+                    state=state,
+                )
+                asr_run = Path(recovered_asr_training["run_root"])
+                asr_adapter = Path(recovered_asr_training["adapter"])
+            else:
+                asr_output_root.mkdir()
+                run_stage(
+                    name="asr_training",
+                    command=[
+                        args.python,
+                        str(ROOT / "scripts" / "run_gpu_rounds.py"),
+                        "--task",
+                        "asr",
+                        "--config",
+                        str(ROOT / "configs" / "gpu_rounds.yaml"),
+                        "--output-root",
+                        str(asr_output_root),
+                    ],
+                    log_path=state_dir / "asr_training_stage.log",
+                    state_path=state_path,
+                    state=state,
+                    accepted_codes={0},
+                )
+                asr_run, asr_summary = newest_complete_run(asr_output_root, "asr")
+                asr_adapter = selected_adapter(asr_run, asr_summary)
+            state["asr_run"] = str(asr_run)
+            state["asr_adapter"] = str(asr_adapter)
+            write_state(state_path, state)
 
-        asr_candidate_dir = state_dir / "asr-candidate"
-        asr_gate_code = run_stage(
-            name="asr_candidate",
-            command=[
-                args.python,
-                str(ROOT / "scripts" / "run_asr_candidate_suite.py"),
-                "--adapter",
-                str(asr_adapter),
-                "--output-dir",
-                str(asr_candidate_dir),
-                "--device",
-                "cuda",
-                "--precision",
-                "bf16",
-                "--batch-size",
-                "4",
-                "--num-beams",
-                "1",
-            ],
-            log_path=state_dir / "asr_candidate_stage.log",
-            state_path=state_path,
-            state=state,
-            accepted_codes={0, 2},
-        )
+            asr_candidate_dir = state_dir / "asr-candidate"
+            asr_gate_code = run_stage(
+                name="asr_candidate",
+                command=[
+                    args.python,
+                    str(ROOT / "scripts" / "run_asr_candidate_suite.py"),
+                    "--adapter",
+                    str(asr_adapter),
+                    "--output-dir",
+                    str(asr_candidate_dir),
+                    "--device",
+                    "cuda",
+                    "--precision",
+                    "bf16",
+                    "--batch-size",
+                    "4",
+                    "--num-beams",
+                    "1",
+                ],
+                log_path=state_dir / "asr_candidate_stage.log",
+                state_path=state_path,
+                state=state,
+                accepted_codes={0, 2},
+            )
         state["stage"] = "finished"
         state["execution_status"] = "complete"
         state["candidate_a_gate_pass"] = mt_gate_code == 0 and asr_gate_code == 0
