@@ -318,6 +318,49 @@ def record_recovered_candidate(
     return int(evidence["return_code"])
 
 
+def verify_live_directory_against_archive(
+    directory: Path,
+    *,
+    manifest: dict[str, Any],
+    archive_prefix: str,
+) -> dict[str, int]:
+    """Require every live file under ``directory`` to match archived evidence."""
+    prefix = archive_prefix.rstrip("/") + "/"
+    expected = {
+        str(item["path"])[len(prefix) :]: item
+        for item in manifest["files"]
+        if str(item["path"]).startswith(prefix)
+    }
+    if not expected:
+        raise ValueError(f"verified archive has no files under {archive_prefix}")
+
+    observed: dict[str, Path] = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"live evidence directory cannot contain symlinks: {path}")
+        if path.is_file():
+            observed[path.relative_to(directory).as_posix()] = path
+    if set(observed) != set(expected):
+        missing = sorted(set(expected) - set(observed))
+        unexpected = sorted(set(observed) - set(expected))
+        raise ValueError(
+            f"live directory does not match verified archive: {directory}; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    for relative_path, path in observed.items():
+        record = expected[relative_path]
+        if (
+            int(record["bytes"]) != path.stat().st_size
+            or str(record["sha256"]) != sha256(path)
+        ):
+            raise ValueError(f"live file does not match verified archive: {path}")
+    return {
+        "file_count": len(observed),
+        "content_bytes": sum(path.stat().st_size for path in observed.values()),
+    }
+
+
 def verified_training_result(output_root: Path, *, task: str) -> dict[str, Any]:
     run_root, summary = newest_complete_run(output_root, task)
     adapter = selected_adapter(run_root, summary)
@@ -372,21 +415,16 @@ def verified_training_result(output_root: Path, *, task: str) -> dict[str, Any]:
     if selected_archive is None:
         raise ValueError(f"selected adapter round has no verified archive: {adapter}")
     selected_manifest = verify_evidence_archive(Path(selected_archive["path"]))
-    adapter_name = f"{selected_round_dir.name}/model/adapter_config.json"
-    adapter_record = next(
-        (item for item in selected_manifest["files"] if item["path"] == adapter_name),
-        None,
+    adapter_snapshot = verify_live_directory_against_archive(
+        adapter,
+        manifest=selected_manifest,
+        archive_prefix=f"{selected_round_dir.name}/model",
     )
-    adapter_config = adapter / "adapter_config.json"
-    if (
-        adapter_record is None
-        or int(adapter_record["bytes"]) != adapter_config.stat().st_size
-        or str(adapter_record["sha256"]) != sha256(adapter_config)
-    ):
-        raise ValueError(f"selected adapter does not match verified archive: {adapter}")
     return {
         "run_root": str(run_root),
         "adapter": str(adapter),
+        "adapter_file_count": adapter_snapshot["file_count"],
+        "adapter_content_bytes": adapter_snapshot["content_bytes"],
         "verified_archives": verified_archives,
     }
 
@@ -406,6 +444,8 @@ def record_recovered_training(
             "recovered_out_of_band": True,
             "run_root": evidence["run_root"],
             "adapter": evidence["adapter"],
+            "adapter_file_count": int(evidence["adapter_file_count"]),
+            "adapter_content_bytes": int(evidence["adapter_content_bytes"]),
             "verified_archives": evidence["verified_archives"],
         }
     )
@@ -425,7 +465,8 @@ def main() -> int:
         action="store_true",
         help=(
             "Resume a recorded waiting_for_mt state, or reconcile a completed out-of-band "
-            "MT candidate bundle before continuing with ASR."
+            "MT/ASR candidate bundle or ASR multi-round run after verifying its complete "
+            "immutable evidence before continuing."
         ),
     )
     args = parser.parse_args()

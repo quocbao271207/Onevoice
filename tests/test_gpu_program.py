@@ -258,6 +258,7 @@ def test_recovered_training_requires_verified_round_archives(tmp_path: Path):
     model = round_dir / "model"
     model.mkdir(parents=True)
     (model / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (model / "adapter_model.safetensors").write_bytes(b"adapter-weights")
     (model / "training_run.json").write_text("{}", encoding="utf-8")
     archive = archive_round(round_dir)
     (run / "summary.json").write_text(
@@ -282,6 +283,10 @@ def test_recovered_training_requires_verified_round_archives(tmp_path: Path):
     evidence = verified_training_result(output_root, task="asr")
 
     assert Path(evidence["adapter"]) == model
+    assert evidence["adapter_file_count"] == 3
+    assert evidence["adapter_content_bytes"] == sum(
+        path.stat().st_size for path in model.iterdir()
+    )
     assert evidence["verified_archives"][0]["sha256"] == archive["sha256"]
     state_path = tmp_path / "program_state.json"
     state = {"stage": "asr_training", "stages": {"asr_training": {"status": "running"}}}
@@ -290,6 +295,19 @@ def test_recovered_training_requires_verified_round_archives(tmp_path: Path):
     )
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     assert persisted["stages"]["asr_training"]["recovered_out_of_band"] is True
+    assert persisted["stages"]["asr_training"]["adapter_file_count"] == 3
+
+    unexpected = model / "unarchived.bin"
+    unexpected.write_bytes(b"not in archive")
+    with pytest.raises(ValueError, match="live directory does not match verified archive"):
+        verified_training_result(output_root, task="asr")
+    unexpected.unlink()
+
+    weights = model / "adapter_model.safetensors"
+    weights.write_bytes(b"mutated")
+    with pytest.raises(ValueError, match="live file does not match verified archive"):
+        verified_training_result(output_root, task="asr")
+    weights.write_bytes(b"adapter-weights")
 
     Path(archive["checksum"]).write_text(
         "0" * 64 + f"  {Path(archive['path']).name}\n", encoding="utf-8"
