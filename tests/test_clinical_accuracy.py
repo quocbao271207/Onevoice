@@ -4,9 +4,16 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
+import pytest
+import sacrebleu
 import yaml
 
-from scripts.evaluate_benchmarks import score_asr, score_mt
+from scripts.evaluate_benchmarks import (
+    _bootstrap_mt_confidence_intervals,
+    score_asr,
+    score_mt,
+)
 from src.pipeline.safety_guard import extract_quantities, negation_count, validate_translation
 from src.training.clinical_sampling import (
     clinical_risk_tags,
@@ -199,3 +206,33 @@ def test_mt_report_exposes_category_gates():
     report = score_mt([prediction])
     assert report["clinical_safety_gate"]["pass"]
     assert report["categories"]["drug_name"]["safety_failure_rate"] == 0.0
+
+
+def test_mt_bootstrap_precomputed_statistics_match_full_rescoring():
+    rows = [
+        {"hypothesis": "Take aspirin daily.", "reference": "Take aspirin daily."},
+        {"hypothesis": "No fever today.", "reference": "No fever today."},
+        {"hypothesis": "Dose is 5 mg.", "reference": "Dose is 10 mg."},
+        {"hypothesis": "Blood pressure stable.", "reference": "Blood pressure is stable."},
+    ]
+    repeats = 40
+    seed = 17
+    rng = np.random.default_rng(seed)
+    expected_bleu = []
+    expected_chrf = []
+    for _ in range(repeats):
+        sampled = [rows[index] for index in rng.integers(0, len(rows), len(rows))]
+        hypotheses = [row["hypothesis"] for row in sampled]
+        references = [row["reference"] for row in sampled]
+        expected_bleu.append(
+            sacrebleu.corpus_bleu(hypotheses, [references], tokenize="intl").score
+        )
+        expected_chrf.append(sacrebleu.corpus_chrf(hypotheses, [references]).score)
+
+    actual = _bootstrap_mt_confidence_intervals(rows, repeats=repeats, seed=seed)
+    assert actual["sacrebleu_bootstrap_95ci"] == pytest.approx(
+        [np.quantile(expected_bleu, 0.025), np.quantile(expected_bleu, 0.975)]
+    )
+    assert actual["chrf2_bootstrap_95ci"] == pytest.approx(
+        [np.quantile(expected_chrf, 0.025), np.quantile(expected_chrf, 0.975)]
+    )

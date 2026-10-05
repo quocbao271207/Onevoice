@@ -12,6 +12,7 @@ from typing import Any
 import sacrebleu
 import numpy as np
 from jiwer import cer, process_words, wer
+from sacrebleu.metrics import BLEU, CHRF
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -140,30 +141,62 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return report
 
 
-def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    def bootstrap(group: list[dict[str, Any]], repeats: int = 1000) -> dict[str, list[float]]:
-        rng = np.random.default_rng(20261005)
-        bleu_values = []
-        chrf_values = []
-        for _ in range(repeats):
-            sampled = [group[index] for index in rng.integers(0, len(group), len(group))]
-            hypotheses = [row["hypothesis"] for row in sampled]
-            references = [row["reference"] for row in sampled]
-            bleu_values.append(
-                sacrebleu.corpus_bleu(hypotheses, [references], tokenize="intl").score
-            )
-            chrf_values.append(sacrebleu.corpus_chrf(hypotheses, [references]).score)
-        return {
-            "sacrebleu_bootstrap_95ci": [
-                float(np.quantile(bleu_values, 0.025)),
-                float(np.quantile(bleu_values, 0.975)),
-            ],
-            "chrf2_bootstrap_95ci": [
-                float(np.quantile(chrf_values, 0.025)),
-                float(np.quantile(chrf_values, 0.975)),
-            ],
-        }
+def _bootstrap_mt_confidence_intervals(
+    rows: list[dict[str, Any]],
+    repeats: int = 1000,
+    seed: int = 20261005,
+) -> dict[str, list[float]]:
+    """Bootstrap corpus MT metrics without re-tokenizing every resample.
 
+    SacreBLEU corpus scores are computed from additive sentence statistics.
+    Extracting those statistics once preserves the original resampling method
+    and deterministic RNG stream while avoiding thousands of full-corpus
+    tokenization passes on locked test sets.
+    """
+    if not rows:
+        raise ValueError("MT bootstrap requires at least one prediction")
+    if repeats < 1:
+        raise ValueError("MT bootstrap repeats must be at least one")
+
+    hypotheses = [row["hypothesis"] for row in rows]
+    references = [row["reference"] for row in rows]
+    reference_streams = [references]
+    bleu_metric = BLEU(tokenize="intl")
+    chrf_metric = CHRF()
+    bleu_stats = np.asarray(
+        bleu_metric._extract_corpus_statistics(hypotheses, reference_streams),
+        dtype=np.int64,
+    )
+    chrf_stats = np.asarray(
+        chrf_metric._extract_corpus_statistics(hypotheses, reference_streams),
+        dtype=np.int64,
+    )
+
+    rng = np.random.default_rng(seed)
+    bleu_values = np.empty(repeats, dtype=np.float64)
+    chrf_values = np.empty(repeats, dtype=np.float64)
+    for repeat in range(repeats):
+        sample_indices = rng.integers(0, len(rows), len(rows))
+        bleu_values[repeat] = bleu_metric._compute_score_from_stats(
+            bleu_stats[sample_indices].sum(axis=0).tolist()
+        ).score
+        chrf_values[repeat] = chrf_metric._compute_score_from_stats(
+            chrf_stats[sample_indices].sum(axis=0).tolist()
+        ).score
+
+    return {
+        "sacrebleu_bootstrap_95ci": [
+            float(np.quantile(bleu_values, 0.025)),
+            float(np.quantile(bleu_values, 0.975)),
+        ],
+        "chrf2_bootstrap_95ci": [
+            float(np.quantile(chrf_values, 0.025)),
+            float(np.quantile(chrf_values, 0.975)),
+        ],
+    }
+
+
+def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
     def score(
         group: list[dict[str, Any]],
         relevant_issue_prefixes: set[str] | None = None,
@@ -218,7 +251,11 @@ def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "safety_failure_rate": safety_failures / max(1, len(group)),
             "safety_issue_counts": dict(issue_counts),
             "safety_failure_examples": failure_examples,
-            **(bootstrap(group) if include_confidence_interval else {}),
+            **(
+                _bootstrap_mt_confidence_intervals(group)
+                if include_confidence_interval
+                else {}
+            ),
         }
 
     by_direction: dict[str, list[dict[str, Any]]] = defaultdict(list)
