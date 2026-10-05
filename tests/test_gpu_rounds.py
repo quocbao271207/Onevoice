@@ -12,6 +12,7 @@ import yaml
 from scripts.run_gpu_rounds import (
     active_utilization_limits,
     apply_round_overrides,
+    archive_round,
     checkpoint_watcher_command,
     cli_args,
     configured_rounds,
@@ -20,6 +21,7 @@ from scripts.run_gpu_rounds import (
     utilization_throttle_reason,
     validate_resource_limits,
 )
+from scripts.candidate_evidence import verify_evidence_archive
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -241,3 +243,24 @@ def test_gpu_round_starts_checkpoint_watcher_for_the_training_pid(tmp_path: Path
     )
     assert command[-4:] == ["--watch-pid", "123", "--poll-seconds", "15.0"]
     assert Path(command[1]).name == "watch_checkpoints.py"
+
+
+def test_gpu_round_archive_has_verified_checksum_and_content_manifest(tmp_path: Path):
+    round_dir = tmp_path / "01-pilot"
+    model_dir = round_dir / "model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (round_dir / "training.log").write_text("complete\n", encoding="utf-8")
+
+    record = archive_round(round_dir)
+
+    archive = Path(record["path"])
+    manifest = verify_evidence_archive(archive)
+    assert record["sha256"] == manifest["archive_sha256"]
+    assert record["bytes"] == manifest["archive_bytes"]
+    assert Path(record["checksum"]).is_file()
+    assert Path(record["manifest"]).is_file()
+    assert {item["path"] for item in manifest["files"]} == {
+        "01-pilot/model/adapter_config.json",
+        "01-pilot/training.log",
+    }

@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
 import signal
 import subprocess
 import sys
-import tarfile
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -22,6 +20,9 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.candidate_evidence import archive_evidence, evidence_sidecars  # noqa: E402
 
 
 def validate_resource_limits(limits: dict[str, Any]) -> tuple[float, float]:
@@ -221,22 +222,15 @@ def checkpoint_watcher_command(
     ]
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(8 * 1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def archive_round(round_dir: Path) -> dict[str, Any]:
-    archive_path = round_dir.with_suffix(".tar.gz")
-    with tarfile.open(archive_path, "w:gz") as archive:
-        archive.add(round_dir, arcname=round_dir.name)
+    archive_path, digest = archive_evidence(round_dir)
+    checksum_path, manifest_path = evidence_sidecars(archive_path)
     return {
         "path": str(archive_path),
         "bytes": archive_path.stat().st_size,
-        "sha256": sha256(archive_path),
+        "sha256": digest,
+        "checksum": str(checksum_path),
+        "manifest": str(manifest_path),
     }
 
 
