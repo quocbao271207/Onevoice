@@ -35,7 +35,7 @@ License metadata được pin cùng revision trong `configs/model_bakeoff.yaml`.
 - Blind locked test v2: `data/eval/blind_test_v2.lock.json` hiện là `awaiting_unseen_data`. Không tự chế blind set từ dữ liệu model đã nhìn thấy.
 - Test/safety cũ không được mở lặp lại để chọn model.
 
-Selection dev chứa lát thuốc, liều, số, đơn vị, phủ định, thuật ngữ và code-switch. ASR còn giữ accent/role/recording-condition để báo riêng. Blind v2 chỉ được khóa khi có đủ hai chiều MT và ASR Bắc/Trung/Nam, bác sĩ/bệnh nhân và nhiễu; script từ chối ID, text fingerprint, pair fingerprint hoặc audio SHA trùng train/selection/test cũ.
+Selection dev chứa lát thuốc, liều, số, đơn vị, phủ định, thuật ngữ và code-switch. ASR còn giữ accent/role/recording-condition để báo riêng. Blind v2 chỉ được khóa khi có đủ hai chiều MT và ASR Bắc/Trung/Nam, bác sĩ/bệnh nhân và nhiễu. Script fail-closed nếu thiếu ID/fingerprint, có ID/pair/audio trùng trong chính blind set, hoặc có ID, text fingerprint, pair fingerprint hay audio SHA giao train/selection/test cũ.
 
 ## Successive halving và winner gate
 

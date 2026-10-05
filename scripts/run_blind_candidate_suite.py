@@ -49,6 +49,40 @@ def values(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> set[str]:
     return result
 
 
+def validate_identifiers(task: str, rows: list[dict[str, Any]]) -> None:
+    """Fail closed when blind rows cannot be audited for leakage or duplicates."""
+    required = (
+        ("id", "pair_fingerprint")
+        if task == "mt"
+        else ("id", "text_fingerprint", "audio_sha256")
+    )
+    unique = ("id", "pair_fingerprint") if task == "mt" else ("id", "audio_sha256")
+    for key in required:
+        missing = [
+            index + 1
+            for index, row in enumerate(rows)
+            if not str(row.get(key) or "").strip()
+        ]
+        if missing:
+            preview = ", ".join(str(index) for index in missing[:5])
+            suffix = "..." if len(missing) > 5 else ""
+            raise ValueError(
+                f"Blind {task} manifest is missing {key} on rows {preview}{suffix}"
+            )
+    for key in unique:
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for row in rows:
+            value = str(row[key]).strip()
+            if value in seen:
+                duplicates.add(value)
+            seen.add(value)
+        if duplicates:
+            raise ValueError(
+                f"Blind {task} manifest contains duplicate {key}: {len(duplicates)} values"
+            )
+
+
 def validate_required_slices(task: str, rows: list[dict[str, Any]], required: list[str]) -> None:
     observed = set()
     for row in rows:
@@ -103,6 +137,7 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         rows = read_jsonl(resolved)
         if not rows:
             raise ValueError(f"Blind {task} manifest is empty")
+        validate_identifiers(task, rows)
         ensure_unseen(task, rows, config)
         validate_required_slices(task, rows, existing["required_slices"][task])
         manifests[task] = {
