@@ -175,10 +175,14 @@ def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
         encoding="utf-8",
     )
     archive, _ = archive_evidence(output)
+    (output / "mt_candidate.log").write_text(
+        "outer wrapper wrote its terminal JSON after archive creation\n", encoding="utf-8"
+    )
 
     result = verified_candidate_result(output, task="mt", expected_adapter=adapter)
 
     assert result["return_code"] == 2
+    assert result["local_log_mismatches"] == ["mt_candidate.log"]
     state_path = tmp_path / "program_state.json"
     state = {"stage": "mt_candidate", "stages": {"mt_candidate": {"status": "running"}}}
     assert record_recovered_candidate(
@@ -191,4 +195,38 @@ def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
     checksum, _ = evidence_sidecars(archive)
     checksum.write_text("0" * 64 + f"  {archive.name}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="checksum mismatch"):
+        verified_candidate_result(output, task="mt", expected_adapter=adapter)
+
+
+def test_recovered_candidate_rejects_mutated_prediction(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    output = tmp_path / "mt-candidate"
+    output.mkdir()
+    for stem in ("mt_candidate", "mt_clinical_candidate"):
+        for suffix, content in (
+            (".json", "{}"),
+            (".log", "done\n"),
+            ("_predictions.jsonl", "{}\n"),
+            ("_predictions.jsonl.provenance.json", "{}"),
+            ("_resource_monitor.jsonl", "{}\n"),
+        ):
+            (output / f"{stem}{suffix}").write_text(content, encoding="utf-8")
+    (output / "candidate_gate.json").write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "promotion_allowed": True,
+                "adapter": str(adapter.resolve()),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    archive_evidence(output)
+    (output / "mt_candidate_predictions.jsonl").write_text(
+        '{"tampered": true}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="does not match archive"):
         verified_candidate_result(output, task="mt", expected_adapter=adapter)

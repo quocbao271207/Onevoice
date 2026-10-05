@@ -243,23 +243,29 @@ def verified_candidate_result(
                 f"{stem}_resource_monitor.jsonl",
             }
         )
+    mutable_log_mismatches = []
     for name in required_names:
         path = output_dir / name
         archive_name = f"{output_dir.name}/{name}"
         record = records.get(archive_name)
-        if (
-            record is None
-            or not path.is_file()
-            or int(record["bytes"]) != path.stat().st_size
-            or str(record["sha256"]) != sha256(path)
-        ):
+        if record is None or not path.is_file():
             raise ValueError(f"candidate evidence does not match archive: {path}")
+        matches_archive = (
+            int(record["bytes"]) == path.stat().st_size
+            and str(record["sha256"]) == sha256(path)
+        )
+        if not matches_archive:
+            if name.endswith(".log"):
+                mutable_log_mismatches.append(name)
+            else:
+                raise ValueError(f"candidate evidence does not match archive: {path}")
     return {
         "return_code": 0 if status == "pass" else 2,
         "status": status,
         "archive": str(archive_path),
         "archive_sha256": str(manifest["archive_sha256"]),
         "archive_bytes": int(manifest["archive_bytes"]),
+        "local_log_mismatches": mutable_log_mismatches,
     }
 
 
@@ -280,6 +286,7 @@ def record_recovered_candidate(
             "evidence_archive": evidence["archive"],
             "evidence_archive_sha256": evidence["archive_sha256"],
             "evidence_archive_bytes": int(evidence["archive_bytes"]),
+            "local_log_mismatches": list(evidence["local_log_mismatches"]),
         }
     )
     state["stage"] = name
