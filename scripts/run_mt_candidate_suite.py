@@ -31,6 +31,7 @@ from scripts.run_gpu_rounds import monitor_process  # noqa: E402
 
 BASE_MODEL = "facebook/nllb-200-distilled-600M"
 BASE_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
+DEFAULT_NUM_BEAMS = 1
 
 
 def validate_locked_suite(config: dict[str, Any], suite_path: Path, lock_path: Path) -> str:
@@ -174,7 +175,7 @@ def main() -> int:
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cuda")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="bf16")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-beams", type=int, default=4)
+    parser.add_argument("--num-beams", type=int, default=DEFAULT_NUM_BEAMS)
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.35)
     args = parser.parse_args()
 

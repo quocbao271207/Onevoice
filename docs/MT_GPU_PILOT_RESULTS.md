@@ -29,7 +29,7 @@ Ba archive đã được tải về `test/` ở máy local và xác minh lại S
 
 ## Hậu kiểm đã chuẩn bị
 
-`scripts/run_mt_candidate_suite.py` sẽ chạy ngay sau full-run. Script nạp adapter LoRA trên đúng NLLB revision đã pin, chấm toàn bộ `mt--test.jsonl` theo cả hai chiều, sau đó chấm riêng suite `medical_safety_mt.jsonl` đã xác minh checksum. Candidate chỉ pass khi BLEU/chrF đạt ngưỡng và đủ cả bảy slice `drug_name`, `dose`, `number`, `unit`, `negation`, `terminology`, `code_switch` với failure rate theo policy. Predictions, report, log và resource trace được đóng gói thành tar.gz kèm SHA-256 để tải về local ngay.
+`scripts/run_mt_candidate_suite.py` sẽ chạy ngay sau full-run. Script nạp adapter LoRA trên đúng NLLB revision đã pin, chấm toàn bộ `mt--test.jsonl` theo cả hai chiều bằng greedy (`num_beams=1`) đã thắng ablation validation, sau đó chấm riêng suite `medical_safety_mt.jsonl` đã xác minh checksum. Candidate chỉ pass khi BLEU/chrF đạt ngưỡng và đủ cả bảy slice `drug_name`, `dose`, `number`, `unit`, `negation`, `terminology`, `code_switch` với failure rate theo policy. Predictions, report, log và resource trace được đóng gói thành tar.gz kèm SHA-256 để tải về local ngay.
 
 ## Full-run đang chạy
 

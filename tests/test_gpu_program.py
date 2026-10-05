@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts.run_gpu_program import (
+    MT_CANDIDATE_NUM_BEAMS,
     latest_checkpoint,
     newest_complete_run,
     read_complete_run,
@@ -14,6 +15,7 @@ from scripts.run_gpu_program import (
     validation_history,
     write_state,
 )
+from scripts.run_mt_candidate_suite import DEFAULT_NUM_BEAMS
 
 
 def make_run(root: Path, *, task: str = "mt", status: str = "complete") -> Path:
@@ -33,6 +35,11 @@ def make_run(root: Path, *, task: str = "mt", status: str = "complete") -> Path:
         encoding="utf-8",
     )
     return run
+
+
+def test_mt_candidate_evaluation_uses_locked_greedy_policy():
+    assert MT_CANDIDATE_NUM_BEAMS == 1
+    assert DEFAULT_NUM_BEAMS == 1
 
 
 def test_selected_adapter_requires_completed_selected_model(tmp_path: Path):

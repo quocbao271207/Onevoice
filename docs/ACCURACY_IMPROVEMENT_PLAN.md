@@ -39,7 +39,7 @@ Các ngưỡng máy đọc được nằm ở `configs/accuracy_program.yaml`. M
 # Sau full-run: chấm adapter trên toàn bộ test khóa + toàn bộ suite lâm sàng,
 # điều tiết GPU theo policy thống nhất rolling 70% / hard 74%, rồi đóng gói report có SHA-256.
 .venv\Scripts\python.exe scripts/run_asr_candidate_suite.py --adapter gpu-runs/asr-YYYYMMDD-HHMMSS/NN-final-selected/model --device cuda --precision bf16 --batch-size 4 --num-beams 1
-.venv\Scripts\python.exe scripts/run_mt_candidate_suite.py --adapter gpu-runs/mt-YYYYMMDD-HHMMSS/01-final-r8-lr1e4-full/model --device cuda --precision bf16 --batch-size 8 --num-beams 4
+.venv\Scripts\python.exe scripts/run_mt_candidate_suite.py --adapter gpu-runs/mt-YYYYMMDD-HHMMSS/01-final-r8-lr1e4-full/model --device cuda --precision bf16 --batch-size 8 --num-beams 1
 ```
 
 CPU smoke ghi `promotion_allowed=false` trong `training_run.json`. Chỉ checkpoint full-run trên GPU, vượt locked validation/test và suite lâm sàng mới được thay đường dẫn production.

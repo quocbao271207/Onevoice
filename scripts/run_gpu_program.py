@@ -20,6 +20,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+MT_CANDIDATE_NUM_BEAMS = 1
 
 
 def utc_now() -> str:
@@ -299,7 +300,7 @@ def main() -> int:
                 "--batch-size",
                 "8",
                 "--num-beams",
-                "4",
+                str(MT_CANDIDATE_NUM_BEAMS),
             ],
             log_path=state_dir / "mt_candidate_stage.log",
             state_path=state_path,
