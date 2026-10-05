@@ -22,6 +22,7 @@ from scripts.run_model_bakeoff import (
     selection_identity,
     selection_identity_sha256,
     strongest_eligible_challenger,
+    tree_manifest,
     validate_candidate_matrix,
     validate_deployment_draft,
     validate_deployment_report,
@@ -70,6 +71,42 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
         ]
         assert required <= {category for row in rows for category in row.get("categories", [])}
         assert b"\r\n" not in (ROOT / data["data"]["selection_dev"][task]["path"]).read_bytes()
+
+
+def test_adapter_tree_manifest_uses_portable_paths(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    nested = adapter / "nested"
+    nested.mkdir(parents=True)
+    weights = nested / "weights.bin"
+    weights.write_bytes(b"weights")
+
+    manifest = tree_manifest(adapter)
+
+    assert manifest["files"] == [
+        {
+            "path": "nested/weights.bin",
+            "bytes": len(b"weights"),
+            "sha256": bakeoff.sha256(weights),
+        }
+    ]
+
+
+def test_adapter_tree_manifest_rejects_symlink_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    link = adapter / "linked.bin"
+    link.write_bytes(b"target")
+    original_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == link or original_is_symlink(path),
+    )
+
+    with pytest.raises(ValueError, match="cannot contain symlinks"):
+        tree_manifest(adapter)
 
 
 def test_bakeoff_preflight_recomputes_fingerprints_and_rejects_locked_overlap(

@@ -357,17 +357,24 @@ def wait_for_current_program(path: Path, poll_seconds: float, should_wait: bool)
 
 
 def tree_manifest(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ValueError(f"Candidate adapter root cannot be a symlink: {path}")
     if not path.is_dir():
         raise FileNotFoundError(path)
     files = []
-    for item in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
-        files.append(
-            {
-                "path": str(item.relative_to(path)),
-                "bytes": item.stat().st_size,
-                "sha256": sha256(item),
-            }
-        )
+    for item in sorted(
+        path.rglob("*"), key=lambda value: value.relative_to(path).as_posix()
+    ):
+        if item.is_symlink():
+            raise ValueError(f"Candidate adapter cannot contain symlinks: {item}")
+        if item.is_file():
+            files.append(
+                {
+                    "path": item.relative_to(path).as_posix(),
+                    "bytes": item.stat().st_size,
+                    "sha256": sha256(item),
+                }
+            )
     if not files:
         raise ValueError(f"Cannot freeze empty candidate directory: {path}")
     manifest_digest = hashlib.sha256(
