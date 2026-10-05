@@ -20,6 +20,11 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.candidate_evidence import sha256, verify_evidence_archive  # noqa: E402
+
+
 MT_CANDIDATE_NUM_BEAMS = 1
 
 
@@ -186,6 +191,102 @@ def newest_complete_run(output_root: Path, task: str) -> tuple[Path, dict[str, A
     raise FileNotFoundError(f"no complete {task} run under {output_root}")
 
 
+def resume_kind(state: dict[str, Any], mt_run: Path) -> str:
+    if Path(state.get("mt_run", "")).resolve() != mt_run:
+        raise ValueError("resume --mt-run does not match recorded state")
+    stages = state.get("stages")
+    if state.get("stage") == "waiting_for_mt" and not stages:
+        return "from_wait"
+    mt_stage = stages.get("mt_candidate") if isinstance(stages, dict) else None
+    if (
+        state.get("stage") == "mt_candidate"
+        and isinstance(mt_stage, dict)
+        and mt_stage.get("status") == "running"
+    ):
+        return "after_recovered_mt_candidate"
+    raise ValueError(
+        "automatic resume is only safe from waiting_for_mt or a verified out-of-band "
+        "mt_candidate result"
+    )
+
+
+def verified_candidate_result(
+    output_dir: Path,
+    *,
+    task: str,
+    expected_adapter: Path,
+) -> dict[str, Any]:
+    gate_path = output_dir / "candidate_gate.json"
+    if not gate_path.is_file():
+        raise FileNotFoundError(f"candidate gate is not complete: {gate_path}")
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    status = gate.get("status")
+    if status not in {"pass", "fail"} or gate.get("error") is not None:
+        raise ValueError(f"candidate gate has no valid terminal result: {gate_path}")
+    if bool(gate.get("promotion_allowed")) != (status == "pass"):
+        raise ValueError(f"candidate gate promotion flag is inconsistent: {gate_path}")
+    if Path(str(gate.get("adapter") or "")).resolve() != expected_adapter.resolve():
+        raise ValueError(f"candidate gate adapter does not match program state: {gate_path}")
+
+    archive_path = output_dir.with_suffix(".tar.gz")
+    manifest = verify_evidence_archive(archive_path)
+    records = {str(item["path"]): item for item in manifest["files"]}
+    stems = (f"{task}_candidate", f"{task}_clinical_candidate")
+    required_names = {"candidate_gate.json"}
+    for stem in stems:
+        required_names.update(
+            {
+                f"{stem}.json",
+                f"{stem}.log",
+                f"{stem}_predictions.jsonl",
+                f"{stem}_predictions.jsonl.provenance.json",
+                f"{stem}_resource_monitor.jsonl",
+            }
+        )
+    for name in required_names:
+        path = output_dir / name
+        archive_name = f"{output_dir.name}/{name}"
+        record = records.get(archive_name)
+        if (
+            record is None
+            or not path.is_file()
+            or int(record["bytes"]) != path.stat().st_size
+            or str(record["sha256"]) != sha256(path)
+        ):
+            raise ValueError(f"candidate evidence does not match archive: {path}")
+    return {
+        "return_code": 0 if status == "pass" else 2,
+        "status": status,
+        "archive": str(archive_path),
+        "archive_sha256": str(manifest["archive_sha256"]),
+        "archive_bytes": int(manifest["archive_bytes"]),
+    }
+
+
+def record_recovered_candidate(
+    *,
+    name: str,
+    evidence: dict[str, Any],
+    state_path: Path,
+    state: dict[str, Any],
+) -> int:
+    stage = state["stages"][name]
+    stage.update(
+        {
+            "status": "complete",
+            "completed_at": utc_now(),
+            "return_code": int(evidence["return_code"]),
+            "recovered_out_of_band": True,
+            "evidence_archive": evidence["archive"],
+            "evidence_archive_sha256": evidence["archive_sha256"],
+            "evidence_archive_bytes": int(evidence["archive_bytes"]),
+        }
+    )
+    state["stage"] = name
+    write_state(state_path, state)
+    return int(evidence["return_code"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -196,7 +297,10 @@ def main() -> int:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume only a previously recorded waiting_for_mt state.",
+        help=(
+            "Resume a recorded waiting_for_mt state, or reconcile a completed out-of-band "
+            "MT candidate bundle before continuing with ASR."
+        ),
     )
     args = parser.parse_args()
 
@@ -208,14 +312,22 @@ def main() -> int:
     state_dir = args.state_dir.resolve()
     mt_run = args.mt_run.resolve()
     state_path = state_dir / "program_state.json"
+    resume_from = "new"
+    recovered_mt: dict[str, Any] | None = None
     if args.resume:
         if not state_path.is_file():
             raise FileNotFoundError(f"cannot resume without {state_path}")
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if Path(state.get("mt_run", "")).resolve() != mt_run:
-            raise ValueError("resume --mt-run does not match recorded state")
-        if state.get("stage") != "waiting_for_mt" or state.get("stages"):
-            raise ValueError("automatic resume is only safe from an idle waiting_for_mt state")
+        resume_from = resume_kind(state, mt_run)
+        if resume_from == "after_recovered_mt_candidate":
+            mt_adapter = Path(str(state.get("mt_adapter") or "")).resolve()
+            if not (mt_adapter / "adapter_config.json").is_file():
+                raise FileNotFoundError(f"recorded MT adapter is incomplete: {mt_adapter}")
+            recovered_mt = verified_candidate_result(
+                state_dir / "mt-candidate",
+                task="mt",
+                expected_adapter=mt_adapter,
+            )
         state["execution_status"] = "running"
         state.pop("error", None)
     else:
@@ -234,79 +346,90 @@ def main() -> int:
     write_state(state_path, state)
 
     try:
-        if args.wait_pid is not None:
-            wait_for_process(args.wait_pid, args.poll_seconds, state_path, state)
-
-        mt_summary = read_complete_run(mt_run, "mt")
-        mt_adapter = selected_adapter(mt_run, mt_summary)
-        resume_checkpoint = latest_checkpoint(mt_adapter)
-        extend_mt, extension_evidence = should_extend_mt(
-            validation_history(resume_checkpoint)
-        )
-        state["mt_extension_decision"] = {
-            "extend": extend_mt,
-            "evidence_checkpoint": str(resume_checkpoint),
-            "initial_adapter": str(mt_adapter),
-            **extension_evidence,
-        }
-        if extend_mt:
-            extension_output_root = state_dir / "mt-extension-runs"
-            extension_output_root.mkdir()
-            run_stage(
-                name="mt_validation_extension",
-                command=[
-                    args.python,
-                    str(ROOT / "scripts" / "run_gpu_rounds.py"),
-                    "--task",
-                    "mt",
-                    "--config",
-                    str(ROOT / "configs" / "gpu_rounds.yaml"),
-                    "--output-root",
-                    str(extension_output_root),
-                    "--round-name",
-                    "final-r8-lr1e4-full",
-                    "--initial-adapter",
-                    str(mt_adapter),
-                    "--epochs",
-                    "2",
-                    "--learning-rate",
-                    "5e-5",
-                ],
-                log_path=state_dir / "mt_validation_extension_stage.log",
+        if resume_from == "after_recovered_mt_candidate":
+            assert recovered_mt is not None
+            mt_gate_code = record_recovered_candidate(
+                name="mt_candidate",
+                evidence=recovered_mt,
                 state_path=state_path,
                 state=state,
-                accepted_codes={0},
             )
-            extension_run, extension_summary = newest_complete_run(extension_output_root, "mt")
-            mt_adapter = selected_adapter(extension_run, extension_summary)
-            state["mt_extension_run"] = str(extension_run)
-        state["mt_adapter"] = str(mt_adapter)
-        write_state(state_path, state)
+        else:
+            if args.wait_pid is not None:
+                wait_for_process(args.wait_pid, args.poll_seconds, state_path, state)
 
-        mt_candidate_dir = state_dir / "mt-candidate"
-        mt_gate_code = run_stage(
-            name="mt_candidate",
-            command=[
-                args.python,
-                str(ROOT / "scripts" / "run_mt_candidate_suite.py"),
-                "--adapter",
-                str(mt_adapter),
-                "--output-dir",
-                str(mt_candidate_dir),
-                "--device",
-                "cuda",
-                "--precision",
-                "bf16",
-                "--batch-size",
-                "8",
-                "--num-beams",
-                str(MT_CANDIDATE_NUM_BEAMS),
-            ],
-            log_path=state_dir / "mt_candidate_stage.log",
-            state_path=state_path,
-            state=state,
-            accepted_codes={0, 2},
-        )
+            mt_summary = read_complete_run(mt_run, "mt")
+            mt_adapter = selected_adapter(mt_run, mt_summary)
+            resume_checkpoint = latest_checkpoint(mt_adapter)
+            extend_mt, extension_evidence = should_extend_mt(
+                validation_history(resume_checkpoint)
+            )
+            state["mt_extension_decision"] = {
+                "extend": extend_mt,
+                "evidence_checkpoint": str(resume_checkpoint),
+                "initial_adapter": str(mt_adapter),
+                **extension_evidence,
+            }
+            if extend_mt:
+                extension_output_root = state_dir / "mt-extension-runs"
+                extension_output_root.mkdir()
+                run_stage(
+                    name="mt_validation_extension",
+                    command=[
+                        args.python,
+                        str(ROOT / "scripts" / "run_gpu_rounds.py"),
+                        "--task",
+                        "mt",
+                        "--config",
+                        str(ROOT / "configs" / "gpu_rounds.yaml"),
+                        "--output-root",
+                        str(extension_output_root),
+                        "--round-name",
+                        "final-r8-lr1e4-full",
+                        "--initial-adapter",
+                        str(mt_adapter),
+                        "--epochs",
+                        "2",
+                        "--learning-rate",
+                        "5e-5",
+                    ],
+                    log_path=state_dir / "mt_validation_extension_stage.log",
+                    state_path=state_path,
+                    state=state,
+                    accepted_codes={0},
+                )
+                extension_run, extension_summary = newest_complete_run(
+                    extension_output_root, "mt"
+                )
+                mt_adapter = selected_adapter(extension_run, extension_summary)
+                state["mt_extension_run"] = str(extension_run)
+            state["mt_adapter"] = str(mt_adapter)
+            write_state(state_path, state)
+
+            mt_candidate_dir = state_dir / "mt-candidate"
+            mt_gate_code = run_stage(
+                name="mt_candidate",
+                command=[
+                    args.python,
+                    str(ROOT / "scripts" / "run_mt_candidate_suite.py"),
+                    "--adapter",
+                    str(mt_adapter),
+                    "--output-dir",
+                    str(mt_candidate_dir),
+                    "--device",
+                    "cuda",
+                    "--precision",
+                    "bf16",
+                    "--batch-size",
+                    "8",
+                    "--num-beams",
+                    str(MT_CANDIDATE_NUM_BEAMS),
+                ],
+                log_path=state_dir / "mt_candidate_stage.log",
+                state_path=state_path,
+                state=state,
+                accepted_codes={0, 2},
+            )
 
         asr_output_root = state_dir / "asr-runs"
         asr_output_root.mkdir()

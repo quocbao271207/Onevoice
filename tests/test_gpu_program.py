@@ -9,12 +9,16 @@ from scripts.run_gpu_program import (
     latest_checkpoint,
     newest_complete_run,
     read_complete_run,
+    record_recovered_candidate,
+    resume_kind,
     run_stage,
     selected_adapter,
     should_extend_mt,
     validation_history,
+    verified_candidate_result,
     write_state,
 )
+from scripts.candidate_evidence import archive_evidence, evidence_sidecars
 from scripts.run_mt_candidate_suite import DEFAULT_NUM_BEAMS
 
 
@@ -117,3 +121,74 @@ def test_mt_extension_stops_on_validation_plateau():
     )
     assert extend is False
     assert evidence["reason"] == "validation_plateau_or_regression"
+
+
+def test_resume_kind_accepts_only_idle_wait_or_running_mt_candidate(tmp_path: Path):
+    mt_run = tmp_path / "mt-run"
+    assert resume_kind(
+        {"mt_run": str(mt_run), "stage": "waiting_for_mt", "stages": {}}, mt_run
+    ) == "from_wait"
+    assert resume_kind(
+        {
+            "mt_run": str(mt_run),
+            "stage": "mt_candidate",
+            "stages": {"mt_candidate": {"status": "running"}},
+        },
+        mt_run,
+    ) == "after_recovered_mt_candidate"
+    with pytest.raises(ValueError, match="only safe"):
+        resume_kind(
+            {
+                "mt_run": str(mt_run),
+                "stage": "mt_candidate",
+                "stages": {"mt_candidate": {"status": "error"}},
+            },
+            mt_run,
+        )
+
+
+def test_recovered_candidate_requires_verified_complete_bundle(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    output = tmp_path / "mt-candidate"
+    output.mkdir()
+    for stem in ("mt_candidate", "mt_clinical_candidate"):
+        (output / f"{stem}.json").write_text("{}", encoding="utf-8")
+        (output / f"{stem}.log").write_text("done\n", encoding="utf-8")
+        (output / f"{stem}_predictions.jsonl").write_text("{}\n", encoding="utf-8")
+        (output / f"{stem}_predictions.jsonl.provenance.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (output / f"{stem}_resource_monitor.jsonl").write_text(
+            "{}\n", encoding="utf-8"
+        )
+    (output / "candidate_gate.json").write_text(
+        json.dumps(
+            {
+                "status": "fail",
+                "promotion_allowed": False,
+                "adapter": str(adapter.resolve()),
+                "error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    archive, _ = archive_evidence(output)
+
+    result = verified_candidate_result(output, task="mt", expected_adapter=adapter)
+
+    assert result["return_code"] == 2
+    state_path = tmp_path / "program_state.json"
+    state = {"stage": "mt_candidate", "stages": {"mt_candidate": {"status": "running"}}}
+    assert record_recovered_candidate(
+        name="mt_candidate", evidence=result, state_path=state_path, state=state
+    ) == 2
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["stages"]["mt_candidate"]["status"] == "complete"
+    assert persisted["stages"]["mt_candidate"]["recovered_out_of_band"] is True
+
+    checksum, _ = evidence_sidecars(archive)
+    checksum.write_text("0" * 64 + f"  {archive.name}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        verified_candidate_result(output, task="mt", expected_adapter=adapter)
