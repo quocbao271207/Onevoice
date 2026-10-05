@@ -54,6 +54,7 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
             if line
         ]
         assert required <= {category for row in rows for category in row.get("categories", [])}
+        assert b"\r\n" not in (ROOT / data["data"]["selection_dev"][task]["path"]).read_bytes()
 
 
 def test_vinai_license_fails_closed_before_gpu():

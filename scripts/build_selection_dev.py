@@ -208,10 +208,12 @@ def ensure_no_test_overlap(
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows),
-        encoding="utf-8",
-    )
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows
+            )
+        )
 
 
 def main() -> int:

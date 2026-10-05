@@ -38,9 +38,9 @@ evaluation:
   medical_safety_mt: data/eval/medical_safety_mt.jsonl
   medical_safety_mt_sha256: 68493af1858de00caa37b0e3f125e61cdba8618337520295316aef2be34ef408
   mt_selection_dev: data/eval/mt_selection_dev.jsonl
-  mt_selection_dev_sha256: 309ab49d678994807d7816f549c3014d1564ce33e55b1893cb8ec68a93d01232
+  mt_selection_dev_sha256: a073b05299128ed3131c8eb674c17e1b44e9d25ae1166c6b59feba5622d49f6c
   asr_selection_dev: data/eval/asr_selection_dev.jsonl
-  asr_selection_dev_sha256: 4225e2294b418509e7aba45529852dcc234d612b9da040595fa3ee43e296fd95
+  asr_selection_dev_sha256: c7ecfe79d9bdf00362b4d080b9e857fefca5c17326e1eb9885e4921d4bae018c
   blind_test_v2_lock: data/eval/blind_test_v2.lock.json
   blind_test_v2_status: awaiting_unseen_data
   rule: "Locked safety evaluation only; never train or select checkpoints on this suite."

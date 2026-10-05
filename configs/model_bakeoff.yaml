@@ -32,10 +32,10 @@ data:
   selection_dev:
     mt:
       path: data/eval/mt_selection_dev.jsonl
-      sha256: 309ab49d678994807d7816f549c3014d1564ce33e55b1893cb8ec68a93d01232
+      sha256: a073b05299128ed3131c8eb674c17e1b44e9d25ae1166c6b59feba5622d49f6c
     asr:
       path: data/eval/asr_selection_dev.jsonl
-      sha256: 4225e2294b418509e7aba45529852dcc234d612b9da040595fa3ee43e296fd95
+      sha256: c7ecfe79d9bdf00362b4d080b9e857fefca5c17326e1eb9885e4921d4bae018c
   blind_test_v2_lock: data/eval/blind_test_v2.lock.json
   forbidden_selection_inputs:
     - data/processed/manifests/mt--test.jsonl
