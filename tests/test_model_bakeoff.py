@@ -11,6 +11,7 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
+    completed_adapter,
     critical_safety_pass,
     deployment_expectations,
     interval_stronger,
@@ -28,6 +29,7 @@ from scripts.run_model_bakeoff import (
     validate_selection_artifacts,
     write_runtime_round_config,
 )
+from scripts.run_gpu_rounds import archive_round
 from src.pipeline.selection_policy import selection_policy_record
 
 
@@ -632,6 +634,42 @@ def test_m2m100_runtime_round_builds_a_dry_run_command(tmp_path: Path):
     assert command[command.index("--model-family") + 1] == "m2m100"
     assert command[command.index("--direction") + 1] == "en_to_vi"
     assert command[command.index("--max-steps") + 1] == "400"
+
+
+def test_completed_bakeoff_adapter_requires_verified_round_bundle(tmp_path: Path):
+    output_root = tmp_path / "training"
+    run = output_root / "mt-20261006-000000"
+    round_dir = run / "01-full"
+    adapter = round_dir / "model"
+    adapter.mkdir(parents=True)
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    weights = adapter / "adapter_model.safetensors"
+    weights.write_bytes(b"verified-weights")
+    archive = archive_round(round_dir)
+    (run / "summary.json").write_text(
+        json.dumps(
+            {
+                "task": "mt",
+                "status": "complete",
+                "selected_round": "full",
+                "rounds": [
+                    {
+                        "name": "full",
+                        "status": "complete",
+                        "metric": 1.0,
+                        "archive": archive,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert completed_adapter(output_root, "mt") == adapter
+
+    weights.write_bytes(b"mutated-after-archive")
+    with pytest.raises(ValueError, match="live file does not match verified archive"):
+        completed_adapter(output_root, "mt")
 
 
 def test_legacy_rescore_is_explicitly_not_vinai_evidence():

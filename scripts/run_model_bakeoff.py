@@ -28,6 +28,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from scripts.run_gpu_program import verified_training_result  # noqa: E402
 from scripts.run_gpu_rounds import validate_resource_limits  # noqa: E402
 from src.data.quality import fingerprint_text  # noqa: E402
 from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
@@ -901,12 +902,11 @@ def completed_adapter(output_root: Path, task: str) -> Path:
             complete.append((run, summary))
     if len(complete) != 1:
         raise ValueError(f"Expected one complete {task} run under {output_root}, found {len(complete)}")
-    run, summary = complete[0]
-    selected = str(summary["selected_round"])
-    matches = list(run.glob(f"[0-9][0-9]-{selected}/model"))
-    if len(matches) != 1 or not (matches[0] / "adapter_config.json").is_file():
-        raise FileNotFoundError(f"Completed adapter missing under {run}")
-    return matches[0]
+    run, _ = complete[0]
+    evidence = verified_training_result(output_root, task=task)
+    if Path(evidence["run_root"]).resolve() != run.resolve():
+        raise ValueError(f"Verified training evidence selected an unexpected run: {run}")
+    return Path(evidence["adapter"])
 
 
 def train_unit(
