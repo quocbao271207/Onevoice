@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import scripts.run_model_bakeoff as bakeoff
 from scripts.run_model_bakeoff import (
     critical_safety_pass,
     interval_stronger,
@@ -87,11 +88,49 @@ def test_promotion_gate_requires_every_critical_slice_and_zero_failures():
     assert passed is False
     assert failures == ["dose:nonzero"]
 
+    report["categories"]["dose"]["safety_failure_rate"] = float("nan")
+    assert critical_safety_pass(report, required) == (False, ["dose:invalid"])
+
 
 def test_stronger_requires_non_overlapping_confidence_intervals():
     assert interval_stronger([47.0, 49.0], [43.0, 46.0], greater_is_better=True)
     assert not interval_stronger([45.5, 47.0], [44.0, 46.0], greater_is_better=True)
     assert interval_stronger([0.15, 0.17], [0.18, 0.21], greater_is_better=False)
+
+
+@pytest.mark.parametrize(
+    ("challenger", "baseline"),
+    [
+        (None, [1.0, 2.0]),
+        ([2.0, 1.0], [3.0, 4.0]),
+        ([float("nan"), 2.0], [3.0, 4.0]),
+        ([1.0], [3.0, 4.0]),
+    ],
+)
+def test_stronger_rejects_invalid_confidence_intervals(challenger, baseline):
+    assert not interval_stronger(challenger, baseline, greater_is_better=True)
+
+
+def test_selection_score_fails_closed_without_valid_metric_and_interval():
+    report = {
+        "directions": {
+            "en_to_vi": {
+                "chrf2": float("nan"),
+                "chrf2_bootstrap_95ci": [2, 1],
+            }
+        },
+        "categories": {"dose": {"samples": 1, "safety_failure_rate": 0.0}},
+    }
+    score = report_score(report, "mt", "en_to_vi", ["dose"])
+    assert score["safety_pass"] is False
+    assert score["clinical_safety_pass"] is True
+    assert score["evidence_valid"] is False
+    assert score["metric"] is None
+    assert score["confidence_interval_95"] is None
+    assert score["safety_failures"] == [
+        "chrf2:missing_or_invalid",
+        "chrf2_bootstrap_95ci:missing_or_invalid",
+    ]
 
 
 def test_asr_selection_rejects_bad_code_switch_wer():
@@ -106,7 +145,61 @@ def test_asr_selection_rejects_bad_code_switch_wer():
     }
     score = report_score(report, "asr", None, required)
     assert score["safety_pass"] is False
+    assert score["clinical_safety_pass"] is False
+    assert score["evidence_valid"] is True
     assert "code_switch_wer:above_policy" in score["safety_failures"]
+
+    report["slices"]["code_switch"]["True"]["wer"] = float("nan")
+    score = report_score(report, "asr", None, required)
+    assert "code_switch_wer:missing_or_invalid" in score["safety_failures"]
+
+
+def test_candidate_a_mt_is_benchmarked_per_direction(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def fake_benchmark_unit(**kwargs):
+        direction = kwargs["direction"]
+        calls.append((kwargs["label"], direction))
+        return {
+            "directions": {
+                direction: {
+                    "chrf2": 50.0,
+                    "chrf2_bootstrap_95ci": [49.0, 51.0],
+                }
+            },
+            "categories": {"dose": {"samples": 1, "safety_failure_rate": 0.0}},
+        }
+
+    monkeypatch.setattr(bakeoff, "benchmark_unit", fake_benchmark_unit)
+    data = {
+        "candidates": {
+            "mt": [
+                {
+                    "id": "candidate-a",
+                    "role": "candidate_a",
+                    "directions": ["en_to_vi", "vi_to_en"],
+                }
+            ]
+        },
+        "promotion_gate": {"critical_slices": ["dose"], "policy_slices": []},
+        "successive_halving": {"semifinal": {"keep": 2}},
+    }
+    result = bakeoff.run_task_bakeoff(
+        task="mt",
+        config=data,
+        research_approvals=set(),
+        frozen={"adapters": {"mt": {"root": str(tmp_path)}}},
+        python=sys.executable,
+        state_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        state={"stages": {}},
+    )
+    assert calls == [
+        ("candidate_a_frozen_en_to_vi", "en_to_vi"),
+        ("candidate_a_frozen_vi_to_en", "vi_to_en"),
+    ]
+    assert result["winners"]["en_to_vi"]["decision"] == "candidate_a_retained"
+    assert result["winners"]["vi_to_en"]["decision"] == "candidate_a_retained"
 
 
 def test_resume_skips_identical_completed_stage_and_rejects_changed_command(tmp_path: Path):

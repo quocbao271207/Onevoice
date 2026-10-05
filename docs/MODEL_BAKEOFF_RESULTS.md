@@ -50,6 +50,8 @@ Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling u
 
 So sánh theo effective train samples, không theo thời gian. Safety là hard gate: thuốc/liều/số/đơn vị/phủ định phải 0 failure; terminology và code-switch cũng có policy riêng. Sau safety, MT dùng BLEU/chrF2 theo chiều với bootstrap 95% CI; ASR dùng WER/CER/code-switch WER và 95% CI. Chỉ thay Candidate A khi khoảng tin cậy chứng minh challenger tốt hơn.
 
+Candidate A MT cũng được benchmark độc lập theo từng chiều; lỗi an toàn hoặc khoảng tin cậy của EN→VI không được làm thay đổi quyết định VI→EN và ngược lại. Metric hay bootstrap 95% CI thiếu, không hữu hạn hoặc đảo cận đều bị loại fail-closed trước ranking.
+
 ## Chứng cứ cũ đã sửa
 
 `data/reports/experiments/decoding/mt_val_greedy_rescored.json` dùng prediction của NLLB greedy. File đã được gắn `model=facebook/nllb-200-distilled-600M` và `evidence_status=invalid_for_model_comparison`; không còn là bằng chứng VinAI Translate. NLLB greedy/beam gốc vẫn hợp lệ vì có prediction, model ID và revision rõ ràng.

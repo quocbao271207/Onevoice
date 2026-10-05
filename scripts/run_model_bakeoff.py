@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import time
@@ -191,25 +192,54 @@ def critical_safety_pass(report: dict[str, Any], required: list[str]) -> tuple[b
     failures = []
     for name in required:
         record = categories.get(name)
-        if not record or int(record.get("samples", 0)) < 1:
+        try:
+            samples = int(record.get("samples", 0)) if record else 0
+        except (TypeError, ValueError):
+            samples = 0
+        if not record or samples < 1:
             failures.append(f"{name}:missing")
-        elif float(record.get("safety_failure_rate", 1.0)) != 0.0:
+            continue
+        try:
+            failure_rate = float(record.get("safety_failure_rate", 1.0))
+        except (TypeError, ValueError):
+            failure_rate = math.nan
+        if not math.isfinite(failure_rate):
+            failures.append(f"{name}:invalid")
+        elif failure_rate != 0.0:
             failures.append(f"{name}:nonzero")
     return not failures, failures
 
 
+def normalized_interval(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        lower, upper = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(lower) or not math.isfinite(upper) or lower > upper:
+        return None
+    return lower, upper
+
+
 def interval_stronger(
-    challenger: list[float], baseline: list[float], *, greater_is_better: bool
+    challenger: Any, baseline: Any, *, greater_is_better: bool
 ) -> bool:
-    if len(challenger) != 2 or len(baseline) != 2:
+    challenger_bounds = normalized_interval(challenger)
+    baseline_bounds = normalized_interval(baseline)
+    if challenger_bounds is None or baseline_bounds is None:
         return False
     if greater_is_better:
-        return float(challenger[0]) > float(baseline[1])
-    return float(challenger[1]) < float(baseline[0])
+        return challenger_bounds[0] > baseline_bounds[1]
+    return challenger_bounds[1] < baseline_bounds[0]
 
 
-def intervals_overlap(left: list[float], right: list[float]) -> bool:
-    return max(float(left[0]), float(right[0])) <= min(float(left[1]), float(right[1]))
+def intervals_overlap(left: Any, right: Any) -> bool:
+    left_bounds = normalized_interval(left)
+    right_bounds = normalized_interval(right)
+    if left_bounds is None or right_bounds is None:
+        return False
+    return max(left_bounds[0], right_bounds[0]) <= min(left_bounds[1], right_bounds[1])
 
 
 def run_stage(
@@ -526,15 +556,43 @@ def report_score(
         if code_switch is None:
             safety_pass = False
             failures.append("code_switch_wer:missing")
-        elif float(code_switch.get("wer", 1.0)) > 0.21:
-            safety_pass = False
-            failures.append("code_switch_wer:above_policy")
+        else:
+            try:
+                code_switch_wer = float(code_switch.get("wer", 1.0))
+            except (TypeError, ValueError):
+                code_switch_wer = math.nan
+            if not math.isfinite(code_switch_wer):
+                safety_pass = False
+                failures.append("code_switch_wer:missing_or_invalid")
+            elif code_switch_wer > 0.21:
+                safety_pass = False
+                failures.append("code_switch_wer:above_policy")
+
+    clinical_safety_pass = safety_pass
+    metric_value = None
+    try:
+        if metric is not None:
+            candidate_metric = float(metric)
+            if math.isfinite(candidate_metric):
+                metric_value = candidate_metric
+    except (TypeError, ValueError):
+        pass
+    interval_value = normalized_interval(interval)
+    if metric_value is None:
+        safety_pass = False
+        failures.append(f"{metric_name}:missing_or_invalid")
+    if interval_value is None:
+        failures.append(f"{metric_name}_bootstrap_95ci:missing_or_invalid")
+    evidence_valid = metric_value is not None and interval_value is not None
+    safety_pass = clinical_safety_pass and evidence_valid
     return {
         "metric_name": metric_name,
-        "metric": float(metric) if metric is not None else None,
-        "confidence_interval_95": interval,
+        "metric": metric_value,
+        "confidence_interval_95": list(interval_value) if interval_value else None,
         "greater_is_better": greater_is_better,
         "safety_pass": safety_pass,
+        "clinical_safety_pass": clinical_safety_pass,
+        "evidence_valid": evidence_valid,
         "safety_failures": failures,
         "report": report,
     }
@@ -570,18 +628,22 @@ def run_task_bakeoff(
     candidate_a = deepcopy(candidate_a)
     candidate_a["unit_id"] = candidate_a["id"]
     candidate_a_adapter = Path(frozen["adapters"][task]["root"])
-    candidate_a_report = benchmark_unit(
-        unit=candidate_a,
-        task=task,
-        label="candidate_a_frozen",
-        adapter=candidate_a_adapter,
-        config=config,
-        python=python,
-        state_dir=state_dir,
-        state_path=state_path,
-        state=state,
-        direction="joint" if task == "mt" else None,
-    )
+    candidate_a_directions = ["en_to_vi", "vi_to_en"] if task == "mt" else [None]
+    candidate_a_reports = {}
+    for direction in candidate_a_directions:
+        key = direction or "vi"
+        candidate_a_reports[key] = benchmark_unit(
+            unit=candidate_a,
+            task=task,
+            label=f"candidate_a_frozen_{key}",
+            adapter=candidate_a_adapter,
+            config=config,
+            python=python,
+            state_dir=state_dir,
+            state_path=state_path,
+            state=state,
+            direction=direction,
+        )
 
     units = []
     excluded = []
@@ -731,13 +793,23 @@ def run_task_bakeoff(
     directions = ["en_to_vi", "vi_to_en"] if task == "mt" else [None]
     winners = {}
     for direction in directions:
-        baseline_score = report_score(candidate_a_report, task, direction, required)
+        baseline_score = report_score(
+            candidate_a_reports[direction or "vi"], task, direction, required
+        )
         challengers = [
             entry
             for entry in full
             if task != "mt" or entry["candidate"].get("direction") == direction
         ]
         ranked = rank_scores(challengers)
+        if not baseline_score["evidence_valid"]:
+            raise ValueError(
+                f"Candidate A evidence is invalid for {task}/{direction or 'vi'}"
+            )
+        if not baseline_score["clinical_safety_pass"] and not ranked:
+            raise RuntimeError(
+                f"No safety-eligible winner for {task}/{direction or 'vi'}"
+            )
         winner = {
             "candidate_id": candidate_a["id"],
             "adapter": str(candidate_a_adapter),
@@ -749,7 +821,7 @@ def run_task_bakeoff(
             challenger = ranked[0]
             challenger_score = challenger["score"]
             stronger = (
-                not baseline_score["safety_pass"]
+                not baseline_score["clinical_safety_pass"]
                 or interval_stronger(
                     challenger_score["confidence_interval_95"],
                     baseline_score["confidence_interval_95"],
@@ -762,7 +834,11 @@ def run_task_bakeoff(
                     "adapter": challenger["adapter"],
                     "direction": direction,
                     "score": challenger_score,
-                    "decision": "challenger_stronger_beyond_95ci",
+                    "decision": (
+                        "challenger_selected_after_candidate_a_safety_failure"
+                        if not baseline_score["clinical_safety_pass"]
+                        else "challenger_stronger_beyond_95ci"
+                    ),
                 }
         winners[direction or "vi"] = winner
     return {
