@@ -14,6 +14,7 @@ from scripts.run_model_bakeoff import (
     deployment_expectations,
     interval_stronger,
     license_gate,
+    multi_metric_stronger,
     report_score,
     run_stage,
     validate_candidate_matrix,
@@ -58,6 +59,18 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
         ]
         assert required <= {category for row in rows for category in row.get("categories", [])}
         assert b"\r\n" not in (ROOT / data["data"]["selection_dev"][task]["path"]).read_bytes()
+
+
+def test_bakeoff_metric_policy_rejects_duplicates_and_invalid_code_switch_limit():
+    data = config()
+    data["promotion_gate"]["mt_metrics"].append("chrf2")
+    with pytest.raises(ValueError, match="mt_metrics"):
+        validate_resources(data)
+
+    data = config()
+    data["promotion_gate"]["asr_code_switch_wer_max"] = float("nan")
+    with pytest.raises(ValueError, match="code-switch WER limit"):
+        validate_resources(data)
 
 
 def test_vinai_license_fails_closed_before_gpu():
@@ -117,6 +130,8 @@ def test_selection_score_fails_closed_without_valid_metric_and_interval():
     report = {
         "directions": {
             "en_to_vi": {
+                "sacrebleu": 30.0,
+                "sacrebleu_bootstrap_95ci": [29.0, 31.0],
                 "chrf2": float("nan"),
                 "chrf2_bootstrap_95ci": [2, 1],
             }
@@ -139,6 +154,7 @@ def test_asr_selection_rejects_bad_code_switch_wer():
     required = ["drug_name", "dose", "number", "unit", "negation", "terminology", "code_switch"]
     report = {
         "wer": 0.15,
+        "cer": 0.10,
         "wer_bootstrap_95ci": [0.14, 0.16],
         "categories": {
             name: {"samples": 1, "safety_failure_rate": 0.0} for name in required
@@ -165,6 +181,8 @@ def test_candidate_a_mt_is_benchmarked_per_direction(monkeypatch, tmp_path: Path
         return {
             "directions": {
                 direction: {
+                    "sacrebleu": 30.0,
+                    "sacrebleu_bootstrap_95ci": [29.0, 31.0],
                     "chrf2": 50.0,
                     "chrf2_bootstrap_95ci": [49.0, 51.0],
                 }
@@ -202,6 +220,52 @@ def test_candidate_a_mt_is_benchmarked_per_direction(monkeypatch, tmp_path: Path
     ]
     assert result["winners"]["en_to_vi"]["decision"] == "candidate_a_retained"
     assert result["winners"]["vi_to_en"]["decision"] == "candidate_a_retained"
+
+
+def test_mt_multi_metric_winner_rejects_significant_bleu_regression():
+    required = ["dose"]
+
+    def score(sacrebleu, bleu_ci, chrf2, chrf_ci):
+        return report_score(
+            {
+                "directions": {
+                    "en_to_vi": {
+                        "sacrebleu": sacrebleu,
+                        "sacrebleu_bootstrap_95ci": bleu_ci,
+                        "chrf2": chrf2,
+                        "chrf2_bootstrap_95ci": chrf_ci,
+                    }
+                },
+                "categories": {"dose": {"samples": 1, "safety_failure_rate": 0.0}},
+            },
+            "mt",
+            "en_to_vi",
+            required,
+        )
+
+    baseline = score(31.0, [30.0, 32.0], 50.0, [49.0, 51.0])
+    bleu_regression = score(26.0, [25.0, 27.0], 54.0, [53.0, 55.0])
+    pareto_improvement = score(33.0, [32.1, 34.0], 54.0, [53.0, 55.0])
+
+    assert multi_metric_stronger(bleu_regression, baseline) is False
+    assert multi_metric_stronger(pareto_improvement, baseline) is True
+
+
+def test_asr_selection_requires_cer_evidence():
+    required = ["code_switch"]
+    report = {
+        "wer": 0.15,
+        "wer_bootstrap_95ci": [0.14, 0.16],
+        "categories": {"code_switch": {"samples": 1, "safety_failure_rate": 0.0}},
+        "slices": {"code_switch": {"True": {"wer": 0.18}}},
+    }
+
+    score = report_score(report, "asr", None, required)
+
+    assert score["evidence_valid"] is False
+    assert score["safety_pass"] is False
+    assert "cer:missing_or_invalid" in score["safety_failures"]
+    assert score["metrics"]["code_switch_wer"]["value"] == 0.18
 
 
 def test_resume_skips_identical_completed_stage_and_rejects_changed_command(tmp_path: Path):

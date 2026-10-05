@@ -96,6 +96,21 @@ def validate_resources(config: dict[str, Any]) -> None:
         or deployment_min_runs < 1
     ):
         raise ValueError("Deployment benchmark requires a positive integer run count")
+    expected_metrics = {
+        "mt_metrics": {"sacrebleu", "chrf2"},
+        "asr_metrics": {"wer", "cer", "code_switch_wer"},
+    }
+    for key, expected in expected_metrics.items():
+        configured = config["promotion_gate"].get(key)
+        if (
+            not isinstance(configured, list)
+            or len(configured) != len(expected)
+            or set(configured) != expected
+        ):
+            raise ValueError(f"Promotion gate {key} must contain exactly {sorted(expected)}")
+    code_switch_limit = float(config["promotion_gate"].get("asr_code_switch_wer_max", math.nan))
+    if not math.isfinite(code_switch_limit) or not 0.0 <= code_switch_limit <= 1.0:
+        raise ValueError("ASR code-switch WER limit must be finite and in [0, 1]")
 
 
 def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
@@ -436,12 +451,39 @@ def interval_stronger(
     return challenger_bounds[1] < baseline_bounds[0]
 
 
-def intervals_overlap(left: Any, right: Any) -> bool:
-    left_bounds = normalized_interval(left)
-    right_bounds = normalized_interval(right)
-    if left_bounds is None or right_bounds is None:
+def multi_metric_stronger(
+    challenger: dict[str, Any], baseline: dict[str, Any]
+) -> bool:
+    """Require a 95% CI win and reject a significant regression on any CI metric."""
+    if not challenger.get("evidence_valid") or not baseline.get("evidence_valid"):
         return False
-    return max(left_bounds[0], right_bounds[0]) <= min(left_bounds[1], right_bounds[1])
+    challenger_metrics = challenger.get("metrics") or {}
+    baseline_metrics = baseline.get("metrics") or {}
+    if set(challenger_metrics) != set(baseline_metrics) or not challenger_metrics:
+        return False
+    improvement = False
+    for name, challenger_metric in challenger_metrics.items():
+        baseline_metric = baseline_metrics[name]
+        challenger_interval = challenger_metric.get("confidence_interval_95")
+        baseline_interval = baseline_metric.get("confidence_interval_95")
+        if challenger_interval is None and baseline_interval is None:
+            continue
+        if challenger_interval is None or baseline_interval is None:
+            return False
+        greater = bool(challenger_metric["greater_is_better"])
+        if interval_stronger(
+            baseline_interval,
+            challenger_interval,
+            greater_is_better=greater,
+        ):
+            return False
+        if interval_stronger(
+            challenger_interval,
+            baseline_interval,
+            greater_is_better=greater,
+        ):
+            improvement = True
+    return improvement
 
 
 def run_stage(
@@ -738,26 +780,33 @@ def benchmark_unit(
 
 
 def report_score(
-    report: dict[str, Any], task: str, direction: str | None, required_slices: list[str]
+    report: dict[str, Any],
+    task: str,
+    direction: str | None,
+    required_slices: list[str],
+    required_metrics: list[str] | None = None,
+    asr_code_switch_wer_max: float = 0.21,
 ) -> dict[str, Any]:
     safety_pass, failures = critical_safety_pass(report, required_slices)
     metric_view = report
     if task == "mt" and direction:
         metric_view = report.get("directions", {}).get(direction) or {}
+    metric_specs: list[tuple[str, bool, bool]]
     if task == "mt":
-        metric_name = "chrf2"
-        metric = metric_view.get(metric_name)
-        interval = metric_view.get("chrf2_bootstrap_95ci")
-        greater_is_better = True
+        default_metrics = ["sacrebleu", "chrf2"]
+        primary_metric = "chrf2"
+        metric_specs = [(name, True, True) for name in (required_metrics or default_metrics)]
     else:
-        metric_name = "wer"
-        metric = metric_view.get(metric_name)
-        interval = metric_view.get("wer_bootstrap_95ci")
-        greater_is_better = False
+        default_metrics = ["wer", "cer", "code_switch_wer"]
+        primary_metric = "wer"
+        metric_specs = [
+            (name, False, name == "wer") for name in (required_metrics or default_metrics)
+        ]
         code_switch = report.get("slices", {}).get("code_switch", {}).get("True")
         if code_switch is None:
             safety_pass = False
             failures.append("code_switch_wer:missing")
+            code_switch_wer = None
         else:
             try:
                 code_switch_wer = float(code_switch.get("wer", 1.0))
@@ -766,32 +815,54 @@ def report_score(
             if not math.isfinite(code_switch_wer):
                 safety_pass = False
                 failures.append("code_switch_wer:missing_or_invalid")
-            elif code_switch_wer > 0.21:
+            elif code_switch_wer > asr_code_switch_wer_max:
                 safety_pass = False
                 failures.append("code_switch_wer:above_policy")
+        metric_view = {**metric_view, "code_switch_wer": code_switch_wer}
 
     clinical_safety_pass = safety_pass
-    metric_value = None
-    try:
-        if metric is not None:
-            candidate_metric = float(metric)
+    metrics: dict[str, dict[str, Any]] = {}
+    for metric_name, greater_is_better, requires_interval in metric_specs:
+        metric_value = None
+        try:
+            candidate_metric = float(metric_view.get(metric_name))
             if math.isfinite(candidate_metric):
                 metric_value = candidate_metric
-    except (TypeError, ValueError):
-        pass
-    interval_value = normalized_interval(interval)
-    if metric_value is None:
-        safety_pass = False
-        failures.append(f"{metric_name}:missing_or_invalid")
-    if interval_value is None:
-        failures.append(f"{metric_name}_bootstrap_95ci:missing_or_invalid")
-    evidence_valid = metric_value is not None and interval_value is not None
+        except (TypeError, ValueError):
+            pass
+        interval_value = normalized_interval(
+            metric_view.get(f"{metric_name}_bootstrap_95ci")
+        )
+        if metric_value is None:
+            failures.append(f"{metric_name}:missing_or_invalid")
+        if requires_interval and interval_value is None:
+            failures.append(f"{metric_name}_bootstrap_95ci:missing_or_invalid")
+        metrics[metric_name] = {
+            "value": metric_value,
+            "confidence_interval_95": list(interval_value) if interval_value else None,
+            "greater_is_better": greater_is_better,
+            "evidence_valid": metric_value is not None
+            and (not requires_interval or interval_value is not None),
+        }
+    evidence_valid = bool(metrics) and all(item["evidence_valid"] for item in metrics.values())
     safety_pass = clinical_safety_pass and evidence_valid
+    primary = metrics.get(primary_metric) or {
+        "value": None,
+        "confidence_interval_95": None,
+        "greater_is_better": task == "mt",
+    }
     return {
-        "metric_name": metric_name,
-        "metric": metric_value,
-        "confidence_interval_95": list(interval_value) if interval_value else None,
-        "greater_is_better": greater_is_better,
+        "metric_name": primary_metric,
+        "metric": primary["value"],
+        "confidence_interval_95": primary["confidence_interval_95"],
+        "greater_is_better": primary["greater_is_better"],
+        "metrics": metrics,
+        "ranking_key": [
+            item["value"] if item["greater_is_better"] else -item["value"]
+            for item in metrics.values()
+        ]
+        if evidence_valid
+        else None,
         "safety_pass": safety_pass,
         "clinical_safety_pass": clinical_safety_pass,
         "evidence_valid": evidence_valid,
@@ -804,11 +875,10 @@ def rank_scores(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     eligible = [entry for entry in entries if entry["score"]["safety_pass"]]
     if not eligible:
         return []
-    greater = eligible[0]["score"]["greater_is_better"]
     return sorted(
         eligible,
-        key=lambda entry: entry["score"]["metric"],
-        reverse=greater,
+        key=lambda entry: entry["score"]["ranking_key"],
+        reverse=True,
     )
 
 
@@ -824,6 +894,13 @@ def run_task_bakeoff(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     required = config["promotion_gate"]["critical_slices"] + config["promotion_gate"]["policy_slices"]
+    required_metrics = config["promotion_gate"].get(
+        f"{task}_metrics",
+        ["sacrebleu", "chrf2"] if task == "mt" else ["wer", "cer", "code_switch_wer"],
+    )
+    asr_code_switch_wer_max = float(
+        config["promotion_gate"].get("asr_code_switch_wer_max", 0.21)
+    )
     candidate_a = next(
         item for item in config["candidates"][task] if item["role"] == "candidate_a"
     )
@@ -872,7 +949,17 @@ def run_task_bakeoff(
             direction=unit.get("direction"),
         )
         zero_shot.append(
-            {"unit": unit["unit_id"], "score": report_score(zero_report, task, unit.get("direction"), required)}
+            {
+                "unit": unit["unit_id"],
+                "score": report_score(
+                    zero_report,
+                    task,
+                    unit.get("direction"),
+                    required,
+                    required_metrics,
+                    asr_code_switch_wer_max,
+                ),
+            }
         )
         adapter = train_unit(
             unit=unit,
@@ -902,7 +989,14 @@ def run_task_bakeoff(
                 "unit": unit["unit_id"],
                 "candidate": unit,
                 "adapter": str(adapter),
-                "score": report_score(report, task, unit.get("direction"), required),
+                "score": report_score(
+                    report,
+                    task,
+                    unit.get("direction"),
+                    required,
+                    required_metrics,
+                    asr_code_switch_wer_max,
+                ),
             }
         )
 
@@ -938,23 +1032,25 @@ def run_task_bakeoff(
                 "unit": unit["unit_id"],
                 "candidate": unit,
                 "adapter": str(adapter),
-                "score": report_score(report, task, unit.get("direction"), required),
+                "score": report_score(
+                    report,
+                    task,
+                    unit.get("direction"),
+                    required,
+                    required_metrics,
+                    asr_code_switch_wer_max,
+                ),
             }
         )
 
     ranked_semifinal = rank_scores(semifinal)
     finalists = []
     if ranked_semifinal:
-        best_interval = ranked_semifinal[0]["score"]["confidence_interval_95"]
+        best = ranked_semifinal[0]
         finalists = [
             entry
             for entry in ranked_semifinal
-            if entry is ranked_semifinal[0]
-            or (
-                best_interval
-                and entry["score"]["confidence_interval_95"]
-                and intervals_overlap(best_interval, entry["score"]["confidence_interval_95"])
-            )
+            if entry is best or not multi_metric_stronger(best["score"], entry["score"])
         ]
 
     full = []
@@ -988,7 +1084,14 @@ def run_task_bakeoff(
                 "unit": unit["unit_id"],
                 "candidate": unit,
                 "adapter": str(adapter),
-                "score": report_score(report, task, unit.get("direction"), required),
+                "score": report_score(
+                    report,
+                    task,
+                    unit.get("direction"),
+                    required,
+                    required_metrics,
+                    asr_code_switch_wer_max,
+                ),
             }
         )
 
@@ -996,7 +1099,12 @@ def run_task_bakeoff(
     winners = {}
     for direction in directions:
         baseline_score = report_score(
-            candidate_a_reports[direction or "vi"], task, direction, required
+            candidate_a_reports[direction or "vi"],
+            task,
+            direction,
+            required,
+            required_metrics,
+            asr_code_switch_wer_max,
         )
         challengers = [
             entry
@@ -1024,11 +1132,7 @@ def run_task_bakeoff(
             challenger_score = challenger["score"]
             stronger = (
                 not baseline_score["clinical_safety_pass"]
-                or interval_stronger(
-                    challenger_score["confidence_interval_95"],
-                    baseline_score["confidence_interval_95"],
-                    greater_is_better=challenger_score["greater_is_better"],
-                )
+                or multi_metric_stronger(challenger_score, baseline_score)
             )
             if stronger:
                 winner = {
