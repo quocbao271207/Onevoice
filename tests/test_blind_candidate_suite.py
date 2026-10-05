@@ -11,11 +11,13 @@ import yaml
 from scripts.run_blind_candidate_suite import (
     adapter_tree_manifest,
     blind_quality_failures,
+    coverage_counts,
     evaluate,
     load_locked_accuracy_config,
     sha256,
     validate_content_integrity,
     validate_identifiers,
+    validate_minimum_coverage,
     verify_lock,
     verify_report_provenance,
     verify_selection_winner,
@@ -36,18 +38,40 @@ def full_bakeoff_config() -> dict:
 
 
 def write_lock(path: Path, mt: Path, asr: Path) -> None:
+    mt_coverage = coverage_counts("mt", read_jsonl_fixture(mt))
+    asr_coverage = coverage_counts("asr", read_jsonl_fixture(asr))
     path.write_text(
         json.dumps(
             {
+                "version": 2,
                 "status": "locked_unopened",
+                "required_slices": {"mt": [], "asr": []},
+                "minimum_coverage": {
+                    "mt": {"rows": 1, "slice_samples": {}},
+                    "asr": {"rows": 1, "slice_samples": {}},
+                },
                 "manifests": {
-                    "mt": {"path": str(mt), "sha256": sha256(mt)},
-                    "asr": {"path": str(asr), "sha256": sha256(asr)},
+                    "mt": {
+                        "path": str(mt),
+                        "rows": mt_coverage["rows"],
+                        "sha256": sha256(mt),
+                        "coverage": mt_coverage,
+                    },
+                    "asr": {
+                        "path": str(asr),
+                        "rows": asr_coverage["rows"],
+                        "sha256": sha256(asr),
+                        "coverage": asr_coverage,
+                    },
                 },
             }
         ),
         encoding="utf-8",
     )
+
+
+def read_jsonl_fixture(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def test_blind_lock_verifies_checksums_and_detects_tampering(tmp_path: Path):
@@ -58,8 +82,31 @@ def test_blind_lock_verifies_checksums_and_detects_tampering(tmp_path: Path):
     lock = tmp_path / "lock.json"
     write_lock(lock, mt, asr)
     assert verify_lock(lock)["status"] == "locked_unopened"
+
+    locked = json.loads(lock.read_text(encoding="utf-8"))
+    locked["manifests"]["mt"]["coverage"]["rows"] = 2
+    lock.write_text(json.dumps(locked), encoding="utf-8")
+    with pytest.raises(ValueError, match="coverage record mismatch"):
+        verify_lock(lock)
+
+    write_lock(lock, mt, asr)
     mt.write_text('{"id":"changed"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="checksum mismatch"):
+        verify_lock(lock)
+
+
+def test_blind_lock_rejects_legacy_schema(tmp_path: Path):
+    mt = tmp_path / "mt.jsonl"
+    asr = tmp_path / "asr.jsonl"
+    mt.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr.write_text('{"id":"asr"}\n', encoding="utf-8")
+    lock = tmp_path / "lock.json"
+    write_lock(lock, mt, asr)
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema version 2"):
         verify_lock(lock)
 
 
@@ -215,10 +262,26 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
     lock_path.write_text(
         json.dumps(
             {
+                "version": 2,
                 "status": "locked_unopened",
+                "required_slices": {"mt": [], "asr": []},
+                "minimum_coverage": {
+                    "mt": {"rows": 1, "slice_samples": {}},
+                    "asr": {"rows": 1, "slice_samples": {}},
+                },
                 "manifests": {
-                    "mt": {"path": str(mt_manifest), "sha256": sha256(mt_manifest)},
-                    "asr": {"path": str(asr_manifest), "sha256": sha256(asr_manifest)},
+                    "mt": {
+                        "path": str(mt_manifest),
+                        "rows": 1,
+                        "sha256": sha256(mt_manifest),
+                        "coverage": {"rows": 1, "slice_samples": {}},
+                    },
+                    "asr": {
+                        "path": str(asr_manifest),
+                        "rows": 1,
+                        "sha256": sha256(asr_manifest),
+                        "coverage": {"rows": 1, "slice_samples": {}},
+                    },
                 },
                 "selection": None,
                 "opened": {"mt": {"en_to_vi": None, "vi_to_en": None}, "asr": None},
@@ -491,6 +554,95 @@ def test_blind_asr_requires_existing_audio(tmp_path: Path):
     }
     with pytest.raises(FileNotFoundError, match="audio is missing"):
         validate_content_integrity("asr", [row])
+
+
+def test_blind_coverage_counts_unique_slices_per_row():
+    mt_rows = [
+        {
+            "source_text": "Take aspirin 81 mg.",
+            "target_text": "Uống aspirin 81 mg.",
+            "categories": ["drug_name", "drug_name", "dose"],
+        },
+        {
+            "source_text": "No insulin.",
+            "target_text": "Không dùng insulin.",
+            "categories": ["drug_name", "negation"],
+        },
+    ]
+    assert coverage_counts("mt", mt_rows) == {
+        "rows": 2,
+        "slice_samples": {
+            "dose": 1,
+            "drug_name": 2,
+            "en_to_vi": 2,
+            "negation": 1,
+            "vi_to_en": 2,
+        },
+    }
+
+    asr_rows = [
+        {
+            "categories": ["code_switch"],
+            "blind_dimensions": {
+                "accent_region": "Central",
+                "role": "Doctor",
+                "noise": True,
+            },
+        },
+        {
+            "categories": ["code_switch"],
+            "selection_dimensions": {
+                "accent_region": "central",
+                "role": "patient",
+                "noise": False,
+            },
+        },
+    ]
+    assert coverage_counts("asr", asr_rows) == {
+        "rows": 2,
+        "slice_samples": {
+            "central": 2,
+            "code_switch": 2,
+            "doctor": 1,
+            "noise": 1,
+            "patient": 1,
+        },
+    }
+
+
+def test_blind_minimum_coverage_is_a_hard_gate():
+    rows = [
+        {
+            "source_text": "Take aspirin 81 mg.",
+            "target_text": "Uống aspirin 81 mg.",
+            "categories": ["drug_name", "dose"],
+        },
+        {
+            "source_text": "No insulin.",
+            "target_text": "Không dùng insulin.",
+            "categories": ["drug_name", "negation"],
+        },
+    ]
+    required = ["drug_name", "dose", "negation", "en_to_vi", "vi_to_en"]
+    policy = {
+        "rows": 2,
+        "slice_samples": {
+            "drug_name": 2,
+            "dose": 1,
+            "negation": 1,
+            "en_to_vi": 2,
+            "vi_to_en": 2,
+        },
+    }
+    assert validate_minimum_coverage("mt", rows, policy, required)["rows"] == 2
+
+    policy["slice_samples"]["dose"] = 2
+    with pytest.raises(ValueError, match=r"dose=1/2"):
+        validate_minimum_coverage("mt", rows, policy, required)
+
+    del policy["slice_samples"]["negation"]
+    with pytest.raises(ValueError, match="lacks required slice quotas"):
+        validate_minimum_coverage("mt", rows, policy, required)
 
 
 def accuracy_config():

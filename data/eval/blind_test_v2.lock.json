@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "status": "awaiting_unseen_data",
   "policy": "Fail closed: do not open or promote until genuinely unseen MT and ASR manifests are supplied, overlap-audited, and SHA-256 locked.",
   "required_slices": {
@@ -29,6 +29,40 @@
       "patient",
       "noise"
     ]
+  },
+  "minimum_coverage": {
+    "mt": {
+      "rows": 256,
+      "slice_samples": {
+        "drug_name": 32,
+        "dose": 32,
+        "number": 32,
+        "unit": 32,
+        "negation": 32,
+        "terminology": 32,
+        "code_switch": 32,
+        "en_to_vi": 256,
+        "vi_to_en": 256
+      }
+    },
+    "asr": {
+      "rows": 384,
+      "slice_samples": {
+        "drug_name": 32,
+        "dose": 32,
+        "number": 32,
+        "unit": 32,
+        "negation": 32,
+        "terminology": 32,
+        "code_switch": 32,
+        "north": 64,
+        "central": 64,
+        "south": 64,
+        "doctor": 64,
+        "patient": 64,
+        "noise": 96
+      }
+    }
   },
   "manifests": {
     "mt": null,

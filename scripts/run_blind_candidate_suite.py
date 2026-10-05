@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import math
@@ -161,23 +162,89 @@ def validate_content_integrity(task: str, rows: list[dict[str, Any]]) -> None:
 
 
 def validate_required_slices(task: str, rows: list[dict[str, Any]], required: list[str]) -> None:
-    observed = set()
+    observed = set(coverage_counts(task, rows)["slice_samples"])
+    missing = sorted(set(required) - observed)
+    if missing:
+        raise ValueError(f"Blind {task} manifest is missing required slices: {missing}")
+
+
+def coverage_counts(task: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count each declared blind slice at most once per independent row."""
+    counts: Counter[str] = Counter()
     for row in rows:
-        observed.update(str(value) for value in row.get("categories", []))
+        observed = {
+            str(value).strip().casefold()
+            for value in row.get("categories", [])
+            if str(value).strip()
+        }
         if task == "mt":
             if row.get("source_text") and row.get("target_text"):
                 observed.update({"en_to_vi", "vi_to_en"})
             else:
-                observed.add(str(row.get("direction") or ""))
+                direction = str(row.get("direction") or "").strip().casefold()
+                if direction:
+                    observed.add(direction)
         else:
             dimensions = row.get("blind_dimensions") or row.get("selection_dimensions") or {}
-            observed.add(str(dimensions.get("accent_region") or ""))
-            observed.add(str(dimensions.get("role") or ""))
-            if dimensions.get("noise"):
+            accent = str(dimensions.get("accent_region") or "").strip().casefold()
+            role = str(dimensions.get("role") or "").strip().casefold()
+            if accent:
+                observed.add(accent)
+            if role:
+                observed.add(role)
+            if dimensions.get("noise") is True:
                 observed.add("noise")
-    missing = sorted(set(required) - observed)
-    if missing:
-        raise ValueError(f"Blind {task} manifest is missing required slices: {missing}")
+        counts.update(observed)
+    return {"rows": len(rows), "slice_samples": dict(sorted(counts.items()))}
+
+
+def _positive_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"Blind coverage policy {label} must be a positive integer")
+    return value
+
+
+def validate_minimum_coverage(
+    task: str,
+    rows: list[dict[str, Any]],
+    policy: dict[str, Any],
+    required_slices: list[str],
+) -> dict[str, Any]:
+    """Fail closed when a blind suite is too small for meaningful slice evidence."""
+    if not isinstance(policy, dict):
+        raise ValueError(f"Blind {task} minimum coverage policy is missing")
+    minimum_rows = _positive_int(policy.get("rows"), f"{task}.rows")
+    minimum_slices = policy.get("slice_samples")
+    if not isinstance(minimum_slices, dict):
+        raise ValueError(f"Blind coverage policy {task}.slice_samples is missing")
+    missing_policy = sorted(set(required_slices) - set(minimum_slices))
+    if missing_policy:
+        raise ValueError(
+            f"Blind coverage policy {task} lacks required slice quotas: {missing_policy}"
+        )
+
+    normalized_minimums = {
+        str(name).strip().casefold(): _positive_int(
+            minimum, f"{task}.slice_samples.{name}"
+        )
+        for name, minimum in minimum_slices.items()
+        if str(name).strip()
+    }
+    coverage = coverage_counts(task, rows)
+    deficits: list[str] = []
+    if coverage["rows"] < minimum_rows:
+        deficits.append(f"rows={coverage['rows']}/{minimum_rows}")
+    observed = coverage["slice_samples"]
+    deficits.extend(
+        f"{name}={observed.get(name, 0)}/{minimum}"
+        for name, minimum in sorted(normalized_minimums.items())
+        if observed.get(name, 0) < minimum
+    )
+    if deficits:
+        raise ValueError(
+            f"Blind {task} manifest is below minimum coverage: {', '.join(deficits)}"
+        )
+    return coverage
 
 
 def finite_float(value: Any) -> float | None:
@@ -312,6 +379,8 @@ def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str,
 
 def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     existing = json.loads(lock_path.read_text(encoding="utf-8"))
+    if existing.get("version") != 2:
+        raise ValueError("Blind v2 lock requires schema version 2")
     if existing.get("status") != "awaiting_unseen_data":
         raise ValueError("Blind v2 is already locked and cannot be replaced")
     manifests = {}
@@ -323,11 +392,19 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         validate_identifiers(task, rows)
         validate_content_integrity(task, rows)
         ensure_unseen(task, rows, config)
-        validate_required_slices(task, rows, existing["required_slices"][task])
+        required_slices = existing["required_slices"][task]
+        validate_required_slices(task, rows, required_slices)
+        coverage = validate_minimum_coverage(
+            task,
+            rows,
+            existing["minimum_coverage"][task],
+            required_slices,
+        )
         manifests[task] = {
             "path": str(resolved),
             "rows": len(rows),
             "sha256": sha256(resolved),
+            "coverage": coverage,
         }
     locked = {
         **existing,
@@ -343,6 +420,8 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
 
 def verify_lock(lock_path: Path) -> dict[str, Any]:
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if lock.get("version") != 2:
+        raise ValueError("Blind v2 lock requires schema version 2")
     if lock.get("status") not in {"locked_unopened", "partially_opened", "opened"}:
         raise ValueError(f"Blind v2 is not locked: {lock.get('status')!r}")
     for task in ("mt", "asr"):
@@ -352,6 +431,15 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
         path = Path(record["path"])
         if not path.is_file() or sha256(path) != record["sha256"]:
             raise ValueError(f"Blind {task} checksum mismatch")
+        rows = read_jsonl(path)
+        coverage = validate_minimum_coverage(
+            task,
+            rows,
+            lock["minimum_coverage"][task],
+            lock["required_slices"][task],
+        )
+        if record.get("rows") != len(rows) or record.get("coverage") != coverage:
+            raise ValueError(f"Blind {task} coverage record mismatch")
     selection = lock.get("selection")
     if selection:
         path = Path(selection["path"])
