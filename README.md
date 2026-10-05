@@ -19,6 +19,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/run_gpu_program.py` — tự quyết định MT continuation bằng validation trend, rồi nối tuần tự MT gate → ASR pilots/full-data → ASR gate; state nguyên tử và không chạy hai GPU child đồng thời
 - `scripts/run_model_bakeoff.py` — sau khi Candidate A hoàn tất, đóng băng nó rồi chạy successive-halving đa model trên selection dev; không mở test khóa cũ để chọn model
 - `scripts/run_blind_candidate_suite.py` — khóa checksum và mở blind test v2 đúng một lần cho winner cuối
+- `scripts/prepare_deployment_benchmark.py` — tạo draft đã khóa winner/adapter và chỉ finalize evidence QCS6490 sau khi tự tính p50/p95, checksum/bytes artifact và vượt physical-board gate
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board

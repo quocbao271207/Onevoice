@@ -399,8 +399,11 @@ def validate_deployment_report(
     else:
         if str(device.get("chipset") or "").upper() != "QCS6490":
             failures.append("device.chipset:not_qcs6490")
-        if not str(device.get("board") or "").strip():
+        board = str(device.get("board") or "").strip()
+        if not board:
             failures.append("device.board:missing")
+        elif "6490" not in board.upper() and "RB3 GEN 2" not in board.upper():
+            failures.append("device.board:not_qcs6490_board")
         if not str(device.get("os") or "").strip():
             failures.append("device.os:missing")
 

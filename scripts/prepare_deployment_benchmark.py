@@ -1,0 +1,236 @@
+"""Prepare and finalize physical-QCS6490 evidence for selected winners.
+
+The template action binds a measurement draft to the exact selected adapters.
+After board measurements and compiled artifacts have been copied back under
+``models/``, the finalize action computes immutable artifact identities and
+latency percentiles, validates the complete report, and writes it atomically.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from copy import deepcopy
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.run_model_bakeoff import (  # noqa: E402
+    deployment_expectations,
+    load_config,
+    percentile_linear,
+    sha256,
+    validate_deployment_report,
+)
+
+
+DEFAULT_CONFIG = ROOT / "configs/model_bakeoff.yaml"
+DEFAULT_DRAFT = ROOT / "data/reports/model_bakeoff/deployment_selected_winners.draft.json"
+DEFAULT_OUTPUT = ROOT / "data/reports/model_bakeoff/deployment_selected_winners.json"
+
+
+def atomic_json_exclusive(path: Path, payload: dict[str, Any]) -> None:
+    """Create immutable evidence without overwriting an existing draft/report."""
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite deployment evidence: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def selected_winner_specs(comparison: dict[str, Any]) -> list[tuple[str, str | None, dict[str, Any]]]:
+    if comparison.get("status") not in {"blind_complete", "complete"}:
+        raise ValueError("Deployment evidence requires completed blind evaluation")
+    results = comparison.get("results")
+    if not isinstance(results, dict):
+        raise ValueError("Selection comparison has no results")
+    mt_winners = (results.get("mt") or {}).get("winners")
+    asr_winners = (results.get("asr") or {}).get("winners")
+    if not isinstance(mt_winners, dict) or not isinstance(asr_winners, dict):
+        raise ValueError("Selection comparison has no winner bindings")
+    required_mt = {"en_to_vi", "vi_to_en"}
+    if set(mt_winners) != required_mt or set(asr_winners) != {"vi"}:
+        raise ValueError("Selection comparison must contain both MT directions and ASR vi")
+    specs = [
+        ("mt", direction, mt_winners[direction])
+        for direction in ("en_to_vi", "vi_to_en")
+    ] + [("asr", None, asr_winners["vi"])]
+    for task, direction, winner in specs:
+        if not isinstance(winner, dict):
+            raise ValueError(f"Invalid winner record: {task}/{direction or 'vi'}")
+        if not str(winner.get("candidate_id") or "").strip():
+            raise ValueError(f"Winner candidate is missing: {task}/{direction or 'vi'}")
+        if not str(winner.get("adapter") or "").strip():
+            raise ValueError(f"Winner adapter is missing: {task}/{direction or 'vi'}")
+    return specs
+
+
+def build_template(
+    selection_path: Path,
+    comparison: dict[str, Any],
+) -> dict[str, Any]:
+    expected = deployment_expectations(selected_winner_specs(comparison))
+    return {
+        "version": 1,
+        "status": "pending_physical_measurement",
+        "target": "QCS6490",
+        "measurement_source": "physical_board",
+        "measured_at": None,
+        "selection_comparison": {
+            "path": str(selection_path.resolve()),
+            "sha256": sha256(selection_path),
+        },
+        "device": {
+            "chipset": "QCS6490",
+            "board": "",
+            "os": "",
+        },
+        "winners": [
+            {
+                **winner,
+                "artifact_path": "",
+                "latency_samples_ms": [],
+                "peak_ram_bytes": None,
+                "peak_vram_bytes": None,
+            }
+            for winner in expected
+        ],
+    }
+
+
+def _winner_key(record: dict[str, Any]) -> tuple[str, str | None]:
+    direction = record.get("direction")
+    return str(record.get("task") or ""), str(direction) if direction is not None else None
+
+
+def _resolve_artifact(path_value: Any, project_root: Path) -> Path:
+    value = str(path_value or "").strip()
+    if not value:
+        raise ValueError("Deployment artifact path is missing")
+    path = Path(value)
+    if not path.is_absolute():
+        path = project_root / path
+    return path.resolve()
+
+
+def finalize_report(
+    selection_path: Path,
+    comparison: dict[str, Any],
+    draft: dict[str, Any],
+    config: dict[str, Any],
+    project_root: Path = ROOT,
+) -> dict[str, Any]:
+    expected = deployment_expectations(selected_winner_specs(comparison))
+    records = draft.get("winners")
+    if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
+        raise ValueError("Deployment draft winners are missing or invalid")
+    record_by_key: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for record in records:
+        key = _winner_key(record)
+        if key in record_by_key:
+            raise ValueError(f"Duplicate deployment winner: {key}")
+        record_by_key[key] = record
+    expected_by_key = {_winner_key(item): item for item in expected}
+    if set(record_by_key) != set(expected_by_key):
+        raise ValueError("Deployment draft winner set does not match selection")
+
+    final = deepcopy(draft)
+    final["version"] = 1
+    final["status"] = "pass"
+    final["target"] = "QCS6490"
+    final["measurement_source"] = "physical_board"
+    final["selection_comparison"] = {
+        "path": str(selection_path.resolve()),
+        "sha256": sha256(selection_path),
+    }
+    final_records = {_winner_key(item): item for item in final["winners"]}
+    for key, expected_record in expected_by_key.items():
+        record = final_records[key]
+        if record.get("candidate_id") != expected_record["candidate_id"]:
+            raise ValueError(f"Deployment candidate binding changed: {key}")
+        if record.get("adapter_manifest_sha256") != expected_record["adapter_manifest_sha256"]:
+            raise ValueError(f"Deployment adapter binding changed: {key}")
+        samples = record.get("latency_samples_ms")
+        if not isinstance(samples, list):
+            raise ValueError(f"Deployment latency samples are missing: {key}")
+        parsed_samples: list[float] = []
+        for value in samples:
+            try:
+                parsed_samples.append(float(value))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid deployment latency sample: {key}") from exc
+        if not parsed_samples:
+            raise ValueError(f"Deployment latency samples are empty: {key}")
+        artifact = _resolve_artifact(record.get("artifact_path"), project_root)
+        if not artifact.is_file():
+            raise FileNotFoundError(f"Deployment artifact is missing: {artifact}")
+        record.update(
+            {
+                "measurement_runs": len(parsed_samples),
+                "latency_samples_ms": parsed_samples,
+                "latency_p50_ms": percentile_linear(parsed_samples, 0.50),
+                "latency_p95_ms": percentile_linear(parsed_samples, 0.95),
+                "artifact_sha256": sha256(artifact),
+                "model_bytes": artifact.stat().st_size,
+            }
+        )
+
+    gate = config["promotion_gate"]
+    final["deployment_gate"] = {
+        "required_metrics": list(gate["deployment_metrics"]),
+        "minimum_measurement_runs": int(gate["deployment_min_runs"]),
+    }
+    passed, failures = validate_deployment_report(
+        final,
+        expected,
+        list(gate["deployment_metrics"]),
+        int(gate["deployment_min_runs"]),
+        project_root,
+    )
+    if not passed:
+        raise ValueError("Deployment report failed validation: " + ", ".join(failures))
+    return final
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--action", choices=["template", "finalize"], required=True)
+    parser.add_argument("--selection-comparison", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--draft", type=Path, default=DEFAULT_DRAFT)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+
+    if not args.selection_comparison.is_file():
+        raise FileNotFoundError(args.selection_comparison)
+    comparison = json.loads(args.selection_comparison.read_text(encoding="utf-8"))
+    config = load_config(args.config)
+    if args.action == "template":
+        template = build_template(args.selection_comparison, comparison)
+        atomic_json_exclusive(args.draft, template)
+        print(json.dumps(template, ensure_ascii=False, indent=2))
+        return 0
+
+    if not args.draft.is_file():
+        raise FileNotFoundError(args.draft)
+    draft = json.loads(args.draft.read_text(encoding="utf-8"))
+    report = finalize_report(args.selection_comparison, comparison, draft, config)
+    atomic_json_exclusive(args.output, report)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

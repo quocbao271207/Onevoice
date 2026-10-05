@@ -600,6 +600,11 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
     assert "winner:mt/en_to_vi:model_bytes_invalid" in failures
     assert "winner:mt/en_to_vi:latency_percentiles_reversed" in failures
 
+    report["device"]["board"] = "Arduino Uno"
+    passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
+    assert passed is False
+    assert "device.board:not_qcs6490_board" in failures
+
     winner["model_bytes"] = artifact.stat().st_size
     artifact.write_bytes(b"tampered")
     passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
