@@ -56,4 +56,4 @@ Sau Candidate A, `scripts/run_model_bakeoff.py` đóng băng adapter/checksum r�
 
 ## Backup và phục hồi
 
-`scripts/create_verified_backup.py` tạo ba tar độc lập cho data (không lặp reports), models và reports, sinh `SHA256SUMS.txt`, rồi đọc lại toàn bộ archive để xác minh checksum và số file. Backup nằm trong `.backups/`, không push lên Git vì chứa dữ liệu/model lớn và có ràng buộc license.
+`scripts/create_verified_backup.py` tạo ba tar độc lập cho data (không lặp reports), models và reports, sinh `SHA256SUMS.txt`, rồi đọc lại toàn bộ archive để xác minh checksum, số file, tổng byte và cấu trúc đường dẫn an toàn. Archive rỗng, tên trùng, path traversal hoặc checksum manifest lệch đều fail-closed. Backup nằm trong `.backups/`, không push lên Git vì chứa dữ liệu/model lớn và có ràng buộc license.
