@@ -31,6 +31,8 @@ Ba archive đã được tải về `test/` ở máy local và xác minh lại S
 
 `scripts/run_mt_candidate_suite.py` sẽ chạy ngay sau full-run. Script nạp adapter LoRA trên đúng NLLB revision đã pin, chấm toàn bộ `mt--test.jsonl` theo cả hai chiều bằng greedy (`num_beams=1`) đã thắng ablation validation, sau đó chấm riêng suite `medical_safety_mt.jsonl` đã xác minh checksum. Candidate chỉ pass khi BLEU/chrF đạt ngưỡng và đủ cả bảy slice `drug_name`, `dose`, `number`, `unit`, `negation`, `terminology`, `code_switch` với failure rate theo policy. Predictions, report, log và resource trace được đóng gói thành tar.gz kèm SHA-256 để tải về local ngay.
 
+Scorer bootstrap hiện hành đã được smoke ở đúng quy mô 8.938 cặp/17.876 prediction giả lập: 1.000 resample cho overall và từng chiều, đủ BLEU/chrF 95% CI, hoàn tất trong 59,749 giây trên CPU local. Báo cáo tại `data/reports/experiments/scoring/mt_bootstrap_fullscale_smoke.json` khóa SHA-256 của manifest và ghi rõ đây chỉ là bằng chứng throughput, không phải kết quả accuracy. Candidate A đang chạy được khởi động trước bản tối ưu này nên vẫn phải hoàn tất scorer cũ nguyên trạng.
+
 ## Full-run đang chạy
 
 Run `mt-20261004-172023/01-final-r8-lr1e4-full` dùng toàn bộ 339.028 cặp train, hai chiều và oversample lâm sàng hệ số 2, tổng 33.521 optimizer steps. Watcher checkpoint nguyên tử được bổ sung giữa run và đã chứng minh bắt được checkpoint mới, không chỉ xử lý checkpoint tồn tại sẵn.

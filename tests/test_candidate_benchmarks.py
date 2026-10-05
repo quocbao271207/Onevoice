@@ -10,6 +10,7 @@ import torch
 from scripts.candidate_evidence import (
     archive_evidence,
     evidence_sidecars,
+    sha256,
     verify_evidence_archive,
 )
 from scripts.run_baseline_benchmarks import (
@@ -71,6 +72,24 @@ def test_predictions_checkpoint_is_utf8_jsonl_and_replaces_stale_file(tmp_path: 
         '{"id": "thuốc", "hypothesis": "Không dùng 5 mg."}\n'
     )
     assert not path.with_suffix(".jsonl.tmp").exists()
+
+
+def test_fullscale_mt_scoring_smoke_is_bound_to_locked_manifest():
+    root = Path(__file__).resolve().parents[1]
+    report = json.loads(
+        (
+            root
+            / "data/reports/experiments/scoring/mt_bootstrap_fullscale_smoke.json"
+        ).read_text(encoding="utf-8")
+    )
+    manifest = root / report["manifest"]["path"]
+
+    assert report["status"] == "pass"
+    assert report["evidence_type"] == "synthetic_fullscale_scoring_smoke"
+    assert sha256(manifest) == report["manifest"]["sha256"]
+    assert report["workload"]["predictions"] == report["manifest"]["pairs"] * 2
+    assert report["result"]["overall_bleu_chrf_confidence_intervals_present"] is True
+    assert report["result"]["direction_bleu_chrf_confidence_intervals_present"] is True
 
 
 def test_candidate_gate_requires_every_clinical_slice():
