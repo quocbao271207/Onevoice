@@ -414,6 +414,72 @@ def validate_candidate_a_locked_evaluation(
         raise ValueError(f"Candidate A {task} gate lacks check evidence: {gate_path}")
     if not isinstance(resources, dict) or not resources:
         raise ValueError(f"Candidate A {task} gate lacks resource evidence: {gate_path}")
+
+    candidate_a = next(
+        candidate
+        for candidate in config["candidates"][task]
+        if candidate.get("role") == "candidate_a"
+    )
+    if (
+        gate.get("base_model") != candidate_a["model"]
+        or gate.get("base_model_revision") != candidate_a["revision"]
+    ):
+        raise ValueError(f"Candidate A {task} gate model binding is inconsistent: {gate_path}")
+    required_checks = {
+        *(f"clinical_{name}" for name in config["promotion_gate"]["critical_slices"]),
+        *(f"clinical_{name}" for name in config["promotion_gate"]["policy_slices"]),
+    }
+    aggregate_checks = (
+        {"mt_sacrebleu", "mt_chrf2"}
+        if task == "mt"
+        else {"asr_vi_wer", "asr_code_switch_wer"}
+    )
+    check_names = [str(row.get("name") or "") for row in checks]
+    normalized_checks = {
+        name.removesuffix("_failure_rate") for name in check_names if name
+    }
+    if (
+        len(check_names) != len(set(check_names))
+        or not aggregate_checks <= set(check_names)
+        or not required_checks <= normalized_checks
+        or any(not isinstance(row.get("pass"), bool) for row in checks)
+    ):
+        raise ValueError(f"Candidate A {task} gate has incomplete checks: {gate_path}")
+    checks_pass = all(bool(row["pass"]) for row in checks)
+    if checks_pass != (status == "pass"):
+        raise ValueError(f"Candidate A {task} gate status disagrees with its checks: {gate_path}")
+
+    for run_name in ("aggregate", "clinical"):
+        run = resources.get(run_name)
+        if not isinstance(run, dict) or run.get("return_code") != 0:
+            raise ValueError(f"Candidate A {task} {run_name} resource run is incomplete")
+    resource_limits = gate.get("resource_limits")
+    configured_limits = config["resources"]
+    if not isinstance(resource_limits, dict) or any(
+        float(resource_limits.get(name, math.nan)) != float(configured_limits[name])
+        for name in (
+            "gpu_memory_fraction",
+            "utilization_percent",
+            "hard_utilization_percent",
+            "resume_percent",
+        )
+    ):
+        raise ValueError(f"Candidate A {task} resource limits do not match policy")
+    if task == "mt":
+        locked_hashes = [gate.get("locked_safety_sha256")]
+    else:
+        locked = gate.get("locked_hashes")
+        locked_hashes = (
+            [locked.get("test"), locked.get("safety")]
+            if isinstance(locked, dict)
+            else []
+        )
+    if not locked_hashes or any(
+        not isinstance(digest, str) or not SHA256_RE.fullmatch(digest)
+        for digest in locked_hashes
+    ):
+        raise ValueError(f"Candidate A {task} locked input hashes are incomplete")
+
     adapter = Path(str(current.get(f"{task}_adapter") or "")).resolve()
     if Path(str(gate.get("adapter") or "")).resolve() != adapter:
         raise ValueError(f"Candidate A {task} gate adapter does not match program state")

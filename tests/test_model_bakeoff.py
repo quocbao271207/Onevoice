@@ -92,6 +92,8 @@ def test_bakeoff_rejects_candidate_a_infrastructure_error_before_gpu(
         "error": "dtype mismatch",
         "promotion_allowed": False,
         "adapter": str(adapter),
+        "base_model": "vinai/PhoWhisper-small",
+        "base_model_revision": "a86b604c346caf7148c37512eafe783a16420adb",
         "checks": [],
         "resource_runs": {},
     }
@@ -119,8 +121,31 @@ def test_bakeoff_binds_terminal_candidate_a_gate_and_canonical_archive(
         "error": None,
         "promotion_allowed": False,
         "adapter": str(adapter),
-        "checks": [{"name": "wer", "pass": False}],
-        "resource_runs": {"aggregate": {"return_code": 0}},
+        "base_model": "vinai/PhoWhisper-small",
+        "base_model_revision": "a86b604c346caf7148c37512eafe783a16420adb",
+        "locked_hashes": {"test": "a" * 64, "safety": "b" * 64},
+        "checks": [
+            {"name": "asr_vi_wer", "pass": False},
+            {"name": "asr_code_switch_wer", "pass": True},
+            *[
+                {"name": f"clinical_{name}_failure_rate", "pass": True}
+                for name in config()["promotion_gate"]["critical_slices"]
+            ],
+            *[
+                {"name": f"clinical_{name}_failure_rate", "pass": True}
+                for name in config()["promotion_gate"]["policy_slices"]
+            ],
+        ],
+        "resource_limits": {
+            "gpu_memory_fraction": 0.35,
+            "utilization_percent": 70.0,
+            "hard_utilization_percent": 74.0,
+            "resume_percent": 55.0,
+        },
+        "resource_runs": {
+            "aggregate": {"return_code": 0},
+            "clinical": {"return_code": 0},
+        },
     }
     gate_path = output / "candidate_gate.json"
     gate_path.write_text(json.dumps(gate), encoding="utf-8")
