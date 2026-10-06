@@ -744,6 +744,29 @@ def test_resume_skips_identical_completed_stage_and_rejects_changed_command(tmp_
         run_stage("stage", command + ["changed"], state_path, state, log, [output])
 
 
+def test_all_stage_launches_reject_a_stale_loaded_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    output = tmp_path / "must-not-exist"
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(output)!r}).write_text('unsafe')",
+    ]
+    monkeypatch.setattr(bakeoff, "LOADED_RUNNER_SHA256", "0" * 64)
+
+    with pytest.raises(RuntimeError, match="runner no longer matches"):
+        run_stage(
+            "stale",
+            command,
+            tmp_path / "state.json",
+            {"stages": {}},
+            tmp_path / "stage.log",
+            [output],
+        )
+    assert not output.exists()
+
+
 def test_resume_scoring_upgrade_revalidates_completed_benchmark_stage(tmp_path: Path):
     state_path = tmp_path / "state.json"
     output = tmp_path / "output.json"

@@ -57,6 +57,15 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 LOADED_RUNNER_SHA256 = sha256(Path(__file__).resolve())
 
 
+def validate_loaded_runner_generation() -> None:
+    actual = sha256(Path(__file__).resolve())
+    if actual != LOADED_RUNNER_SHA256:
+        raise RuntimeError(
+            "Loaded bake-off runner no longer matches the file on disk; "
+            "restart only after confirming no GPU child is active"
+        )
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
@@ -1079,6 +1088,7 @@ def run_stage(
     expected_outputs: list[Path],
     resource_limits: dict[str, Any] | None = None,
 ) -> None:
+    validate_loaded_runner_generation()
     digest = command_digest(command)
     previous = state.setdefault("stages", {}).get(name)
     if previous and previous.get("status") == "complete":
