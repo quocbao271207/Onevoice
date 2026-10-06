@@ -233,6 +233,11 @@ def test_gpu_spawn_capacity_waiter_retries_and_records_evidence(tmp_path: Path):
                 "memory_total_mib": 40_960.0,
                 "memory_used_mib": 20_000.0,
             },
+            {
+                "utilization": 10.0,
+                "memory_total_mib": 40_960.0,
+                "memory_used_mib": 20_000.0,
+            },
         ]
     )
     sleeps: list[float] = []
@@ -247,10 +252,14 @@ def test_gpu_spawn_capacity_waiter_retries_and_records_evidence(tmp_path: Path):
     )
 
     records = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
-    assert result["samples"] == 2
-    assert sleeps == [2.0]
-    assert [record["allowed"] for record in records] == [False, True]
+    assert result["samples"] == 3
+    assert sleeps == [2.0, 2.0]
+    assert [record["allowed"] for record in records] == [False, False, True]
     assert records[0]["reason"] == "insufficient_memory_headroom"
+    assert records[1]["reason"] == "awaiting_sustained_capacity"
+    assert records[1]["capacity_allowed"] is True
+    assert records[2]["consecutive_allowed_samples"] == 2
+    assert result["approval"] == records[2]
 
 
 def test_gpu_spawn_capacity_waiter_fails_closed_on_sample_error(tmp_path: Path):
@@ -260,6 +269,11 @@ def test_gpu_spawn_capacity_waiter_fails_closed_on_sample_error(tmp_path: Path):
     outcomes = iter(
         [
             OSError("nvidia-smi unavailable"),
+            {
+                "utilization": 5.0,
+                "memory_total_mib": 40_960.0,
+                "memory_used_mib": 20_000.0,
+            },
             {
                 "utilization": 5.0,
                 "memory_total_mib": 40_960.0,
@@ -284,9 +298,39 @@ def test_gpu_spawn_capacity_waiter_fails_closed_on_sample_error(tmp_path: Path):
     )
 
     records = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
-    assert result["samples"] == 2
+    assert result["samples"] == 3
     assert records[0]["reason"] == "gpu_sample_error"
     assert records[0]["allowed"] is False
+
+
+def test_gpu_spawn_capacity_waiter_resets_sustained_count_after_pressure(
+    tmp_path: Path,
+):
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    samples = iter(
+        [
+            {"utilization": 5.0, "memory_total_mib": 40_960.0, "memory_used_mib": 20_000.0},
+            {"utilization": 5.0, "memory_total_mib": 40_960.0, "memory_used_mib": 31_000.0},
+            {"utilization": 5.0, "memory_total_mib": 40_960.0, "memory_used_mib": 20_000.0},
+            {"utilization": 5.0, "memory_total_mib": 40_960.0, "memory_used_mib": 20_000.0},
+        ]
+    )
+    evidence = tmp_path / "pre_spawn_capacity.jsonl"
+
+    result = wait_for_gpu_spawn_capacity(
+        limits,
+        evidence,
+        sample_reader=lambda: next(samples),
+        sleeper=lambda _: None,
+        poll_seconds=1.0,
+    )
+
+    records = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
+    assert result["samples"] == 4
+    assert [record["consecutive_allowed_samples"] for record in records] == [1, 0, 1, 2]
+    assert [record["allowed"] for record in records] == [False, False, False, True]
 
 
 def test_gpu_spawn_capacity_waiter_rejects_invalid_historical_peak(tmp_path: Path):
@@ -299,6 +343,22 @@ def test_gpu_spawn_capacity_waiter_rejects_invalid_historical_peak(tmp_path: Pat
             limits,
             tmp_path / "pre_spawn_capacity.jsonl",
             historical_peak_process_memory_mib=math.nan,
+        )
+
+
+@pytest.mark.parametrize("value", [0, True, 1.5])
+def test_gpu_spawn_capacity_waiter_rejects_invalid_sustained_sample_count(
+    tmp_path: Path, value: object
+):
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+
+    with pytest.raises(ValueError, match="required_consecutive_samples"):
+        wait_for_gpu_spawn_capacity(
+            limits,
+            tmp_path / "pre_spawn_capacity.jsonl",
+            required_consecutive_samples=value,  # type: ignore[arg-type]
         )
 
 

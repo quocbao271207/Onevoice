@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 SPAWN_CAPACITY_HISTORY_MIN_SAMPLES = 50
 SPAWN_CAPACITY_HISTORY_FACTOR = 1.25
 SPAWN_CAPACITY_HISTORY_MARGIN_MIB = 2048.0
+SPAWN_CAPACITY_REQUIRED_CONSECUTIVE_SAMPLES = 2
 
 from scripts.candidate_evidence import archive_evidence, evidence_sidecars  # noqa: E402
 
@@ -183,8 +184,9 @@ def wait_for_gpu_spawn_capacity(
     sleeper: Callable[[float], None] | None = None,
     poll_seconds: float | None = None,
     historical_peak_process_memory_mib: float | None = None,
+    required_consecutive_samples: int = SPAWN_CAPACITY_REQUIRED_CONSECUTIVE_SAMPLES,
 ) -> dict[str, Any]:
-    """Wait without a GPU child until shared-GPU utilization and memory are safe."""
+    """Wait until shared-GPU capacity is safe for several consecutive samples."""
     validate_resource_limits(limits)
     reader = sample_reader or read_gpu_sample
     sleep = sleeper or time.sleep
@@ -199,10 +201,17 @@ def wait_for_gpu_spawn_capacity(
         historical_peak = float(historical_peak_process_memory_mib)
         if not math.isfinite(historical_peak) or historical_peak <= 0.0:
             raise ValueError("Historical GPU process-memory peak must be positive and finite")
+    if (
+        isinstance(required_consecutive_samples, bool)
+        or not isinstance(required_consecutive_samples, int)
+        or required_consecutive_samples < 1
+    ):
+        raise ValueError("required_consecutive_samples must be a positive integer")
 
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     samples = 0
+    consecutive_allowed_samples = 0
     with evidence_path.open("a", encoding="utf-8") as evidence:
         while True:
             samples += 1
@@ -213,13 +222,33 @@ def wait_for_gpu_spawn_capacity(
                     limits,
                     historical_peak_process_memory_mib=historical_peak_process_memory_mib,
                 )
-                record = {"time": timestamp, **capacity}
+                capacity_allowed = bool(capacity["allowed"])
+                consecutive_allowed_samples = (
+                    consecutive_allowed_samples + 1 if capacity_allowed else 0
+                )
+                launch_allowed = (
+                    capacity_allowed
+                    and consecutive_allowed_samples >= required_consecutive_samples
+                )
+                record = {
+                    "time": timestamp,
+                    **capacity,
+                    "capacity_allowed": capacity_allowed,
+                    "allowed": launch_allowed,
+                    "consecutive_allowed_samples": consecutive_allowed_samples,
+                    "required_consecutive_allowed_samples": required_consecutive_samples,
+                }
+                if capacity_allowed and not launch_allowed:
+                    record["reason"] = "awaiting_sustained_capacity"
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                consecutive_allowed_samples = 0
                 record = {
                     "time": timestamp,
                     "allowed": False,
                     "reason": "gpu_sample_error",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "consecutive_allowed_samples": consecutive_allowed_samples,
+                    "required_consecutive_allowed_samples": required_consecutive_samples,
                 }
             evidence.write(json.dumps(record) + "\n")
             evidence.flush()
