@@ -23,6 +23,8 @@ from scripts.run_model_bakeoff import (
     multi_metric_stronger,
     report_score,
     run_stage,
+    select_finalists,
+    select_semifinalists,
     selection_identity,
     selection_identity_sha256,
     strongest_eligible_challenger,
@@ -664,6 +666,51 @@ def test_winner_search_skips_higher_point_score_with_significant_regression():
 
     assert ranked[0]["unit"] == "high-bleu-regressor"
     assert strongest_eligible_challenger(ranked, baseline)["unit"] == "valid-pareto-winner"
+
+
+def test_mt_successive_halving_keeps_each_direction_independent():
+    def entry(unit: str, direction: str, value: float) -> dict:
+        return {
+            "unit": unit,
+            "candidate": {"direction": direction},
+            "score": {
+                "safety_pass": True,
+                "evidence_valid": True,
+                "ranking_key": value,
+                "metrics": {
+                    "sacrebleu": {"ci": [value, value + 0.1]},
+                    "chrf2": {"ci": [value, value + 0.1]},
+                },
+            },
+        }
+
+    pilot = [
+        entry("en-best", "en_to_vi", 100.0),
+        entry("en-second", "en_to_vi", 90.0),
+        entry("vi-best", "vi_to_en", 10.0),
+        entry("vi-second", "vi_to_en", 9.0),
+    ]
+
+    selected = select_semifinalists(pilot, "mt", 1)
+    assert {item["unit"] for item in selected} == {"en-best", "vi-best"}
+    assert {item["unit"] for item in select_finalists(selected, "mt")} == {
+        "en-best",
+        "vi-best",
+    }
+
+
+def test_asr_successive_halving_uses_one_shared_ranking():
+    entries = [
+        {
+            "unit": name,
+            "candidate": {"direction": None},
+            "score": {"safety_pass": True, "ranking_key": value},
+        }
+        for name, value in (("best", 2.0), ("second", 1.0))
+    ]
+    assert [item["unit"] for item in select_semifinalists(entries, "asr", 1)] == [
+        "best"
+    ]
 
 
 def test_selection_identity_ignores_later_blind_results_but_binds_winners():

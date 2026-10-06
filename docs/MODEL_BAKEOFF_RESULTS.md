@@ -68,6 +68,8 @@ Mỗi stage ghi PID và process-group ngay sau `Popen`. Nếu parent gián đo�
 5. Full train giữ các candidate không bị candidate dẫn đầu Pareto-dominance theo 95% CI; một metric tốt không được che một metric khác kém rõ rệt.
 6. MT EN→VI và VI→EN được chọn độc lập.
 
+Giới hạn `keep` của successive halving được áp dụng riêng trong từng chiều MT, không xếp chung hai chiều. Vì vậy candidate EN→VI điểm cao không thể chiếm hết slot và loại toàn bộ VI→EN; finalist Pareto/95% CI cũng được xét trong từng chiều. ASR không có phân chiều nên vẫn dùng một ranking chung.
+
 So sánh theo effective train samples, không theo thời gian. Safety là hard gate: thuốc/liều/số/đơn vị/phủ định phải 0 failure; terminology và code-switch cũng có policy riêng. Sau safety, MT bắt buộc đủ cả BLEU và chrF2 theo chiều cùng bootstrap 95% CI; ASR bắt buộc đủ WER, CER và code-switch WER, trong đó WER có bootstrap 95% CI. Chỉ thay Candidate A khi ít nhất một metric có CI tốt hơn rõ rệt và không metric có CI nào thụt lùi rõ rệt; CER/code-switch vẫn phải hữu hạn và code-switch phải qua policy riêng. Winner search duyệt toàn bộ challenger đã qua safety theo thứ hạng và chọn challenger cao nhất thực sự thỏa luật đa metric; một model đứng đầu point estimate nhưng có CI regression không được che mất model xếp sau có Pareto improvement hợp lệ.
 
 Candidate A MT cũng được benchmark độc lập theo từng chiều; lỗi an toàn hoặc khoảng tin cậy của EN→VI không được làm thay đổi quyết định VI→EN và ngược lại. Metric hay bootstrap 95% CI thiếu, không hữu hạn hoặc đảo cận đều bị loại fail-closed trước ranking.

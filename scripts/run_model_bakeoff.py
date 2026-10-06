@@ -1546,6 +1546,54 @@ def rank_scores(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def halving_groups(
+    entries: list[dict[str, Any]], task: str
+) -> list[list[dict[str, Any]]]:
+    if task != "mt":
+        return [entries]
+    directions = sorted(
+        {
+            str(entry.get("candidate", {}).get("direction") or "")
+            for entry in entries
+        }
+    )
+    return [
+        [
+            entry
+            for entry in entries
+            if str(entry.get("candidate", {}).get("direction") or "") == direction
+        ]
+        for direction in directions
+    ]
+
+
+def select_semifinalists(
+    pilot: list[dict[str, Any]], task: str, keep: int
+) -> list[dict[str, Any]]:
+    return [
+        entry
+        for group in halving_groups(pilot, task)
+        for entry in rank_scores(group)[:keep]
+    ]
+
+
+def select_finalists(
+    semifinal: list[dict[str, Any]], task: str
+) -> list[dict[str, Any]]:
+    finalists = []
+    for group in halving_groups(semifinal, task):
+        ranked = rank_scores(group)
+        if not ranked:
+            continue
+        best = ranked[0]
+        finalists.extend(
+            entry
+            for entry in ranked
+            if entry is best or not multi_metric_stronger(best["score"], entry["score"])
+        )
+    return finalists
+
+
 def strongest_eligible_challenger(
     ranked: list[dict[str, Any]], baseline_score: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -1718,7 +1766,11 @@ def run_task_bakeoff(
             }
         )
 
-    semifinalists = rank_scores(pilot)[: int(config["successive_halving"]["semifinal"]["keep"])]
+    semifinalists = select_semifinalists(
+        pilot,
+        task,
+        int(config["successive_halving"]["semifinal"]["keep"]),
+    )
     semifinal = []
     for entry in semifinalists:
         unit = entry["candidate"]
@@ -1761,15 +1813,7 @@ def run_task_bakeoff(
             }
         )
 
-    ranked_semifinal = rank_scores(semifinal)
-    finalists = []
-    if ranked_semifinal:
-        best = ranked_semifinal[0]
-        finalists = [
-            entry
-            for entry in ranked_semifinal
-            if entry is best or not multi_metric_stronger(best["score"], entry["score"])
-        ]
+    finalists = select_finalists(semifinal, task)
 
     full = []
     for entry in finalists:
