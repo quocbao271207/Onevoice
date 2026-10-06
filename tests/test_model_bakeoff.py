@@ -11,6 +11,7 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
+    assert_interrupted_stage_is_not_live,
     bind_or_validate_invocation,
     candidate_output_dir,
     completed_adapter,
@@ -765,6 +766,26 @@ def test_all_stage_launches_reject_a_stale_loaded_runner(
             [output],
         )
     assert not output.exists()
+
+
+def test_running_stage_pid_blocks_duplicate_launch(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(bakeoff, "pid_is_live", lambda pid: pid == 4242)
+    with pytest.raises(RuntimeError, match="PID 4242 is still live"):
+        assert_interrupted_stage_is_not_live(
+            {"status": "running", "pid": 4242, "command": ["python", "stage.py"]}
+        )
+
+
+def test_legacy_running_stage_command_blocks_duplicate_launch(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        bakeoff, "matching_linux_command_pids", lambda command: [111, 222]
+    )
+    with pytest.raises(RuntimeError, match="111, 222"):
+        assert_interrupted_stage_is_not_live(
+            {"status": "running", "command": ["python", "stage.py"]}
+        )
 
 
 def test_resume_scoring_upgrade_revalidates_completed_benchmark_stage(tmp_path: Path):

@@ -59,6 +59,8 @@ Resume không tin file `candidate_a_freeze.json` chỉ vì nó đã tồn tại.
 
 State resume còn khóa đúng program-state path, SHA-256 của config, `research`/`production` scope và danh sách phê duyệt research-license. State legacy chưa có binding chỉ được nâng cấp khi chưa có stage nào complete; nếu đã có GPU result thì runner từ chối thay vì suy diễn nó thuộc invocation hiện tại.
 
+Mỗi stage ghi PID và process-group ngay sau `Popen`. Nếu parent gián đoạn, resume kiểm tra PID cũ trước khi ghi đè state; state legacy chưa có PID được đối chiếu exact command qua `/proc/*/cmdline`. Chỉ khi không còn process khớp mới được launch lại, ngăn hai GPU child chạy song song sau crash.
+
 1. Zero-shot trên cùng selection dev.
 2. Pilot 400 steps, effective batch 32.
 3. Loại candidate fail safety hoặc thua rõ; giữ tối đa hai.

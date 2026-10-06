@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -195,6 +196,53 @@ def resume_scoring_command_compatible(
         [item for item in previous_command if item != "--resume-scoring"]
         == [item for item in current_command if item != "--resume-scoring"]
     )
+
+
+def pid_is_live(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def matching_linux_command_pids(command: Any) -> list[int]:
+    if os.name != "posix" or not isinstance(command, list) or not command:
+        return []
+    expected = [str(item) for item in command]
+    matches = []
+    for cmdline_path in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            observed = [
+                item.decode(errors="surrogateescape")
+                for item in cmdline_path.read_bytes().split(b"\0")
+                if item
+            ]
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if observed == expected:
+            matches.append(int(cmdline_path.parent.name))
+    return sorted(matches)
+
+
+def assert_interrupted_stage_is_not_live(previous: dict[str, Any] | None) -> None:
+    if not isinstance(previous, dict) or previous.get("status") != "running":
+        return
+    pid = previous.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool):
+        if pid_is_live(pid):
+            raise RuntimeError(f"Refusing duplicate stage launch; PID {pid} is still live")
+        return
+    matches = matching_linux_command_pids(previous.get("command"))
+    if matches:
+        raise RuntimeError(
+            "Refusing duplicate legacy stage launch; matching PIDs are still live: "
+            + ", ".join(str(item) for item in matches)
+        )
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1091,6 +1139,7 @@ def run_stage(
     validate_loaded_runner_generation()
     digest = command_digest(command)
     previous = state.setdefault("stages", {}).get(name)
+    assert_interrupted_stage_is_not_live(previous)
     if previous and previous.get("status") == "complete":
         recovery_only_upgrade = (
             previous.get("command_sha256") != digest
@@ -1126,6 +1175,9 @@ def run_stage(
             text=True,
             start_new_session=True,
         )
+        state["stages"][name]["pid"] = process.pid
+        state["stages"][name]["process_group"] = process.pid
+        atomic_json(state_path, state)
         if resource_limits is None:
             return_code = process.wait()
         else:
