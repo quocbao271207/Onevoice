@@ -89,6 +89,16 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
         assert b"\r\n" not in (ROOT / data["data"]["selection_dev"][task]["path"]).read_bytes()
 
 
+def test_gpu_requirements_include_m2m100_tokenizer_runtime():
+    requirements = {
+        line.strip()
+        for line in (ROOT / "requirements-gpu.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert "sentencepiece==0.2.1" in requirements
+
+
 def test_bakeoff_rejects_candidate_a_infrastructure_error_before_gpu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
