@@ -11,11 +11,13 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
+    bind_or_validate_invocation,
     candidate_output_dir,
     completed_adapter,
     critical_safety_pass,
     deployment_expectations,
     interval_stronger,
+    invocation_binding,
     license_gate,
     multi_metric_stronger,
     report_score,
@@ -183,6 +185,36 @@ def test_existing_candidate_a_freeze_is_rehashed_before_resume(tmp_path: Path):
     (asr_adapter / "adapter_model.safetensors").write_bytes(b"mutated")
     with pytest.raises(ValueError, match="adapter changed after freeze"):
         validate_candidate_a_freeze(current, freeze)
+
+
+def test_bakeoff_invocation_binding_blocks_cross_program_resume(tmp_path: Path):
+    program = tmp_path / "program_state.json"
+    config_path = tmp_path / "bakeoff.yaml"
+    program.write_text("{}", encoding="utf-8")
+    config_path.write_text("version: 1\n", encoding="utf-8")
+    binding = invocation_binding(program, config_path, "research", set())
+    state = {"stages": {"interrupted": {"status": "running"}}}
+
+    bind_or_validate_invocation(state, binding)
+    assert state["invocation_binding"] == binding
+    bind_or_validate_invocation(state, binding)
+
+    changed = invocation_binding(program, config_path, "production", set())
+    with pytest.raises(ValueError, match="invocation changed"):
+        bind_or_validate_invocation(state, changed)
+
+
+def test_completed_legacy_state_without_invocation_binding_is_rejected():
+    state = {"stages": {"old": {"status": "complete"}}}
+    binding = {
+        "current_program_state": "/program.json",
+        "config": {"path": "/config.yaml", "sha256": "a" * 64},
+        "scope": "research",
+        "research_approvals": [],
+    }
+
+    with pytest.raises(ValueError, match="completed stages"):
+        bind_or_validate_invocation(state, binding)
 
 
 def test_adapter_tree_manifest_uses_portable_paths(tmp_path: Path):

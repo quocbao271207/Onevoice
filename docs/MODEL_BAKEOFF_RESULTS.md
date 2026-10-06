@@ -55,6 +55,8 @@ Trước bất kỳ GPU stage bake-off nào, runner bây giờ kiểm tra lại 
 
 Resume không tin file `candidate_a_freeze.json` chỉ vì nó đã tồn tại. Runner băm lại từng file của cả adapter MT/ASR, so khớp root/path/bytes/SHA-256/manifest digest và kiểm tra adapter binding trong program state; freeze cũ, bị sửa hoặc trỏ sang checkpoint khác sẽ dừng fail-closed trước bake-off.
 
+State resume còn khóa đúng program-state path, SHA-256 của config, `research`/`production` scope và danh sách phê duyệt research-license. State legacy chưa có binding chỉ được nâng cấp khi chưa có stage nào complete; nếu đã có GPU result thì runner từ chối thay vì suy diễn nó thuộc invocation hiện tại.
+
 1. Zero-shot trên cùng selection dev.
 2. Pilot 400 steps, effective batch 32.
 3. Loại candidate fail safety hoặc thua rõ; giữ tối đa hai.

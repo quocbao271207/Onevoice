@@ -195,6 +195,44 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def invocation_binding(
+    program_path: Path,
+    config_path: Path,
+    scope: str,
+    research_approvals: set[str],
+) -> dict[str, Any]:
+    return {
+        "current_program_state": str(program_path.resolve()),
+        "config": {
+            "path": str(config_path.resolve()),
+            "sha256": sha256(config_path.resolve()),
+        },
+        "scope": scope,
+        "research_approvals": sorted(research_approvals),
+    }
+
+
+def bind_or_validate_invocation(
+    state: dict[str, Any], binding: dict[str, Any]
+) -> None:
+    recorded = state.get("invocation_binding")
+    if recorded is None:
+        completed = [
+            name
+            for name, stage in state.get("stages", {}).items()
+            if isinstance(stage, dict) and stage.get("status") == "complete"
+        ]
+        if completed:
+            raise ValueError(
+                "Legacy bake-off state has completed stages but no invocation binding: "
+                + ", ".join(sorted(completed))
+            )
+        state["invocation_binding"] = binding
+        return
+    if recorded != binding:
+        raise ValueError("Bake-off invocation changed for the existing state directory")
+
+
 def load_config(path: Path) -> dict[str, Any]:
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     if config.get("version") != 1:
@@ -1825,6 +1863,8 @@ def main() -> int:
 
     program_path = find_current_program_state(config, args.current_program_state)
     current = wait_for_current_program(program_path, args.poll_seconds, args.wait_current)
+    approvals = set(args.approve_research_license)
+    binding = invocation_binding(program_path, args.config, args.scope, approvals)
     candidate_a_locked_evaluations = {
         "mt": validate_candidate_a_locked_evaluation(
             current, config, "mt", args.mt_candidate_output
@@ -1846,6 +1886,7 @@ def main() -> int:
             "stages": {},
         }
         atomic_json(state_path, state)
+    bind_or_validate_invocation(state, binding)
     freeze_path = state_dir / "candidate_a_freeze.json"
     if not freeze_path.is_file():
         frozen = freeze_candidate_a(current, freeze_path)
@@ -1862,7 +1903,7 @@ def main() -> int:
     mt_result = run_task_bakeoff(
         task="mt",
         config=config,
-        research_approvals=set(args.approve_research_license),
+        research_approvals=approvals,
         frozen=frozen,
         python=args.python,
         state_dir=state_dir,
@@ -1874,7 +1915,7 @@ def main() -> int:
     asr_result = run_task_bakeoff(
         task="asr",
         config=config,
-        research_approvals=set(args.approve_research_license),
+        research_approvals=approvals,
         frozen=frozen,
         python=args.python,
         state_dir=state_dir,
