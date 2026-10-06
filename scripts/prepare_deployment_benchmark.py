@@ -96,6 +96,8 @@ def build_template(
             "chipset": "QCS6490",
             "board": "",
             "os": "",
+            "identity_evidence_path": "",
+            "identity_evidence_sha256": "",
         },
         "winners": [
             {
@@ -155,6 +157,29 @@ def finalize_report(
         "path": str(selection_path.resolve()),
         "sha256": sha256(selection_path),
     }
+    device = final.get("device")
+    if not isinstance(device, dict):
+        raise ValueError("Deployment device metadata is missing")
+    identity_value = str(device.get("identity_evidence_path") or "").strip()
+    if not identity_value:
+        raise ValueError("QCS6490 identity evidence path is missing")
+    identity_path = _resolve_artifact(identity_value, project_root)
+    identity_root = (
+        project_root / "data" / "reports" / "model_bakeoff" / "board-evidence"
+    ).resolve()
+    if identity_root not in identity_path.parents:
+        raise ValueError("QCS6490 identity evidence must be under board-evidence")
+    if not identity_path.is_file():
+        raise FileNotFoundError(f"QCS6490 identity evidence is missing: {identity_path}")
+    try:
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("QCS6490 identity evidence is not valid JSON") from exc
+    if not isinstance(identity, dict):
+        raise ValueError("QCS6490 identity evidence payload is invalid")
+    device["identity_evidence_sha256"] = sha256(identity_path)
+    device["board"] = str(identity.get("board_model") or "").strip()
+    device["architecture"] = str(identity.get("architecture") or "").strip()
     final_records = {_winner_key(item): item for item in final["winners"]}
     for key, expected_record in expected_by_key.items():
         record = final_records[key]

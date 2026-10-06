@@ -775,6 +775,27 @@ def test_deployment_expectations_bind_exact_adapter_tree(tmp_path: Path):
 def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: Path):
     checksum = "a" * 64
     project_root = tmp_path / "project"
+    identity = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/qcs6490-identity.json"
+    )
+    identity.parent.mkdir(parents=True)
+    identity.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "capture_source": "linux_sysfs_device_tree",
+                "captured_at": "2026-10-06T12:00:00+07:00",
+                "architecture": "aarch64",
+                "board_model": "Dragonwing RB3 Gen 2 Vision Kit",
+                "device_tree_compatible": ["qcom,qcs6490-rb3gen2"],
+                "soc_family": "Qualcomm QCS6490",
+                "soc_id": "QCS6490",
+                "kernel_release": "6.1",
+            }
+        ),
+        encoding="utf-8",
+    )
     artifact = project_root / "models" / "mt-winner.tar"
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"compiled-qnn-artifact")
@@ -809,6 +830,9 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
             "chipset": "QCS6490",
             "board": "Dragonwing RB3 Gen 2 Vision Kit",
             "os": "Qc_Linux 1.6",
+            "architecture": "aarch64",
+            "identity_evidence_path": str(identity.relative_to(project_root)),
+            "identity_evidence_sha256": bakeoff.sha256(identity),
         },
         "winners": [winner],
     }
@@ -820,6 +844,12 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "model_bytes",
     ]
     assert validate_deployment_report(report, expected, metrics, 30, project_root) == (True, [])
+
+    report["measured_at"] = "2026-10-08T12:00:01+07:00"
+    passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
+    assert passed is False
+    assert "device.identity_evidence:not_same_session" in failures
+    report["measured_at"] = "2026-10-06T12:00:00+07:00"
 
     report["measurement_source"] = "cloud_profile"
     winner["candidate_id"] = "wrong-winner"

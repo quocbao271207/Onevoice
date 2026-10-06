@@ -54,6 +54,36 @@ def deployment_fixture(tmp_path: Path) -> tuple[Path, dict, dict, Path]:
     return selection, comparison, config, project_root
 
 
+def write_identity_evidence(
+    project_root: Path,
+    *,
+    board_model: str = "Qualcomm QCS6490 RB3 Gen 2 Vision Kit",
+    compatible: list[str] | None = None,
+) -> Path:
+    path = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/qcs6490-identity.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "capture_source": "linux_sysfs_device_tree",
+                "captured_at": "2026-10-06T12:00:00+07:00",
+                "architecture": "aarch64",
+                "board_model": board_model,
+                "device_tree_compatible": compatible or ["qcom,qcs6490-rb3gen2"],
+                "soc_family": "Qualcomm QCS6490",
+                "soc_id": "QCS6490",
+                "kernel_release": "6.1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_template_binds_all_selected_winners(tmp_path: Path):
     selection, comparison, _, _ = deployment_fixture(tmp_path)
 
@@ -76,8 +106,12 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
     draft = build_template(selection, comparison)
     draft["measured_at"] = "2026-10-06T12:00:00+07:00"
+    identity = write_identity_evidence(project_root)
     draft["device"].update(
-        {"board": "Dragonwing RB3 Gen 2 Vision Kit", "os": "Qc_Linux 1.6"}
+        {
+            "os": "Qc_Linux 1.6",
+            "identity_evidence_path": str(identity.relative_to(project_root)),
+        }
     )
     models = project_root / "models"
     models.mkdir()
@@ -97,6 +131,8 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
 
     assert report["status"] == "pass"
     assert report["selection_comparison"]["sha256"] == sha256(selection)
+    assert report["device"]["board"] == "Qualcomm QCS6490 RB3 Gen 2 Vision Kit"
+    assert report["device"]["identity_evidence_sha256"] == sha256(identity)
     for index, winner in enumerate(report["winners"]):
         artifact = models / f"winner-{index}.bin"
         assert winner["measurement_runs"] == 30
@@ -109,6 +145,13 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
 def test_finalize_rejects_changed_winner_binding(tmp_path: Path):
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
     draft = build_template(selection, comparison)
+    identity = write_identity_evidence(project_root)
+    draft["device"].update(
+        {
+            "os": "Qc_Linux 1.6",
+            "identity_evidence_path": str(identity.relative_to(project_root)),
+        }
+    )
     draft["winners"][0]["candidate_id"] = "other"
 
     with pytest.raises(ValueError, match="candidate binding changed"):
@@ -119,7 +162,17 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
     draft = build_template(selection, comparison)
     draft["measured_at"] = "2026-10-06T12:00:00+07:00"
-    draft["device"].update({"board": "Arduino", "os": "firmware"})
+    identity = write_identity_evidence(
+        project_root,
+        board_model="Arduino Uno",
+        compatible=["arduino,uno"],
+    )
+    draft["device"].update(
+        {
+            "os": "firmware",
+            "identity_evidence_path": str(identity.relative_to(project_root)),
+        }
+    )
     outside = tmp_path / "outside-model.bin"
     outside.write_bytes(b"not-qcs-artifact")
     for winner in draft["winners"]:
@@ -132,7 +185,7 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
             }
         )
 
-    with pytest.raises(ValueError, match="artifact_outside_models"):
+    with pytest.raises(ValueError, match="identity_evidence:board_model_not_qcs6490"):
         finalize_report(selection, comparison, draft, config, project_root)
 
 

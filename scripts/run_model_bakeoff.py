@@ -420,6 +420,51 @@ def percentile_linear(values: list[float], quantile: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
+def qcs6490_identity_failures(identity: Any) -> list[str]:
+    """Validate raw Linux device-tree evidence captured on the target board."""
+    if not isinstance(identity, dict):
+        return ["payload_invalid"]
+    failures: list[str] = []
+    if identity.get("version") != 1:
+        failures.append("version_invalid")
+    if identity.get("capture_source") != "linux_sysfs_device_tree":
+        failures.append("capture_source_invalid")
+
+    captured_at = str(identity.get("captured_at") or "")
+    try:
+        captured_time = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        if captured_time.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError:
+        failures.append("captured_at_invalid")
+
+    architecture = str(identity.get("architecture") or "").strip().lower()
+    if architecture not in {"aarch64", "arm64"}:
+        failures.append("architecture_not_arm64")
+
+    board_model = str(identity.get("board_model") or "").strip().upper()
+    if not (
+        "QCS6490" in board_model
+        or "RB3 GEN 2" in board_model
+        or "RB3GEN2" in board_model
+    ):
+        failures.append("board_model_not_qcs6490")
+
+    compatible_value = identity.get("device_tree_compatible")
+    if isinstance(compatible_value, str):
+        compatible = [compatible_value]
+    elif isinstance(compatible_value, list):
+        compatible = [str(value) for value in compatible_value]
+    else:
+        compatible = []
+    compatible_text = " ".join(compatible).upper()
+    if "QCOM" not in compatible_text or (
+        "QCS6490" not in compatible_text and "RB3GEN2" not in compatible_text
+    ):
+        failures.append("compatible_not_qcs6490")
+    return failures
+
+
 def validate_deployment_report(
     report: dict[str, Any],
     expected_winners: list[dict[str, Any]],
@@ -439,11 +484,13 @@ def validate_deployment_report(
         failures.append("measurement_source:not_physical_board")
 
     measured_at = str(report.get("measured_at") or "")
+    measured_time: datetime | None = None
     try:
         measured_time = datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
         if measured_time.tzinfo is None:
             raise ValueError("timezone required")
     except ValueError:
+        measured_time = None
         failures.append("measured_at:invalid")
 
     device = report.get("device")
@@ -459,6 +506,59 @@ def validate_deployment_report(
             failures.append("device.board:not_qcs6490_board")
         if not str(device.get("os") or "").strip():
             failures.append("device.os:missing")
+
+        identity_value = str(device.get("identity_evidence_path") or "").strip()
+        identity_sha = str(device.get("identity_evidence_sha256") or "")
+        if not identity_value:
+            failures.append("device.identity_evidence_path:missing")
+        else:
+            identity_path = Path(identity_value)
+            if not identity_path.is_absolute():
+                identity_path = project_root / identity_path
+            identity_path = identity_path.resolve()
+            identity_root = (
+                project_root / "data" / "reports" / "model_bakeoff" / "board-evidence"
+            ).resolve()
+            if identity_root not in identity_path.parents:
+                failures.append("device.identity_evidence_path:outside_board_evidence")
+            elif not identity_path.is_file():
+                failures.append("device.identity_evidence_path:missing_file")
+            else:
+                if not SHA256_RE.fullmatch(identity_sha):
+                    failures.append("device.identity_evidence_sha256:invalid")
+                elif sha256(identity_path) != identity_sha:
+                    failures.append("device.identity_evidence_sha256:mismatch")
+                try:
+                    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    failures.append("device.identity_evidence:invalid_json")
+                else:
+                    for failure in qcs6490_identity_failures(identity):
+                        failures.append(f"device.identity_evidence:{failure}")
+                    evidence_board = str(identity.get("board_model") or "").strip()
+                    if evidence_board and board != evidence_board:
+                        failures.append("device.board:identity_mismatch")
+                    evidence_architecture = str(
+                        identity.get("architecture") or ""
+                    ).strip()
+                    if evidence_architecture and str(
+                        device.get("architecture") or ""
+                    ).strip() != evidence_architecture:
+                        failures.append("device.architecture:identity_mismatch")
+                    try:
+                        captured_time = datetime.fromisoformat(
+                            str(identity.get("captured_at") or "").replace("Z", "+00:00")
+                        )
+                        if captured_time.tzinfo is None:
+                            captured_time = None
+                    except ValueError:
+                        captured_time = None
+                    if (
+                        measured_time is not None
+                        and captured_time is not None
+                        and abs((measured_time - captured_time).total_seconds()) > 86_400
+                    ):
+                        failures.append("device.identity_evidence:not_same_session")
 
     expected_by_key = {
         (item["task"], item.get("direction")): item for item in expected_winners
