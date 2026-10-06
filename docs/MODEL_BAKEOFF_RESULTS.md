@@ -64,7 +64,7 @@ Mỗi slot blind chỉ được mở cho winner đúng task/chiều trong snapsh
 
 ## Successive halving và winner gate
 
-Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling utilization 70%, resume 55% và hard reaction 74% — luôn dưới 75%. Stage mới lấy mẫu tài nguyên mỗi 1 giây; preflight từ chối ngưỡng không hữu hạn, sai thứ tự hoặc vượt trần trước khi khởi chạy child.
+Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling utilization 70%, resume 55% và hard reaction 74% — luôn dưới 75%. Trước mọi child train/eval, runner không dùng GPU và chờ đến khi utilization không vượt resume threshold đồng thời VRAM trống đủ chứa toàn bộ hard budget 40%; log `pre_spawn_capacity.jsonl` ghi bằng chứng mỗi phút và PID sở hữu stage ngăn launch trùng khi đang chờ. Sau khi spawn, stage lấy mẫu tài nguyên mỗi 1 giây; preflight từ chối ngưỡng không hữu hạn, sai thứ tự hoặc vượt trần trước khi khởi chạy child.
 
 Monitor VRAM đối chiếu cả PID trong container và chuỗi `NSpid` Linux để tìm đúng host PID mà `nvidia-smi` báo. Chỉ khi không có ánh xạ namespace mới dùng chênh lệch snapshot trước/sau spawn; nhờ vậy job GPU khác khởi động đồng thời không bị cộng nhầm vào bộ nhớ của child đang train và không tạo hard-stop giả.
 
