@@ -13,7 +13,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -112,6 +112,94 @@ def read_gpu_sample() -> dict[str, float]:
     ).strip().splitlines()[0]
     values = [float(value.strip()) for value in output.split(",")]
     return dict(zip(("utilization", "memory_total_mib", "memory_used_mib", "power_w", "power_limit_w"), values))
+
+
+def gpu_spawn_capacity(
+    sample: dict[str, float],
+    limits: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Evaluate whether a new GPU child can safely reserve its hard memory budget."""
+    _, hard_memory_fraction = validate_resource_limits(limits)
+    required = ("utilization", "memory_total_mib", "memory_used_mib")
+    try:
+        utilization, total, used = (float(sample[name]) for name in required)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("GPU capacity sample is missing finite numeric fields") from exc
+    if not all(math.isfinite(value) for value in (utilization, total, used)):
+        raise ValueError("GPU capacity sample must be finite")
+    if total <= 0.0 or not 0.0 <= used <= total or not 0.0 <= utilization <= 100.0:
+        raise ValueError("GPU capacity sample is outside valid bounds")
+
+    _, resume_percent, boosted_window = active_utilization_limits(limits, now)
+    free = total - used
+    required_free = total * hard_memory_fraction
+    reason = None
+    if utilization > resume_percent:
+        reason = "utilization_above_resume"
+    elif free < required_free:
+        reason = "insufficient_memory_headroom"
+    return {
+        "allowed": reason is None,
+        "reason": reason,
+        "utilization": utilization,
+        "memory_total_mib": total,
+        "memory_used_mib": used,
+        "memory_free_mib": free,
+        "required_free_memory_mib": required_free,
+        "active_resume_percent": resume_percent,
+        "configured_hard_memory_fraction": hard_memory_fraction,
+        "boosted_window": boosted_window,
+    }
+
+
+def wait_for_gpu_spawn_capacity(
+    limits: dict[str, Any],
+    evidence_path: Path,
+    *,
+    sample_reader: Callable[[], dict[str, float]] | None = None,
+    sleeper: Callable[[float], None] | None = None,
+    poll_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Wait without a GPU child until shared-GPU utilization and memory are safe."""
+    validate_resource_limits(limits)
+    reader = sample_reader or read_gpu_sample
+    sleep = sleeper or time.sleep
+    interval = (
+        max(60.0, float(limits["sample_seconds"]))
+        if poll_seconds is None
+        else float(poll_seconds)
+    )
+    if not math.isfinite(interval) or interval <= 0.0:
+        raise ValueError("GPU spawn-capacity poll interval must be positive and finite")
+
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    samples = 0
+    with evidence_path.open("a", encoding="utf-8") as evidence:
+        while True:
+            samples += 1
+            timestamp = datetime.now(timezone.utc).isoformat()
+            try:
+                capacity = gpu_spawn_capacity(reader(), limits)
+                record = {"time": timestamp, **capacity}
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                record = {
+                    "time": timestamp,
+                    "allowed": False,
+                    "reason": "gpu_sample_error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            evidence.write(json.dumps(record) + "\n")
+            evidence.flush()
+            if record["allowed"]:
+                return {
+                    "samples": samples,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "evidence_log": str(evidence_path),
+                    "approval": record,
+                }
+            sleep(interval)
 
 
 def active_utilization_limits(
@@ -657,8 +745,10 @@ def main() -> int:
             continue
         log_path = round_dir / "training.log"
         monitor_path = round_dir / "resource_monitor.jsonl"
+        spawn_capacity_path = round_dir / "pre_spawn_capacity.jsonl"
         checkpoint_archive_dir = run_root / "checkpoint-archives" / round_dir.name
         watcher_log_path = round_dir / "checkpoint_watcher.log"
+        spawn_capacity = wait_for_gpu_spawn_capacity(limits, spawn_capacity_path)
         with log_path.open("w", encoding="utf-8") as log:
             gpu_memory_baseline = gpu_process_memory_by_pid()
             process = subprocess.Popen(
@@ -714,6 +804,7 @@ def main() -> int:
         result = {
             "name": name,
             "status": "complete" if training_complete and watcher_complete else "failed",
+            "spawn_capacity": spawn_capacity,
             "monitor": monitor_summary,
             "checkpoint_watcher": watcher_summary,
             "metric": metric_from_report(report, task["selection_metric"]),

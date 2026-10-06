@@ -20,11 +20,13 @@ from scripts.run_gpu_rounds import (
     configured_rounds,
     gpu_process_memory_by_pid,
     exact_process_memory_attribution,
+    gpu_spawn_capacity,
     process_pid_aliases,
     resolve_adaptive_final,
     select_completed_round,
     utilization_throttle_reason,
     validate_resource_limits,
+    wait_for_gpu_spawn_capacity,
 )
 from scripts.candidate_evidence import verify_evidence_archive
 
@@ -102,6 +104,110 @@ def test_gpu_round_hard_utilization_guard_preempts_a_low_rolling_average():
         == "rolling_utilization"
     )
     assert utilization_throttle_reason(current=73.0, rolling=70.0, **common) is None
+
+
+def test_gpu_spawn_capacity_requires_room_for_the_hard_process_budget():
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    sample = {
+        "utilization": 20.0,
+        "memory_total_mib": 40_960.0,
+        "memory_used_mib": 31_734.0,
+    }
+
+    capacity = gpu_spawn_capacity(sample, limits)
+
+    assert capacity["allowed"] is False
+    assert capacity["reason"] == "insufficient_memory_headroom"
+    assert capacity["required_free_memory_mib"] == 16_384.0
+
+
+def test_gpu_spawn_capacity_uses_resume_threshold_before_launch():
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    sample = {
+        "utilization": 55.1,
+        "memory_total_mib": 40_960.0,
+        "memory_used_mib": 10_000.0,
+    }
+
+    assert gpu_spawn_capacity(sample, limits)["reason"] == "utilization_above_resume"
+    sample["utilization"] = 55.0
+    assert gpu_spawn_capacity(sample, limits)["allowed"] is True
+
+
+def test_gpu_spawn_capacity_waiter_retries_and_records_evidence(tmp_path: Path):
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    samples = iter(
+        [
+            {
+                "utilization": 10.0,
+                "memory_total_mib": 40_960.0,
+                "memory_used_mib": 31_000.0,
+            },
+            {
+                "utilization": 10.0,
+                "memory_total_mib": 40_960.0,
+                "memory_used_mib": 20_000.0,
+            },
+        ]
+    )
+    sleeps: list[float] = []
+    evidence = tmp_path / "pre_spawn_capacity.jsonl"
+
+    result = wait_for_gpu_spawn_capacity(
+        limits,
+        evidence,
+        sample_reader=lambda: next(samples),
+        sleeper=sleeps.append,
+        poll_seconds=2.0,
+    )
+
+    records = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
+    assert result["samples"] == 2
+    assert sleeps == [2.0]
+    assert [record["allowed"] for record in records] == [False, True]
+    assert records[0]["reason"] == "insufficient_memory_headroom"
+
+
+def test_gpu_spawn_capacity_waiter_fails_closed_on_sample_error(tmp_path: Path):
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    outcomes = iter(
+        [
+            OSError("nvidia-smi unavailable"),
+            {
+                "utilization": 5.0,
+                "memory_total_mib": 40_960.0,
+                "memory_used_mib": 20_000.0,
+            },
+        ]
+    )
+
+    def sample_reader() -> dict[str, float]:
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    evidence = tmp_path / "pre_spawn_capacity.jsonl"
+    result = wait_for_gpu_spawn_capacity(
+        limits,
+        evidence,
+        sample_reader=sample_reader,
+        sleeper=lambda _: None,
+        poll_seconds=1.0,
+    )
+
+    records = [json.loads(line) for line in evidence.read_text(encoding="utf-8").splitlines()]
+    assert result["samples"] == 2
+    assert records[0]["reason"] == "gpu_sample_error"
+    assert records[0]["allowed"] is False
 
 
 def test_gpu_process_memory_parser_ignores_malformed_rows(monkeypatch: pytest.MonkeyPatch):

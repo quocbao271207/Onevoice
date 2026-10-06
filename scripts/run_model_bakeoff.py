@@ -30,7 +30,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.run_gpu_program import verified_training_result  # noqa: E402
-from scripts.run_gpu_rounds import validate_resource_limits  # noqa: E402
+from scripts.run_gpu_rounds import (  # noqa: E402
+    validate_resource_limits,
+    wait_for_gpu_spawn_capacity,
+)
 from scripts.verify_checkpoint_download import verify_checkpoint_download  # noqa: E402
 from scripts.watch_checkpoints import (  # noqa: E402
     checkpoint_file_records,
@@ -1279,15 +1282,36 @@ def run_stage(
         # Re-run only the CPU scoring path; --resume-scoring verifies the exact
         # prediction checkpoint and skips model loading and inference.
     state["stage"] = name
-    state["stages"][name] = {
+    stage_record = {
         "status": "running",
         "started_at": utc_now(),
         "command": command,
         "command_sha256": digest,
         "log": str(log_path),
     }
+    if resource_limits is not None:
+        stage_record.update(
+            {
+                "pid": os.getpid(),
+                "waiting_for_gpu_capacity": True,
+            }
+        )
+    state["stages"][name] = stage_record
     atomic_json(state_path, state)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    if resource_limits is not None:
+        spawn_capacity_path = log_path.with_suffix(".pre_spawn.jsonl")
+        spawn_capacity = wait_for_gpu_spawn_capacity(
+            resource_limits,
+            spawn_capacity_path,
+        )
+        state["stages"][name].update(
+            {
+                "spawn_capacity": spawn_capacity,
+                "waiting_for_gpu_capacity": False,
+            }
+        )
+        atomic_json(state_path, state)
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,

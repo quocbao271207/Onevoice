@@ -877,6 +877,52 @@ def test_running_stage_pid_blocks_duplicate_launch(monkeypatch: pytest.MonkeyPat
         )
 
 
+def test_gpu_stage_waits_for_capacity_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    state_path = tmp_path / "state.json"
+    output = tmp_path / "output.json"
+    log = tmp_path / "stage.log"
+    state = {"stages": {}}
+    command = [
+        sys.executable,
+        "-c",
+        f"from pathlib import Path; Path({str(output)!r}).write_text('ok')",
+    ]
+    observed: dict = {}
+
+    def approve_capacity(limits: dict, evidence_path: Path) -> dict:
+        waiting_state = json.loads(state_path.read_text(encoding="utf-8"))
+        observed.update(waiting_state["stages"]["stage"])
+        assert not output.exists()
+        return {
+            "samples": 1,
+            "evidence_log": str(evidence_path),
+            "approval": {"allowed": True},
+        }
+
+    def monitor(process: subprocess.Popen, *_args) -> dict:
+        return {"return_code": process.wait()}
+
+    monkeypatch.setattr(bakeoff, "wait_for_gpu_spawn_capacity", approve_capacity)
+    monkeypatch.setattr("scripts.run_gpu_rounds.monitor_process", monitor)
+
+    run_stage(
+        "stage",
+        command,
+        state_path,
+        state,
+        log,
+        [output],
+        resource_limits=config()["resources"],
+    )
+
+    assert observed["pid"] == bakeoff.os.getpid()
+    assert observed["waiting_for_gpu_capacity"] is True
+    assert state["stages"]["stage"]["waiting_for_gpu_capacity"] is False
+    assert state["stages"]["stage"]["spawn_capacity"]["approval"]["allowed"] is True
+
+
 def test_legacy_running_stage_command_blocks_duplicate_launch(
     monkeypatch: pytest.MonkeyPatch,
 ):
