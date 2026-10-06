@@ -13,7 +13,9 @@ Chưa model bổ sung nào được gọi là `benchmarked`. Candidate A vẫn �
 
 Artifact MT legacy đã được tải về `test/program-20261005-014500`: archive 3.938.906 byte có SHA-256 `d908ddc739acb9067514b0139a291bb67c91c465b7f096418064ebc5bf83cf81`, khớp sidecar gốc. Runner cũ không phát hành canonical `.manifest.json` và archive thiếu provenance cho full predictions, nên artifact này không đủ điều kiện resume/promotion theo runner mới. Bản kê `mt-candidate.tar.gz.derived-manifest.json` chỉ xác minh forensic 12 member/22.861.924 byte và luôn ghi `resume_eligible=false`; `download_manifest.json` khóa lại toàn bộ file đã tải. Đây vẫn chỉ là một phần chương trình: ASR Candidate A, challenger training, blind v2 và deployment benchmark còn ở phía sau.
 
-Checkpoint ASR full-data bước 500 đã được watcher phát hành và tải về local ngày 06/10/2026. Archive 28.892.956 byte có SHA-256 `acb7e618ec12b4f433243b8a1bb5377c14cdd07b68ef935d08b322b2b3e05d34`; sidecar, manifest và index khớp, 15/15 member (34.771.506 byte nội dung) đều qua kiểm tra hash/path/type. `eval_loss` giảm từ 1,5151 ở bước 250 xuống 1,1474; `eval_wer` giảm từ 67,3243 xuống 39,1998, nên checkpoint 500 là best hiện tại. Đây là validation trend, không phải locked-test safety evidence và chưa cho phép promotion.
+Checkpoint ASR full-data bước 500 và 750 đã được watcher phát hành, tải về local và xác minh ngày 06/10/2026. Archive bước 750 có 28.888.504 byte, SHA-256 `b565ccfd1c8602bbc71a720b63a3bee13a65f9e9f78f7124657b7002485aabd8`; sidecar, content manifest và checkpoint index khớp. Cả 15/15 regular member (34.773.485 byte nội dung) đều đúng hash, không có path traversal, duplicate, symlink hay special member; `trainer_state.global_step=750` và `max_steps=2871`.
+
+`eval_loss` tiếp tục giảm từ 1,5151 ở bước 250 qua 1,1474 ở bước 500 xuống 0,9435 ở bước 750. Tuy nhiên `eval_wer` giảm từ 67,3243 xuống 39,1998 rồi tăng nhẹ lên 39,9387, nên best checkpoint vẫn là bước 500 theo policy `eval_wer` lower-is-better; không được đổi winner chỉ vì loss thấp hơn. Đây là validation trend, không phải locked-test safety evidence và chưa cho phép promotion.
 
 ## Candidate và license gate
 
