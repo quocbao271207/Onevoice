@@ -768,9 +768,13 @@ def evaluate(
             ]
         else:
             command += ["--language", "vi"]
-        from scripts.run_gpu_rounds import monitor_process
+        from scripts.run_gpu_rounds import monitor_process, wait_for_gpu_spawn_capacity
 
         log_path = output_dir / f"{stem}.log"
+        spawn_capacity = wait_for_gpu_spawn_capacity(
+            config["resources"],
+            output_dir / f"{stem}_pre_spawn.jsonl",
+        )
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
                 command,
@@ -785,6 +789,7 @@ def evaluate(
                 output_dir / f"{stem}_resources.jsonl",
                 config["resources"],
             )
+        monitored["spawn_capacity"] = spawn_capacity
         if monitored["return_code"]:
             raise RuntimeError(
                 f"Blind benchmark failed with {monitored['return_code']}; see {log_path}"
@@ -802,6 +807,7 @@ def evaluate(
                 "report": str(report_path),
                 "report_bytes": report_path.stat().st_size,
                 "report_sha256": sha256(report_path),
+                "resource_run": monitored,
             },
         )
     provenance = verify_report_provenance(

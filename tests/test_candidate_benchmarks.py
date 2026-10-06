@@ -11,6 +11,8 @@ import pytest
 import torch
 
 import scripts.run_baseline_benchmarks as benchmark
+import scripts.run_asr_candidate_suite as asr_suite
+import scripts.run_mt_candidate_suite as mt_suite
 from scripts.candidate_evidence import (
     archive_evidence,
     derive_legacy_evidence_manifest,
@@ -34,6 +36,52 @@ from scripts.run_baseline_benchmarks import (
 )
 from scripts.run_asr_candidate_suite import candidate_checks as asr_candidate_checks
 from scripts.run_mt_candidate_suite import candidate_checks as mt_candidate_checks
+
+
+@pytest.mark.parametrize("suite", [asr_suite, mt_suite])
+def test_candidate_gpu_benchmark_waits_for_spawn_capacity(
+    suite, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    events: list[str] = []
+
+    def approve_capacity(limits: dict, evidence_path: Path) -> dict:
+        events.append("capacity")
+        return {
+            "samples": 1,
+            "evidence_log": str(evidence_path),
+            "approval": {"allowed": True},
+        }
+
+    class Process:
+        def __init__(self, *_args, **_kwargs):
+            assert events == ["capacity"]
+            events.append("spawn")
+
+    def monitor(_process, _path: Path, _limits: dict) -> dict:
+        events.append("monitor")
+        return {"return_code": 0}
+
+    monkeypatch.setattr(suite, "wait_for_gpu_spawn_capacity", approve_capacity)
+    monkeypatch.setattr(suite.subprocess, "Popen", Process)
+    monkeypatch.setattr(suite, "monitor_process", monitor)
+    output_dir = tmp_path / "candidate"
+    output_dir.mkdir()
+
+    summary = suite.run_benchmark(
+        adapter=tmp_path / "adapter",
+        manifest=tmp_path / "manifest.jsonl",
+        name="selection",
+        output_dir=output_dir,
+        device="cuda",
+        precision="bf16",
+        batch_size=1,
+        num_beams=1,
+        gpu_memory_fraction=0.35,
+        utilization_limits={"sentinel": True},
+    )
+
+    assert events == ["capacity", "spawn", "monitor"]
+    assert summary["spawn_capacity"]["approval"]["allowed"] is True
 
 
 def test_explicit_benchmark_device_is_preserved():

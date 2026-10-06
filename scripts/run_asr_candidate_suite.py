@@ -27,7 +27,10 @@ from scripts.candidate_evidence import (  # noqa: E402
     read_json,
     sha256,
 )
-from scripts.run_gpu_rounds import monitor_process  # noqa: E402
+from scripts.run_gpu_rounds import (  # noqa: E402
+    monitor_process,
+    wait_for_gpu_spawn_capacity,
+)
 
 
 BASE_MODEL = "vinai/PhoWhisper-small"
@@ -199,6 +202,12 @@ def run_benchmark(
         "--resume-scoring",
     ]
     log_path = output_dir / f"{name}.log"
+    spawn_capacity = None
+    if device != "cpu":
+        spawn_capacity = wait_for_gpu_spawn_capacity(
+            utilization_limits,
+            output_dir / f"{name}_pre_spawn.jsonl",
+        )
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -213,6 +222,7 @@ def run_benchmark(
             output_dir / f"{name}_resource_monitor.jsonl",
             utilization_limits,
         )
+    summary["spawn_capacity"] = spawn_capacity
     if summary["return_code"] != 0:
         raise subprocess.CalledProcessError(summary["return_code"], command)
     return summary
