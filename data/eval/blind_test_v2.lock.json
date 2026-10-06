@@ -47,6 +47,8 @@
     },
     "asr": {
       "rows": 384,
+      "unique_speakers": 32,
+      "unique_groups": 32,
       "slice_samples": {
         "drug_name": 32,
         "dose": 32,

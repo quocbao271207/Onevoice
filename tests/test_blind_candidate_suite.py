@@ -282,7 +282,12 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
                         "path": str(asr_manifest),
                         "rows": 1,
                         "sha256": sha256(asr_manifest),
-                        "coverage": {"rows": 1, "slice_samples": {}},
+                        "coverage": {
+                            "rows": 1,
+                            "slice_samples": {},
+                            "unique_speakers": 0,
+                            "unique_groups": 0,
+                        },
                     },
                 },
                 "selection": None,
@@ -815,6 +820,8 @@ def test_blind_coverage_counts_unique_slices_per_row():
             "noise": 1,
             "patient": 1,
         },
+        "unique_speakers": 0,
+        "unique_groups": 0,
     }
 
 
@@ -851,6 +858,31 @@ def test_blind_minimum_coverage_is_a_hard_gate():
     del policy["slice_samples"]["negation"]
     with pytest.raises(ValueError, match="lacks required slice quotas"):
         validate_minimum_coverage("mt", rows, policy, required)
+
+
+def test_blind_asr_requires_independent_speaker_and_group_coverage():
+    rows = [
+        {
+            "speaker": f"speaker-{index % 2}",
+            "group": f"group-{index % 3}",
+            "categories": ["code_switch"],
+        }
+        for index in range(6)
+    ]
+    policy = {
+        "rows": 6,
+        "unique_speakers": 3,
+        "unique_groups": 3,
+        "slice_samples": {"code_switch": 6},
+    }
+
+    with pytest.raises(ValueError, match=r"unique_speakers=2/3"):
+        validate_minimum_coverage("asr", rows, policy, ["code_switch"])
+
+    policy["unique_speakers"] = 2
+    coverage = validate_minimum_coverage("asr", rows, policy, ["code_switch"])
+    assert coverage["unique_speakers"] == 2
+    assert coverage["unique_groups"] == 3
 
 
 def test_blind_report_coverage_must_match_locked_mt_manifest():
@@ -897,11 +929,28 @@ def test_blind_report_coverage_must_match_locked_asr_dimensions():
         "patient": 1,
         "noise": 1,
     }
-    assert blind_report_coverage_failures(report, "asr", None, 2, expected) == []
+    report.update(
+        {
+            "unique_speakers": 2,
+            "unique_groups": 2,
+            "wer_bootstrap_unit": "group",
+            "wer_bootstrap_clusters": 2,
+        }
+    )
+    expected_unique = {"unique_speakers": 2, "unique_groups": 2}
+    assert blind_report_coverage_failures(
+        report, "asr", None, 2, expected, expected_unique
+    ) == []
 
     del report["slices"]["accent"]["Central"]
-    assert blind_report_coverage_failures(report, "asr", None, 2, expected) == [
-        "slice:central:None/2"
+    report["wer_bootstrap_unit"] = "row"
+    report["wer_bootstrap_clusters"] = 1
+    assert blind_report_coverage_failures(
+        report, "asr", None, 2, expected, expected_unique
+    ) == [
+        "wer_bootstrap_unit:not_group",
+        "wer_bootstrap_clusters:1/2",
+        "slice:central:None/2",
     ]
 
 

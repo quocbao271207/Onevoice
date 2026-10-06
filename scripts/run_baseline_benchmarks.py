@@ -251,6 +251,8 @@ def asr_prediction_slices(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "accent": row.get("accent") or dimensions.get("accent_region"),
         "role": metadata.get("role") or dimensions.get("role"),
+        "speaker": row.get("speaker"),
+        "group": row.get("group"),
         "recording_condition": metadata.get("rec_condition")
         or dimensions.get("recording_condition"),
         "noise": dimensions.get("noise") if isinstance(dimensions.get("noise"), bool) else None,

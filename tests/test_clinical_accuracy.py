@@ -181,10 +181,18 @@ def test_asr_blind_dimensions_survive_prediction_and_slice_scoring():
         "recording_condition": "clinic",
         "noise": True,
     }
-    slices = asr_prediction_slices({"blind_dimensions": dimensions})
+    slices = asr_prediction_slices(
+        {
+            "blind_dimensions": dimensions,
+            "speaker": "speaker-central-1",
+            "group": "recording-central-1",
+        }
+    )
     assert slices == {
         "accent": "Central",
         "role": "Doctor",
+        "speaker": "speaker-central-1",
+        "group": "recording-central-1",
         "recording_condition": "clinic",
         "noise": True,
         "noise_snr": None,
@@ -203,6 +211,10 @@ def test_asr_blind_dimensions_survive_prediction_and_slice_scoring():
     assert report["slices"]["accent"]["Central"]["samples"] == 1
     assert report["slices"]["role"]["Doctor"]["samples"] == 1
     assert report["slices"]["noise"]["True"]["samples"] == 1
+    assert report["wer_bootstrap_unit"] == "group"
+    assert report["wer_bootstrap_clusters"] == 1
+    assert report["unique_speakers"] == 1
+    assert report["unique_groups"] == 1
 
 
 def test_locked_safety_suite_has_no_exact_pair_overlap_with_training_manifest():

@@ -237,7 +237,30 @@ def coverage_counts(task: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             if dimensions.get("noise") is True:
                 observed.add("noise")
         counts.update(observed)
-    return {"rows": len(rows), "slice_samples": dict(sorted(counts.items()))}
+    coverage: dict[str, Any] = {
+        "rows": len(rows),
+        "slice_samples": dict(sorted(counts.items())),
+    }
+    if task == "asr":
+        coverage.update(
+            {
+                "unique_speakers": len(
+                    {
+                        str(row.get("speaker") or "").strip()
+                        for row in rows
+                        if str(row.get("speaker") or "").strip()
+                    }
+                ),
+                "unique_groups": len(
+                    {
+                        str(row.get("group") or "").strip()
+                        for row in rows
+                        if str(row.get("group") or "").strip()
+                    }
+                ),
+            }
+        )
+    return coverage
 
 
 def _positive_int(value: Any, label: str) -> int:
@@ -276,6 +299,13 @@ def validate_minimum_coverage(
     deficits: list[str] = []
     if coverage["rows"] < minimum_rows:
         deficits.append(f"rows={coverage['rows']}/{minimum_rows}")
+    if task == "asr":
+        for name in ("unique_speakers", "unique_groups"):
+            if name not in policy:
+                continue
+            minimum = _positive_int(policy[name], f"{task}.{name}")
+            if coverage[name] < minimum:
+                deficits.append(f"{name}={coverage[name]}/{minimum}")
     observed = coverage["slice_samples"]
     deficits.extend(
         f"{name}={observed.get(name, 0)}/{minimum}"
@@ -346,6 +376,7 @@ def blind_report_coverage_failures(
     direction: str | None,
     expected_rows: int,
     expected_slices: dict[str, int],
+    expected_unique: dict[str, int] | None = None,
 ) -> list[str]:
     """Bind report sample counts to the immutable blind manifest coverage."""
     metric_view = report
@@ -355,6 +386,23 @@ def blind_report_coverage_failures(
     actual_rows = _reported_samples(metric_view)
     if actual_rows != expected_rows:
         failures.append(f"rows:{actual_rows}/{expected_rows}")
+    if task == "asr" and expected_unique:
+        for name, expected in sorted(expected_unique.items()):
+            try:
+                actual = int(report.get(name))
+            except (TypeError, ValueError):
+                actual = None
+            if actual != expected:
+                failures.append(f"{name}:{actual}/{expected}")
+        if report.get("wer_bootstrap_unit") != "group":
+            failures.append("wer_bootstrap_unit:not_group")
+        try:
+            clusters = int(report.get("wer_bootstrap_clusters"))
+        except (TypeError, ValueError):
+            clusters = None
+        expected_groups = expected_unique.get("unique_groups")
+        if clusters != expected_groups:
+            failures.append(f"wer_bootstrap_clusters:{clusters}/{expected_groups}")
 
     categories = report.get("categories") or {}
     slices = report.get("slices") or {}
@@ -781,6 +829,13 @@ def evaluate(
         args.direction,
         int(manifest_record["rows"]),
         expected_slices,
+        {
+            name: int(manifest_record["coverage"][name])
+            for name in ("unique_speakers", "unique_groups")
+            if name in manifest_record["coverage"]
+        }
+        if args.task == "asr"
+        else None,
     )
     accuracy_config = load_locked_accuracy_config(config)
     quality_failed = blind_quality_failures(

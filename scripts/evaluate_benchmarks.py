@@ -103,21 +103,42 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
         hyps = [normalize_for_wer(row["hypothesis"]) for row in group]
         return {"wer": wer(refs, hyps), "cer": cer(refs, hyps)}
 
-    def bootstrap_wer(group: list[dict[str, Any]], repeats: int = 1000) -> list[float]:
-        counts = []
-        for row in group:
+    def bootstrap_wer(
+        group: list[dict[str, Any]], repeats: int = 1000
+    ) -> tuple[list[float], str, int]:
+        if all(str(row.get("group") or "").strip() for row in group):
+            unit = "group"
+            keys = [str(row["group"]).strip() for row in group]
+        elif all(str(row.get("speaker") or "").strip() for row in group):
+            unit = "speaker"
+            keys = [str(row["speaker"]).strip() for row in group]
+        else:
+            unit = "row"
+            keys = [f"row-{index}" for index in range(len(group))]
+
+        cluster_counts: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        for key, row in zip(keys, group):
             result = process_words(
                 normalize_for_wer(row["reference"]),
                 normalize_for_wer(row["hypothesis"]),
             )
-            counts.append((result.substitutions + result.deletions + result.insertions, result.hits + result.substitutions + result.deletions))
-        array = np.asarray(counts, dtype=np.float64)
+            cluster_counts[key][0] += (
+                result.substitutions + result.deletions + result.insertions
+            )
+            cluster_counts[key][1] += (
+                result.hits + result.substitutions + result.deletions
+            )
+        array = np.asarray(list(cluster_counts.values()), dtype=np.float64)
         rng = np.random.default_rng(20260922)
         values = []
         for _ in range(repeats):
             sample = array[rng.integers(0, len(array), len(array))]
             values.append(float(sample[:, 0].sum() / max(1.0, sample[:, 1].sum())))
-        return [float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))]
+        interval = [
+            float(np.quantile(values, 0.025)),
+            float(np.quantile(values, 0.975)),
+        ]
+        return interval, unit, len(array)
 
     slices: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
@@ -133,12 +154,27 @@ def score_asr(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if row.get(key) not in (None, ""):
                 slices[key][str(row[key])].append(row)
     overall = score(rows)
+    wer_interval, bootstrap_unit, bootstrap_clusters = bootstrap_wer(rows)
+    unique_speakers = {
+        str(row.get("speaker") or "").strip()
+        for row in rows
+        if str(row.get("speaker") or "").strip()
+    }
+    unique_groups = {
+        str(row.get("group") or "").strip()
+        for row in rows
+        if str(row.get("group") or "").strip()
+    }
     report = {
         "task": "asr",
         "normalizer": NORMALIZER_VERSION,
         "samples": len(rows),
         **overall,
-        "wer_bootstrap_95ci": bootstrap_wer(rows),
+        "wer_bootstrap_95ci": wer_interval,
+        "wer_bootstrap_unit": bootstrap_unit,
+        "wer_bootstrap_clusters": bootstrap_clusters,
+        "unique_speakers": len(unique_speakers),
+        "unique_groups": len(unique_groups),
         "slices": {
             key: {value: {"samples": len(group), **score(group)} for value, group in groups.items()}
             for key, groups in slices.items()
