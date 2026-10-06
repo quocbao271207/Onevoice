@@ -165,20 +165,56 @@ def test_historical_peak_requires_a_sustained_prior_attempt(tmp_path: Path):
     short = tmp_path / "mt-short" / "01-pilot" / "resource_monitor.jsonl"
     short.parent.mkdir(parents=True)
     short.write_text(
-        "".join(json.dumps({"process_memory_mib": 20_000.0}) + "\n" for _ in range(2)),
+        "".join(
+            json.dumps(
+                {
+                    "process_memory_mib": 20_000.0,
+                    "process_memory_attribution": "process_group_pid",
+                }
+            )
+            + "\n"
+            for _ in range(2)
+        ),
         encoding="utf-8",
     )
     sustained = tmp_path / "mt-sustained" / "01-pilot" / "resource_monitor.jsonl"
     sustained.parent.mkdir(parents=True)
     sustained.write_text(
         "".join(
-            json.dumps({"process_memory_mib": float(8_000 + index)}) + "\n"
+            json.dumps(
+                {
+                    "process_memory_mib": float(8_000 + index),
+                    "process_memory_attribution": "process_namespace_pid",
+                }
+            )
+            + "\n"
             for index in range(50)
         ),
         encoding="utf-8",
     )
 
     assert historical_peak_process_memory(tmp_path) == 8_049.0
+
+
+def test_historical_peak_rejects_post_spawn_telemetry(tmp_path: Path):
+    monitor = tmp_path / "mt-run" / "01-pilot" / "resource_monitor.jsonl"
+    monitor.parent.mkdir(parents=True)
+    monitor.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "process_memory_mib": 24_714.0,
+                    "process_memory_attribution": "post_spawn_memory_growth",
+                    "hard_memory_enforced_from_nvidia_pid": False,
+                }
+            )
+            + "\n"
+            for _ in range(100)
+        ),
+        encoding="utf-8",
+    )
+
+    assert historical_peak_process_memory(tmp_path) is None
 
 
 def test_gpu_spawn_capacity_waiter_retries_and_records_evidence(tmp_path: Path):

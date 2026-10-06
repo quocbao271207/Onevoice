@@ -253,6 +253,13 @@ def historical_peak_process_memory(
                     if not line.strip():
                         continue
                     record = json.loads(line)
+                    exact_attribution = (
+                        record.get("hard_memory_enforced_from_nvidia_pid") is True
+                        or record.get("process_memory_attribution")
+                        in {"process_group_pid", "process_namespace_pid"}
+                    )
+                    if not exact_attribution:
+                        continue
                     value = float(record.get("process_memory_mib", math.nan))
                     if math.isfinite(value) and value > 0.0:
                         positive_samples.append(value)
