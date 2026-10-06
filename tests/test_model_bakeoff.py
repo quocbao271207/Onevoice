@@ -939,6 +939,54 @@ def test_resume_scoring_upgrade_revalidates_completed_benchmark_stage(tmp_path: 
     ]
 
 
+def test_completed_benchmark_accepts_runner_generation_only_change(tmp_path: Path):
+    state_path = tmp_path / "state.json"
+    output = tmp_path / "output.json"
+    output.write_text("verified", encoding="utf-8")
+    log = tmp_path / "stage.log"
+    scorer = tmp_path / "run_baseline_benchmarks.py"
+    old_command = [
+        sys.executable,
+        str(scorer),
+        "--task",
+        "mt",
+        "--bakeoff-runner-sha256",
+        "a" * 64,
+    ]
+    current_command = [*old_command[:-1], "b" * 64]
+    state = {
+        "stages": {
+            "stage": {
+                "status": "complete",
+                "command": old_command,
+                "command_sha256": bakeoff.command_digest(old_command),
+                "output_evidence": bakeoff.output_evidence([output]),
+            }
+        }
+    }
+
+    run_stage("stage", current_command, state_path, state, log, [output])
+
+    assert not log.exists()
+    assert state["stages"]["stage"]["command"] == old_command
+
+
+def test_runner_generation_compatibility_rejects_other_command_changes():
+    old_command = [
+        "python",
+        "/repo/scripts/run_baseline_benchmarks.py",
+        "--task",
+        "mt",
+        "--bakeoff-runner-sha256",
+        "a" * 64,
+    ]
+
+    assert not bakeoff.runner_generation_only_command_change(
+        old_command,
+        [*old_command[:-1], "b" * 64, "--samples", "1"],
+    )
+
+
 def test_completed_stage_rejects_modified_file_output(tmp_path: Path):
     state_path = tmp_path / "state.json"
     output = tmp_path / "output.json"

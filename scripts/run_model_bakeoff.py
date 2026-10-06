@@ -203,6 +203,46 @@ def resume_scoring_command_compatible(
     )
 
 
+def runner_generation_only_command_change(
+    previous_command: Any,
+    current_command: list[str],
+) -> bool:
+    """Allow immutable completed evidence across a runner-only code upgrade.
+
+    Benchmark reports retain the runner hash that produced them. On resume, a
+    newer runner may safely skip that completed stage only when the sole command
+    difference is the 64-character ``--bakeoff-runner-sha256`` value; ``run_stage``
+    still verifies the recorded output fingerprint before returning.
+    """
+    if not isinstance(previous_command, list) or not all(
+        isinstance(item, str) for item in previous_command
+    ):
+        return False
+    option = "--bakeoff-runner-sha256"
+    if previous_command.count(option) != 1 or current_command.count(option) != 1:
+        return False
+    if not any(Path(item).name == "run_baseline_benchmarks.py" for item in current_command):
+        return False
+    previous = list(previous_command)
+    current = list(current_command)
+    previous_index = previous.index(option) + 1
+    current_index = current.index(option) + 1
+    if previous_index >= len(previous) or current_index >= len(current):
+        return False
+    old_hash = previous[previous_index]
+    new_hash = current[current_index]
+    if not all(
+        len(value) == 64 and set(value.lower()) <= set("0123456789abcdef")
+        for value in (old_hash, new_hash)
+    ):
+        return False
+    if old_hash == new_hash:
+        return False
+    previous[previous_index] = "<runner-generation>"
+    current[current_index] = "<runner-generation>"
+    return previous == current
+
+
 def pid_is_live(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1216,16 +1256,23 @@ def run_stage(
     previous = state.setdefault("stages", {}).get(name)
     assert_interrupted_stage_is_not_live(previous)
     if previous and previous.get("status") == "complete":
+        command_changed = previous.get("command_sha256") != digest
         recovery_only_upgrade = (
-            previous.get("command_sha256") != digest
+            command_changed
             and resume_scoring_command_compatible(previous.get("command"), command)
         )
-        if previous.get("command_sha256") != digest and not recovery_only_upgrade:
+        immutable_runner_upgrade = (
+            command_changed
+            and runner_generation_only_command_change(previous.get("command"), command)
+        )
+        if command_changed and not (recovery_only_upgrade or immutable_runner_upgrade):
             raise ValueError(f"Cannot resume {name}: command changed")
         current_evidence = output_evidence(expected_outputs)
         recorded_evidence = previous.get("output_evidence")
         if recorded_evidence is not None and recorded_evidence != current_evidence:
             raise ValueError(f"Cannot resume {name}: output evidence changed")
+        if immutable_runner_upgrade:
+            return
         if not recovery_only_upgrade:
             return
         # A legacy benchmark did not bind its report to verified predictions.
