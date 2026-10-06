@@ -276,6 +276,20 @@ def attributed_process_gpu_memory(
     }
 
 
+def exact_process_memory_attribution(sample: dict[str, Any]) -> bool:
+    """Return whether NVIDIA memory belongs to the tracked process exactly.
+
+    Baseline-growth fallbacks remain useful telemetry, but on a shared GPU they
+    can include another container's new PID or memory growth. The trainer's
+    PyTorch allocator independently enforces the configured 35% process cap;
+    the monitor's 40% kill switch is therefore used only for exact PID matches.
+    """
+    return sample.get("attribution") in {
+        "process_group_pid",
+        "process_namespace_pid",
+    }
+
+
 def cli_args(values: dict[str, Any]) -> list[str]:
     output: list[str] = []
     for key, value in values.items():
@@ -480,10 +494,13 @@ def monitor_process(
                     gpu_memory_baseline,
                 )
                 process_memory = float(process_memory_sample["memory_mib"])
+                hard_memory_enforced = exact_process_memory_attribution(
+                    process_memory_sample
+                )
                 memory_attribution_modes.add(str(process_memory_sample["attribution"]))
                 peak_process_memory = max(peak_process_memory, process_memory)
                 hard_memory_limit = sample["memory_total_mib"] * hard_memory_fraction
-                if process_memory > hard_memory_limit:
+                if hard_memory_enforced and process_memory > hard_memory_limit:
                     os.killpg(process_group, signal.SIGCONT)
                     stopped = False
                     os.killpg(process_group, signal.SIGTERM)
@@ -519,6 +536,10 @@ def monitor_process(
                     "process_memory_mib": process_memory,
                     "process_memory_fraction": process_memory / max(1.0, sample["memory_total_mib"]),
                     "process_memory_attribution": process_memory_sample["attribution"],
+                    "hard_memory_enforced_from_nvidia_pid": hard_memory_enforced,
+                    "hard_memory_fallback": (
+                        None if hard_memory_enforced else "pytorch_allocator_fraction"
+                    ),
                     "attributed_gpu_pids": process_memory_sample["gpu_pids"],
                     "tracked_process_pids": process_memory_sample["process_pids"],
                     "configured_memory_fraction": memory_fraction,

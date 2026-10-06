@@ -19,6 +19,7 @@ from scripts.run_gpu_rounds import (
     cli_args,
     configured_rounds,
     gpu_process_memory_by_pid,
+    exact_process_memory_attribution,
     process_pid_aliases,
     resolve_adaptive_final,
     select_completed_round,
@@ -226,6 +227,22 @@ def test_gpu_memory_without_pid_match_or_baseline_is_unattributed(
     assert sample["memory_mib"] == 0.0
     assert sample["attribution"] == "unattributed"
     assert sample["gpu_pids"] == []
+
+
+@pytest.mark.parametrize(
+    ("attribution", "expected"),
+    [
+        ("process_group_pid", True),
+        ("process_namespace_pid", True),
+        ("post_spawn_pid", False),
+        ("post_spawn_memory_growth", False),
+        ("unattributed", False),
+    ],
+)
+def test_hard_memory_kill_requires_exact_process_attribution(
+    attribution: str, expected: bool
+):
+    assert exact_process_memory_attribution({"attribution": attribution}) is expected
 
 
 def test_gpu_round_cli_args_preserve_false_and_skip_none():
