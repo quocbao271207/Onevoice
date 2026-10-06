@@ -49,6 +49,10 @@ MODEL_REVISIONS = {
 }
 
 PREDICTION_CHECKPOINT_SCHEMA_VERSION = 1
+CANONICAL_SELECTION_MANIFESTS = (
+    "data/eval/mt_selection_dev.jsonl",
+    "data/eval/asr_selection_dev.jsonl",
+)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -59,6 +63,33 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 def stable_rank(seed: int, row: dict[str, Any]) -> str:
     value = f"{seed}\x1f{row.get('id', '')}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
+
+
+def validate_bakeoff_runner_generation(
+    manifest: Path, claimed_runner_sha256: str | None
+) -> None:
+    """Reject canonical selection inference from an already-stale waiter.
+
+    A long-lived waiter loads ``run_model_bakeoff.py`` before Candidate A
+    finishes. Pulling hardened code later does not update those in-memory
+    functions. The loaded runner therefore binds every selection command to
+    its import-time source hash, while this fresh child checks that the hash
+    still matches the on-disk runner before loading a model or CUDA context.
+    """
+    canonical = {
+        (ROOT / relative).resolve() for relative in CANONICAL_SELECTION_MANIFESTS
+    }
+    if manifest.resolve() not in canonical:
+        return
+    runner = ROOT / "scripts" / "run_model_bakeoff.py"
+    if runner.is_symlink() or not runner.is_file():
+        raise ValueError(f"Canonical bake-off runner must be a regular file: {runner}")
+    actual = sha256(runner)
+    if claimed_runner_sha256 != actual:
+        raise RuntimeError(
+            "Stale or unbound bake-off runner generation; canonical selection "
+            "inference is blocked before model loading"
+        )
 
 
 def source_balanced_sample(rows: list[dict[str, Any]], size: int, seed: int) -> list[dict[str, Any]]:
@@ -137,6 +168,7 @@ def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, A
         "asr_prompt": args.asr_prompt if args.task == "asr" else None,
         "mt_model_family": args.mt_model_family if args.task == "mt" else None,
         "mt_direction": args.mt_direction if args.task == "mt" else None,
+        "bakeoff_runner_sha256": getattr(args, "bakeoff_runner_sha256", None),
     }
 
 
@@ -488,6 +520,10 @@ def main() -> int:
         action="store_true",
         help="Reuse an exact checksum-verified prediction checkpoint and rerun CPU scoring only.",
     )
+    parser.add_argument(
+        "--bakeoff-runner-sha256",
+        help="Import-time SHA-256 required for canonical selection-dev inference.",
+    )
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data" / "reports" / "baselines")
     args = parser.parse_args()
     if args.num_beams is None:
@@ -516,6 +552,7 @@ def main() -> int:
         args.model_revision = MODEL_REVISIONS.get(args.model)
     if not args.manifest.is_file():
         raise FileNotFoundError(args.manifest)
+    validate_bakeoff_runner_generation(args.manifest, args.bakeoff_runner_sha256)
 
     stem = args.name or (f"asr_{args.language}_base" if args.task == "asr" else "mt_base")
     prediction_path = args.output_dir / f"{stem}_predictions.jsonl"

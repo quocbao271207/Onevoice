@@ -50,6 +50,9 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+LOADED_RUNNER_SHA256 = sha256(Path(__file__).resolve())
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
@@ -939,6 +942,8 @@ def benchmark_command(
         "--output-dir",
         str(output_dir),
         "--resume-scoring",
+        "--bakeoff-runner-sha256",
+        LOADED_RUNNER_SHA256,
     ]
     if adapter:
         command += ["--adapter", str(adapter)]

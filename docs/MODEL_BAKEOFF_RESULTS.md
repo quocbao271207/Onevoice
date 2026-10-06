@@ -49,7 +49,7 @@ Mỗi slot blind chỉ được mở cho winner đúng task/chiều trong snapsh
 
 Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling utilization 70%, resume 55% và hard reaction 74% — luôn dưới 75%. Stage mới lấy mẫu tài nguyên mỗi 1 giây; preflight từ chối ngưỡng không hữu hạn, sai thứ tự hoặc vượt trần trước khi khởi chạy child.
 
-Selection comparison phải chứa checksum của policy đa metric/95% CI và toàn bộ input selection-dev + accuracy policy. Blind runner từ chối comparison cũ, thiếu policy hoặc lệch checksum; vì vậy kết quả do waiter sống lâu nạp từ commit cũ chỉ là provisional. Sau khi waiter đó kết thúc ở trạng thái `waiting_for_blind_test_v2`, runner hiện hành phải resume cùng state directory để tái dùng artifact hợp lệ, bổ sung stage còn thiếu và phát hành immutable selection snapshot mới trước khi blind test được phép mở.
+Selection comparison phải chứa checksum của policy đa metric/95% CI và toàn bộ input selection-dev + accuracy policy. Blind runner từ chối comparison cũ, thiếu policy hoặc lệch checksum. Mỗi lệnh selection-dev còn mang SHA-256 của `run_model_bakeoff.py` đã nạp lúc waiter khởi động; child benchmark đối chiếu nó với runner hiện hành trên đĩa **trước khi nạp model hoặc CUDA**. Vì vậy waiter sống lâu từ commit cũ sẽ dừng fail-closed thay vì tạo inference bằng logic cũ. Chỉ sau khi PID cũ đã kết thúc và state xác nhận không có GPU child, runner hiện hành mới được resume đúng state directory; artifact hợp lệ có thể được tái dùng, còn stage thiếu khóa thế hệ phải chạy lại và phát hành immutable selection snapshot mới trước khi blind test được phép mở.
 
 1. Zero-shot trên cùng selection dev.
 2. Pilot 400 steps, effective batch 32.

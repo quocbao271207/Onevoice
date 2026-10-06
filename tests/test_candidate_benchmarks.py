@@ -27,6 +27,7 @@ from scripts.run_baseline_benchmarks import (
     prepare_runtime,
     resolve_device,
     source_balanced_sample,
+    validate_bakeoff_runner_generation,
     write_prediction_checkpoint,
     write_predictions_checkpoint,
 )
@@ -68,6 +69,26 @@ def test_source_balanced_sample_can_take_full_manifest():
     ]
     selected = source_balanced_sample(rows, len(rows), seed=7)
     assert {row["id"] for row in selected} == {"a", "b", "c"}
+
+
+def test_canonical_selection_manifest_rejects_stale_waiter_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runner = tmp_path / "scripts" / "run_model_bakeoff.py"
+    selection = tmp_path / "data" / "eval" / "mt_selection_dev.jsonl"
+    runner.parent.mkdir(parents=True)
+    selection.parent.mkdir(parents=True)
+    runner.write_text("# current runner\n", encoding="utf-8")
+    selection.write_text('{}\n', encoding="utf-8")
+    monkeypatch.setattr(benchmark, "ROOT", tmp_path)
+
+    with pytest.raises(RuntimeError, match="Stale or unbound"):
+        validate_bakeoff_runner_generation(selection, None)
+    with pytest.raises(RuntimeError, match="Stale or unbound"):
+        validate_bakeoff_runner_generation(selection, "0" * 64)
+
+    validate_bakeoff_runner_generation(selection, sha256(runner))
+    validate_bakeoff_runner_generation(tmp_path / "ad-hoc.jsonl", None)
 
 
 def test_predictions_checkpoint_is_utf8_jsonl_and_replaces_stale_file(tmp_path: Path):

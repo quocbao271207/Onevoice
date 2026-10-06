@@ -675,6 +675,11 @@ def test_bakeoff_benchmarks_enable_verified_scoring_resume(tmp_path: Path):
     )
 
     assert command.count("--resume-scoring") == 1
+    guard_index = command.index("--bakeoff-runner-sha256")
+    assert command[guard_index + 1] == bakeoff.LOADED_RUNNER_SHA256
+    assert bakeoff.LOADED_RUNNER_SHA256 == bakeoff.sha256(
+        Path(bakeoff.__file__).resolve()
+    )
 
 
 def test_m2m100_runtime_round_builds_a_dry_run_command(tmp_path: Path):
