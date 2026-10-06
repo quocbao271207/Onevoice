@@ -29,6 +29,7 @@ from scripts.run_model_bakeoff import (
     selection_identity,
     selection_identity_sha256,
     strongest_eligible_challenger,
+    train_unit,
     tree_manifest,
     validate_candidate_matrix,
     validate_candidate_a_locked_evaluation,
@@ -37,8 +38,10 @@ from scripts.run_model_bakeoff import (
     validate_deployment_report,
     validate_resources,
     validate_selection_artifacts,
+    verified_resume_checkpoint,
     write_runtime_round_config,
 )
+from scripts.watch_checkpoints import archive_ready_checkpoints
 from scripts.run_gpu_rounds import archive_round
 from scripts.candidate_evidence import archive_evidence
 from src.pipeline.selection_policy import selection_policy_record
@@ -1013,6 +1016,83 @@ def test_completed_bakeoff_adapter_requires_verified_round_bundle(tmp_path: Path
     weights.write_bytes(b"mutated-after-archive")
     with pytest.raises(ValueError, match="live file does not match verified archive"):
         completed_adapter(output_root, "mt")
+
+
+def test_interrupted_bakeoff_training_resumes_only_verified_live_checkpoint(
+    tmp_path: Path,
+):
+    output_root = tmp_path / "training"
+    run = output_root / "mt-20261006-000000"
+    checkpoint = run / "01-pilot" / "model" / "checkpoint-100"
+    checkpoint.mkdir(parents=True)
+    for name in ("optimizer.pt", "scheduler.pt", "rng_state.pth"):
+        (checkpoint / name).write_bytes(name.encode())
+    (checkpoint / "adapter_model.safetensors").write_bytes(b"adapter")
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps(
+            {
+                "global_step": 100,
+                "max_steps": 400,
+                "best_metric": 1.25,
+                "best_model_checkpoint": str(checkpoint),
+                "log_history": [{"step": 100, "eval_loss": 1.25}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    archive_dir = run / "checkpoint-archives" / "01-pilot"
+    archive_ready_checkpoints(checkpoint.parent, archive_dir)
+
+    assert verified_resume_checkpoint(output_root, "mt") == checkpoint.resolve()
+
+    (checkpoint / "optimizer.pt").write_bytes(b"replaced")
+    with pytest.raises(ValueError, match="does not match verified archive"):
+        verified_resume_checkpoint(output_root, "mt")
+
+
+def test_interrupted_train_unit_passes_verified_checkpoint_to_round_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checkpoint = tmp_path / "checkpoint-100"
+    captured: dict[str, list[str]] = {}
+    monkeypatch.setattr(bakeoff, "write_runtime_round_config", lambda *args: None)
+    monkeypatch.setattr(
+        bakeoff, "verified_resume_checkpoint", lambda output_root, task: checkpoint
+    )
+    monkeypatch.setattr(
+        bakeoff,
+        "run_stage",
+        lambda name, command, *args: captured.update(command=command),
+    )
+    monkeypatch.setattr(
+        bakeoff, "completed_adapter", lambda output_root, task: tmp_path / "adapter"
+    )
+    stage = "mt_mt_m2m100_418m__vi_to_en_pilot_r32_lr2e5_train"
+    state = {"stages": {stage: {"status": "error"}}}
+    unit = {
+        "unit_id": "mt_m2m100_418m__vi_to_en",
+        "model": "facebook/m2m100_418M",
+        "revision": "revision",
+        "model_family": "m2m100",
+        "direction": "vi_to_en",
+    }
+
+    train_unit(
+        unit=unit,
+        task="mt",
+        round_name="pilot",
+        steps=400,
+        config=config(),
+        python=sys.executable,
+        state_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        state=state,
+        profile=hyperparameter_profiles(config(), "mt")[-1],
+    )
+
+    command = captured["command"]
+    assert command[command.index("--round-name") + 1] == "pilot"
+    assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
 
 
 def test_legacy_rescore_is_explicitly_not_vinai_evidence():

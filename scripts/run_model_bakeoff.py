@@ -31,6 +31,11 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.run_gpu_program import verified_training_result  # noqa: E402
 from scripts.run_gpu_rounds import validate_resource_limits  # noqa: E402
+from scripts.verify_checkpoint_download import verify_checkpoint_download  # noqa: E402
+from scripts.watch_checkpoints import (  # noqa: E402
+    checkpoint_file_records,
+    completed_checkpoint,
+)
 from scripts.candidate_evidence import (  # noqa: E402
     evidence_sidecars,
     verify_evidence_archive,
@@ -1412,6 +1417,66 @@ def completed_adapter(output_root: Path, task: str) -> Path:
     return Path(evidence["adapter"])
 
 
+def verified_resume_checkpoint(output_root: Path, task: str) -> Path | None:
+    """Return the newest immutable checkpoint from an interrupted GPU stage.
+
+    Resuming is allowed only when the watcher index, archive, checksum sidecar,
+    content manifest, Trainer state, and the live checkpoint tree all agree.
+    This keeps optimizer/scheduler progress without trusting a partial or
+    replaced directory merely because it has a ``checkpoint-*`` name.
+    """
+    root = output_root.resolve()
+    candidates: list[tuple[int, int, Path]] = []
+    for run_root in sorted(root.glob(f"{task}-*")):
+        resolved_run = run_root.resolve()
+        for index_path in sorted(
+            run_root.glob("checkpoint-archives/*/checkpoint_archives.json")
+        ):
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid checkpoint index: {index_path}") from exc
+            records = index.get("checkpoints")
+            if not isinstance(records, list):
+                raise ValueError(f"Checkpoint index has no checkpoints list: {index_path}")
+            for record in records:
+                if not isinstance(record, dict):
+                    raise ValueError(f"Invalid checkpoint record: {index_path}")
+                archive = Path(str(record.get("archive", ""))).resolve()
+                checkpoint = Path(str(record.get("checkpoint", ""))).resolve()
+                if archive.parent != index_path.parent.resolve():
+                    raise ValueError(f"Checkpoint archive escaped its index directory: {archive}")
+                try:
+                    checkpoint.relative_to(resolved_run)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Checkpoint escaped its training run: {checkpoint}"
+                    ) from exc
+                verification = verify_checkpoint_download(archive, index_path)
+                complete = completed_checkpoint(checkpoint)
+                if complete is None or complete[0] != verification["checkpoint_step"]:
+                    raise ValueError(f"Live checkpoint is incomplete: {checkpoint}")
+                manifest = verify_evidence_archive(archive)
+                live_records = [
+                    {key: item[key] for key in ("path", "bytes", "sha256")}
+                    for item in checkpoint_file_records(checkpoint)
+                ]
+                if live_records != manifest["files"]:
+                    raise ValueError(
+                        f"Live checkpoint does not match verified archive: {checkpoint}"
+                    )
+                candidates.append(
+                    (
+                        int(verification["checkpoint_step"]),
+                        run_root.stat().st_mtime_ns,
+                        checkpoint,
+                    )
+                )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
 def train_unit(
     *,
     unit: dict[str, Any],
@@ -1454,6 +1519,18 @@ def train_unit(
         str(output_root),
     ]
     stage = f"{task}_{unit_id}_{round_name}_{profile_id}_train"
+    previous = state.get("stages", {}).get(stage)
+    if isinstance(previous, dict) and previous.get("status") in {"error", "running"}:
+        resume_checkpoint = verified_resume_checkpoint(output_root, task)
+        if resume_checkpoint is not None:
+            command.extend(
+                [
+                    "--round-name",
+                    round_name,
+                    "--resume-from-checkpoint",
+                    str(resume_checkpoint),
+                ]
+            )
     run_stage(
         stage,
         command,
