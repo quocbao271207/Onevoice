@@ -186,6 +186,37 @@ def test_bakeoff_binds_terminal_candidate_a_gate_and_canonical_archive(
     assert record["archive"]["content_manifest_verified"] is True
 
 
+def test_candidate_a_resume_output_reuses_locked_evidence_and_honors_override():
+    state = {
+        "candidate_a_locked_evaluations": {
+            "asr": {
+                "task": "asr",
+                "output_dir": "/gpu-runs/asr-candidate-rerun",
+            }
+        }
+    }
+
+    assert bakeoff.candidate_a_resume_output(state, "asr") == Path(
+        "/gpu-runs/asr-candidate-rerun"
+    )
+    assert bakeoff.candidate_a_resume_output(state, "mt") is None
+    explicit = Path("/gpu-runs/explicit-asr")
+    assert bakeoff.candidate_a_resume_output(state, "asr", explicit) == explicit
+
+
+def test_candidate_a_resume_output_rejects_unbound_record():
+    state = {
+        "candidate_a_locked_evaluations": {
+            "asr": {
+                "task": "mt",
+                "output_dir": "/gpu-runs/wrong-task",
+            }
+        }
+    }
+
+    assert bakeoff.candidate_a_resume_output(state, "asr") is None
+
+
 def test_existing_candidate_a_freeze_is_rehashed_before_resume(tmp_path: Path):
     mt_adapter = tmp_path / "mt"
     asr_adapter = tmp_path / "asr"

@@ -685,6 +685,24 @@ def validate_candidate_a_locked_evaluation(
     }
 
 
+def candidate_a_resume_output(
+    state: dict[str, Any], task: str, explicit: Path | None = None
+) -> Path | None:
+    """Reuse the already locked Candidate A output when resuming a bake-off.
+
+    The returned path is only a hint: ``validate_candidate_a_locked_evaluation``
+    still revalidates the gate, model binding, hashes, archive, and manifest before
+    any GPU work is allowed. An explicit CLI override remains authoritative.
+    """
+    if explicit is not None:
+        return explicit
+    record = state.get("candidate_a_locked_evaluations", {}).get(task)
+    if not isinstance(record, dict) or record.get("task") != task:
+        return None
+    output_dir = record.get("output_dir")
+    return Path(str(output_dir)) if output_dir else None
+
+
 def tree_manifest(path: Path) -> dict[str, Any]:
     if path.is_symlink():
         raise ValueError(f"Candidate adapter root cannot be a symlink: {path}")
@@ -2133,14 +2151,6 @@ def main() -> int:
     current = wait_for_current_program(program_path, args.poll_seconds, args.wait_current)
     approvals = set(args.approve_research_license)
     binding = invocation_binding(program_path, args.config, args.scope, approvals)
-    candidate_a_locked_evaluations = {
-        "mt": validate_candidate_a_locked_evaluation(
-            current, config, "mt", args.mt_candidate_output
-        ),
-        "asr": validate_candidate_a_locked_evaluation(
-            current, config, "asr", args.asr_candidate_output
-        ),
-    }
     state_dir = args.state_dir.resolve()
     state_path = state_dir / "bakeoff_state.json"
     if state_path.is_file():
@@ -2155,6 +2165,20 @@ def main() -> int:
         }
         atomic_json(state_path, state)
     bind_or_validate_invocation(state, binding)
+    candidate_a_locked_evaluations = {
+        "mt": validate_candidate_a_locked_evaluation(
+            current,
+            config,
+            "mt",
+            candidate_a_resume_output(state, "mt", args.mt_candidate_output),
+        ),
+        "asr": validate_candidate_a_locked_evaluation(
+            current,
+            config,
+            "asr",
+            candidate_a_resume_output(state, "asr", args.asr_candidate_output),
+        ),
+    }
     freeze_path = state_dir / "candidate_a_freeze.json"
     if not freeze_path.is_file():
         frozen = freeze_candidate_a(current, freeze_path)
