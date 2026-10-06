@@ -13,6 +13,14 @@ prerequisite:
   current_program_state_glob: gpu-runs/program-*/program_state.json
   required_execution_status: complete
   freeze_candidate_a_before_bakeoff: true
+  candidate_a_locked_evaluation:
+    mt:
+      require_content_manifest: false
+      legacy_reference_only: true
+      note: legacy MT gate remains reference-only and can never authorize promotion
+    asr:
+      require_content_manifest: true
+      legacy_reference_only: false
 
 resources:
   gpu_memory_fraction: 0.35

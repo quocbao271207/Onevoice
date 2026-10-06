@@ -4,10 +4,10 @@ Ngày mở vòng: 05/10/2026.
 
 ## Trạng thái hiện tại
 
-Chưa model bổ sung nào được gọi là `benchmarked`. Candidate A vẫn đang được tạo bởi pipeline hiện hữu và không bị restart hay thay đổi process đang chạy:
+Chưa model bổ sung nào được gọi là `benchmarked`. Candidate A đã hoàn tất training và được giữ nguyên làm reference:
 
 - MT Candidate A: `facebook/nllb-200-distilled-600M`, full-data LoRA đã hoàn tất 33.521 bước; candidate suite kết thúc ngày 06/10/2026 với `status=fail`, `error=null`. Hard gate phát hiện lỗi liều 11,11%, số 8,33%, phủ định 5,56%, thuật ngữ 27,78% và code-switch 50%; model không được promotion.
-- ASR Candidate A: `vinai/PhoWhisper-small`; ba pilot 150 bước đã hoàn tất và chọn LoRA r32 theo `eval_wer=31,2608` (r16: 33,9176; r8: 43,1929). Full-data adaptive run đang tiếp tục tuần tự; không có controller hoặc GPU child trùng được khởi động.
+- ASR Candidate A: `vinai/PhoWhisper-small`; ba pilot 150 bước đã hoàn tất và chọn LoRA r32 theo `eval_wer=31,2608` (r16: 33,9176; r8: 43,1929). Full-data đã hoàn tất 2.871/2.871 bước; best checkpoint 2.750 có `eval_wer=28,5726`. Lần locked evaluation đầu tiên dừng vì input `float32` không khớp encoder `bfloat16`, nên đó là lỗi hạ tầng chứ không phải kết quả safety. Rerun bằng evaluator đã sửa dtype đang chạy tuần tự trên chính adapter này; không có controller hoặc GPU child trùng.
 - Các challenger đều là `planned`; `data/reports/model_bakeoff/comparison.json` là nguồn trạng thái máy đọc được.
 - Candidate A đạt gate cũ vẫn chỉ được đóng băng làm chuẩn tham chiếu. `promotion_allowed` luôn là `false` cho đến khi hoàn tất bake-off, blind v2 và deployment gate.
 
@@ -51,6 +51,8 @@ Mỗi GPU child chạy tuần tự, 35% VRAM/process, hard memory 40%, rolling u
 
 Selection comparison phải chứa checksum của policy đa metric/95% CI và toàn bộ input selection-dev + accuracy policy. Blind runner từ chối comparison cũ, thiếu policy hoặc lệch checksum. Mỗi lệnh selection-dev còn mang SHA-256 của `run_model_bakeoff.py` đã nạp lúc waiter khởi động; child benchmark đối chiếu nó với runner hiện hành trên đĩa **trước khi nạp model hoặc CUDA**. Vì vậy waiter sống lâu từ commit cũ sẽ dừng fail-closed thay vì tạo inference bằng logic cũ. Chỉ sau khi PID cũ đã kết thúc và state xác nhận không có GPU child, runner hiện hành mới được resume đúng state directory; artifact hợp lệ có thể được tái dùng, còn stage thiếu khóa thế hệ phải chạy lại và phát hành immutable selection snapshot mới trước khi blind test được phép mở.
 
+Trước bất kỳ GPU stage bake-off nào, runner bây giờ kiểm tra lại locked evaluation của cả hai Candidate A. `status` chỉ được là `pass` hoặc `fail` với `error=null`; `error` hạ tầng, gate rỗng, sai adapter hay sai promotion flag đều chặn bake-off trước khi nạp CUDA. ASR bắt buộc có archive, sidecar và canonical content manifest khớp từng member. MT legacy không có manifest chỉ được miễn theo cấu hình `legacy_reference_only=true`, vì gate `fail` đã biết và model này không thể tự promotion. Hash gate/archive của hai task được ghi vào state, comparison và selection identity; thay bằng chứng sau khi chọn winner sẽ làm snapshot blind không còn khớp.
+
 1. Zero-shot trên cùng selection dev.
 2. Pilot 400 steps, effective batch 32.
 3. Loại candidate fail safety hoặc thua rõ; giữ tối đa hai.
@@ -76,6 +78,7 @@ python scripts/run_model_bakeoff.py --preflight
 python scripts/run_model_bakeoff.py \
   --execute --wait-current \
   --current-program-state gpu-runs/program-YYYYMMDD-HHMMSS/program_state.json \
+  --asr-candidate-output gpu-runs/program-YYYYMMDD-HHMMSS/asr-candidate-rerun-<commit> \
   --state-dir gpu-runs/model-bakeoff
 
 # Khi có blind v2 thật sự chưa từng bị model nhìn thấy:

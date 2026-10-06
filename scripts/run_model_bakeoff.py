@@ -30,6 +30,10 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.run_gpu_program import verified_training_result  # noqa: E402
 from scripts.run_gpu_rounds import validate_resource_limits  # noqa: E402
+from scripts.candidate_evidence import (  # noqa: E402
+    evidence_sidecars,
+    verify_evidence_archive,
+)
 from src.data.quality import fingerprint_text  # noqa: E402
 from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
 
@@ -357,6 +361,110 @@ def wait_for_current_program(path: Path, poll_seconds: float, should_wait: bool)
         if not should_wait:
             raise RuntimeError(f"Current GPU program is not complete: {status!r}")
         time.sleep(poll_seconds)
+
+
+def candidate_output_dir(
+    current: dict[str, Any], task: str, override: Path | None = None
+) -> Path:
+    output = override
+    if output is None:
+        stage = current.get("stages", {}).get(f"{task}_candidate")
+        command = stage.get("command") if isinstance(stage, dict) else None
+        if not isinstance(command, list) or "--output-dir" not in command:
+            raise ValueError(f"Current program lacks {task} Candidate A output binding")
+        index = command.index("--output-dir")
+        if index + 1 >= len(command):
+            raise ValueError(f"Current program has an invalid {task} --output-dir binding")
+        output = Path(str(command[index + 1]))
+    resolved = output.resolve()
+    gpu_runs = (ROOT / "gpu-runs").resolve()
+    if not resolved.is_relative_to(gpu_runs):
+        raise ValueError(f"Candidate A evidence must remain under {gpu_runs}: {resolved}")
+    if resolved.is_symlink() or not resolved.is_dir():
+        raise FileNotFoundError(f"Candidate A output is not a regular directory: {resolved}")
+    return resolved
+
+
+def validate_candidate_a_locked_evaluation(
+    current: dict[str, Any],
+    config: dict[str, Any],
+    task: str,
+    override: Path | None = None,
+) -> dict[str, Any]:
+    """Bind a terminal locked-test gate before any bake-off GPU work.
+
+    Candidate A may pass or fail its locked clinical policy and still remain a
+    reference. Infrastructure ``error`` is not a benchmark result and must
+    stop the bake-off. New evidence requires a canonical member manifest; the
+    explicitly documented MT legacy bundle remains reference-only.
+    """
+    output = candidate_output_dir(current, task, override)
+    gate_path = output / "candidate_gate.json"
+    if gate_path.is_symlink() or not gate_path.is_file():
+        raise FileNotFoundError(f"Candidate A gate is incomplete: {gate_path}")
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    status = gate.get("status")
+    if status not in {"pass", "fail"} or gate.get("error") not in {None, ""}:
+        raise ValueError(f"Candidate A {task} locked evaluation is not terminal: {gate_path}")
+    if bool(gate.get("promotion_allowed")) != (status == "pass"):
+        raise ValueError(f"Candidate A {task} promotion flag is inconsistent: {gate_path}")
+    checks = gate.get("checks")
+    resources = gate.get("resource_runs")
+    if not isinstance(checks, list) or not checks or any(not isinstance(row, dict) for row in checks):
+        raise ValueError(f"Candidate A {task} gate lacks check evidence: {gate_path}")
+    if not isinstance(resources, dict) or not resources:
+        raise ValueError(f"Candidate A {task} gate lacks resource evidence: {gate_path}")
+    adapter = Path(str(current.get(f"{task}_adapter") or "")).resolve()
+    if Path(str(gate.get("adapter") or "")).resolve() != adapter:
+        raise ValueError(f"Candidate A {task} gate adapter does not match program state")
+
+    archive = output.with_suffix(".tar.gz")
+    sidecar, manifest_path = evidence_sidecars(archive)
+    if not archive.is_file() or not sidecar.is_file():
+        raise FileNotFoundError(f"Candidate A {task} archive/sidecar is incomplete: {archive}")
+    digest = sha256(archive)
+    sidecar_fields = sidecar.read_text(encoding="utf-8").strip().split()
+    if sidecar_fields != [digest, archive.name]:
+        raise ValueError(f"Candidate A {task} archive checksum mismatch: {archive}")
+
+    policy = config["prerequisite"]["candidate_a_locked_evaluation"][task]
+    canonical_manifest = manifest_path.is_file()
+    archive_record: dict[str, Any] = {
+        "path": str(archive),
+        "bytes": archive.stat().st_size,
+        "sha256": digest,
+        "content_manifest_verified": canonical_manifest,
+    }
+    if canonical_manifest:
+        manifest = verify_evidence_archive(archive)
+        member_name = f"{output.name}/candidate_gate.json"
+        members = {str(row["path"]): row for row in manifest["files"]}
+        member = members.get(member_name)
+        if (
+            member is None
+            or int(member["bytes"]) != gate_path.stat().st_size
+            or str(member["sha256"]) != sha256(gate_path)
+        ):
+            raise ValueError(f"Candidate A {task} gate does not match its archive")
+        archive_record["manifest_sha256"] = sha256(manifest_path)
+    elif bool(policy.get("require_content_manifest", True)):
+        raise ValueError(f"Candidate A {task} archive lacks a canonical content manifest")
+    elif not bool(policy.get("legacy_reference_only", False)):
+        raise ValueError(f"Candidate A {task} legacy evidence is not explicitly reference-only")
+
+    return {
+        "task": task,
+        "status": status,
+        "promotion_allowed": status == "pass",
+        "output_dir": str(output),
+        "gate": {
+            "path": str(gate_path),
+            "bytes": gate_path.stat().st_size,
+            "sha256": sha256(gate_path),
+        },
+        "archive": archive_record,
+        "legacy_reference_only": not canonical_manifest,
+    }
 
 
 def tree_manifest(path: Path) -> dict[str, Any]:
@@ -1283,6 +1391,9 @@ def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
     return {
         "scope": comparison.get("scope"),
         "candidate_a_freeze": comparison.get("candidate_a_freeze"),
+        "candidate_a_locked_evaluations": comparison.get(
+            "candidate_a_locked_evaluations"
+        ),
         "selection_sha256": comparison.get("selection_sha256"),
         "selection_policy": comparison.get("selection_policy"),
         "winners": winners,
@@ -1598,6 +1709,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/model_bakeoff.yaml")
     parser.add_argument("--current-program-state", type=Path)
+    parser.add_argument("--mt-candidate-output", type=Path)
+    parser.add_argument("--asr-candidate-output", type=Path)
     parser.add_argument("--state-dir", type=Path, default=ROOT / "gpu-runs/model-bakeoff")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--poll-seconds", type=float, default=30.0)
@@ -1622,6 +1735,14 @@ def main() -> int:
 
     program_path = find_current_program_state(config, args.current_program_state)
     current = wait_for_current_program(program_path, args.poll_seconds, args.wait_current)
+    candidate_a_locked_evaluations = {
+        "mt": validate_candidate_a_locked_evaluation(
+            current, config, "mt", args.mt_candidate_output
+        ),
+        "asr": validate_candidate_a_locked_evaluation(
+            current, config, "asr", args.asr_candidate_output
+        ),
+    }
     state_dir = args.state_dir.resolve()
     state_path = state_dir / "bakeoff_state.json"
     if state_path.is_file():
@@ -1640,6 +1761,7 @@ def main() -> int:
         freeze_candidate_a(current, freeze_path)
     state["stage"] = "freeze_candidate_A"
     state["candidate_a_freeze"] = str(freeze_path)
+    state["candidate_a_locked_evaluations"] = candidate_a_locked_evaluations
     state["scope"] = args.scope
     atomic_json(state_path, state)
     frozen = json.loads(freeze_path.read_text(encoding="utf-8"))
@@ -1675,6 +1797,7 @@ def main() -> int:
         "scope": args.scope,
         "promotion_allowed": False,
         "candidate_a_freeze": str(freeze_path),
+        "candidate_a_locked_evaluations": candidate_a_locked_evaluations,
         "selection_sha256": report["selection_sha256"],
         "selection_policy": selection_policy_record(config),
         "results": {"mt": mt_result, "asr": asr_result},

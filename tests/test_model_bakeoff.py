@@ -11,6 +11,7 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
+    candidate_output_dir,
     completed_adapter,
     critical_safety_pass,
     deployment_expectations,
@@ -24,6 +25,7 @@ from scripts.run_model_bakeoff import (
     strongest_eligible_challenger,
     tree_manifest,
     validate_candidate_matrix,
+    validate_candidate_a_locked_evaluation,
     validate_deployment_draft,
     validate_deployment_report,
     validate_resources,
@@ -31,6 +33,7 @@ from scripts.run_model_bakeoff import (
     write_runtime_round_config,
 )
 from scripts.run_gpu_rounds import archive_round
+from scripts.candidate_evidence import archive_evidence
 from src.pipeline.selection_policy import selection_policy_record
 
 
@@ -60,6 +63,9 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
     assert data["resources"]["gpu_memory_fraction"] == 0.35
     assert data["resources"]["gpu_memory_hard_fraction"] == 0.40
     assert data["resources"]["sample_seconds"] == 1.0
+    assert data["prerequisite"]["candidate_a_locked_evaluation"]["asr"][
+        "require_content_manifest"
+    ] is True
     required = set(data["promotion_gate"]["critical_slices"] + data["promotion_gate"]["policy_slices"])
     for task in ("mt", "asr"):
         rows = [
@@ -71,6 +77,65 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
         ]
         assert required <= {category for row in rows for category in row.get("categories", [])}
         assert b"\r\n" not in (ROOT / data["data"]["selection_dev"][task]["path"]).read_bytes()
+
+
+def test_bakeoff_rejects_candidate_a_infrastructure_error_before_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(bakeoff, "ROOT", tmp_path)
+    adapter = tmp_path / "gpu-runs" / "adapter"
+    output = tmp_path / "gpu-runs" / "asr-candidate"
+    adapter.mkdir(parents=True)
+    output.mkdir(parents=True)
+    gate = {
+        "status": "error",
+        "error": "dtype mismatch",
+        "promotion_allowed": False,
+        "adapter": str(adapter),
+        "checks": [],
+        "resource_runs": {},
+    }
+    (output / "candidate_gate.json").write_text(json.dumps(gate), encoding="utf-8")
+    current = {
+        "asr_adapter": str(adapter),
+        "stages": {"asr_candidate": {"command": ["python", "--output-dir", str(output)]}},
+    }
+
+    assert candidate_output_dir(current, "asr") == output.resolve()
+    with pytest.raises(ValueError, match="locked evaluation is not terminal"):
+        validate_candidate_a_locked_evaluation(current, config(), "asr")
+
+
+def test_bakeoff_binds_terminal_candidate_a_gate_and_canonical_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(bakeoff, "ROOT", tmp_path)
+    adapter = tmp_path / "gpu-runs" / "adapter"
+    output = tmp_path / "gpu-runs" / "asr-candidate-rerun"
+    adapter.mkdir(parents=True)
+    output.mkdir(parents=True)
+    gate = {
+        "status": "fail",
+        "error": None,
+        "promotion_allowed": False,
+        "adapter": str(adapter),
+        "checks": [{"name": "wer", "pass": False}],
+        "resource_runs": {"aggregate": {"return_code": 0}},
+    }
+    gate_path = output / "candidate_gate.json"
+    gate_path.write_text(json.dumps(gate), encoding="utf-8")
+    archive, digest = archive_evidence(output)
+    current = {
+        "asr_adapter": str(adapter),
+        "stages": {"asr_candidate": {"command": ["python", "--output-dir", str(output)]}},
+    }
+
+    record = validate_candidate_a_locked_evaluation(current, config(), "asr")
+
+    assert record["status"] == "fail"
+    assert record["gate"]["sha256"] == bakeoff.sha256(gate_path)
+    assert record["archive"]["sha256"] == digest
+    assert record["archive"]["content_manifest_verified"] is True
 
 
 def test_adapter_tree_manifest_uses_portable_paths(tmp_path: Path):
@@ -556,6 +621,12 @@ def test_selection_identity_ignores_later_blind_results_but_binds_winners():
 
     finalized = json.loads(json.dumps(comparison))
     finalized["selection_policy"]["winner_rule"] = "legacy_single_metric"
+    assert selection_identity(finalized) != selection_identity(comparison)
+
+    finalized = json.loads(json.dumps(comparison))
+    finalized["candidate_a_locked_evaluations"] = {
+        "asr": {"gate": {"sha256": "d" * 64}}
+    }
     assert selection_identity(finalized) != selection_identity(comparison)
 
 
