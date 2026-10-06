@@ -22,6 +22,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+SPAWN_CAPACITY_HISTORY_MIN_SAMPLES = 50
+SPAWN_CAPACITY_HISTORY_FACTOR = 1.25
+SPAWN_CAPACITY_HISTORY_MARGIN_MIB = 2048.0
+
 from scripts.candidate_evidence import archive_evidence, evidence_sidecars  # noqa: E402
 
 
@@ -118,6 +122,7 @@ def gpu_spawn_capacity(
     sample: dict[str, float],
     limits: dict[str, Any],
     now: datetime | None = None,
+    historical_peak_process_memory_mib: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate whether a new GPU child can safely reserve its hard memory budget."""
     _, hard_memory_fraction = validate_resource_limits(limits)
@@ -133,7 +138,21 @@ def gpu_spawn_capacity(
 
     _, resume_percent, boosted_window = active_utilization_limits(limits, now)
     free = total - used
-    required_free = total * hard_memory_fraction
+    hard_budget = total * hard_memory_fraction
+    required_free = hard_budget
+    capacity_strategy = "full_hard_budget"
+    if historical_peak_process_memory_mib is not None:
+        historical_peak = float(historical_peak_process_memory_mib)
+        if not math.isfinite(historical_peak) or historical_peak <= 0.0:
+            raise ValueError("Historical GPU process-memory peak must be positive and finite")
+        required_free = min(
+            hard_budget,
+            max(
+                historical_peak * SPAWN_CAPACITY_HISTORY_FACTOR,
+                historical_peak + SPAWN_CAPACITY_HISTORY_MARGIN_MIB,
+            ),
+        )
+        capacity_strategy = "historical_peak_with_headroom"
     reason = None
     if utilization > resume_percent:
         reason = "utilization_above_resume"
@@ -147,6 +166,9 @@ def gpu_spawn_capacity(
         "memory_used_mib": used,
         "memory_free_mib": free,
         "required_free_memory_mib": required_free,
+        "hard_memory_budget_mib": hard_budget,
+        "historical_peak_process_memory_mib": historical_peak_process_memory_mib,
+        "capacity_strategy": capacity_strategy,
         "active_resume_percent": resume_percent,
         "configured_hard_memory_fraction": hard_memory_fraction,
         "boosted_window": boosted_window,
@@ -160,6 +182,7 @@ def wait_for_gpu_spawn_capacity(
     sample_reader: Callable[[], dict[str, float]] | None = None,
     sleeper: Callable[[float], None] | None = None,
     poll_seconds: float | None = None,
+    historical_peak_process_memory_mib: float | None = None,
 ) -> dict[str, Any]:
     """Wait without a GPU child until shared-GPU utilization and memory are safe."""
     validate_resource_limits(limits)
@@ -172,6 +195,10 @@ def wait_for_gpu_spawn_capacity(
     )
     if not math.isfinite(interval) or interval <= 0.0:
         raise ValueError("GPU spawn-capacity poll interval must be positive and finite")
+    if historical_peak_process_memory_mib is not None:
+        historical_peak = float(historical_peak_process_memory_mib)
+        if not math.isfinite(historical_peak) or historical_peak <= 0.0:
+            raise ValueError("Historical GPU process-memory peak must be positive and finite")
 
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -181,7 +208,11 @@ def wait_for_gpu_spawn_capacity(
             samples += 1
             timestamp = datetime.now(timezone.utc).isoformat()
             try:
-                capacity = gpu_spawn_capacity(reader(), limits)
+                capacity = gpu_spawn_capacity(
+                    reader(),
+                    limits,
+                    historical_peak_process_memory_mib=historical_peak_process_memory_mib,
+                )
                 record = {"time": timestamp, **capacity}
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
                 record = {
@@ -200,6 +231,36 @@ def wait_for_gpu_spawn_capacity(
                     "approval": record,
                 }
             sleep(interval)
+
+
+def historical_peak_process_memory(
+    output_root: Path,
+    minimum_samples: int = SPAWN_CAPACITY_HISTORY_MIN_SAMPLES,
+) -> float | None:
+    """Return the largest credible process-memory peak from earlier attempts."""
+    if (
+        isinstance(minimum_samples, bool)
+        or not isinstance(minimum_samples, int)
+        or minimum_samples < 1
+    ):
+        raise ValueError("minimum_samples must be a positive integer")
+    peaks: list[float] = []
+    for monitor_path in sorted(output_root.glob("*/**/resource_monitor.jsonl")):
+        positive_samples: list[float] = []
+        try:
+            with monitor_path.open(encoding="utf-8") as monitor:
+                for line in monitor:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    value = float(record.get("process_memory_mib", math.nan))
+                    if math.isfinite(value) and value > 0.0:
+                        positive_samples.append(value)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if len(positive_samples) >= minimum_samples:
+            peaks.append(max(positive_samples))
+    return max(peaks) if peaks else None
 
 
 def active_utilization_limits(
@@ -748,7 +809,16 @@ def main() -> int:
         spawn_capacity_path = round_dir / "pre_spawn_capacity.jsonl"
         checkpoint_archive_dir = run_root / "checkpoint-archives" / round_dir.name
         watcher_log_path = round_dir / "checkpoint_watcher.log"
-        spawn_capacity = wait_for_gpu_spawn_capacity(limits, spawn_capacity_path)
+        historical_peak = (
+            historical_peak_process_memory(args.output_root.resolve())
+            if args.resume_from_checkpoint is not None
+            else None
+        )
+        spawn_capacity = wait_for_gpu_spawn_capacity(
+            limits,
+            spawn_capacity_path,
+            historical_peak_process_memory_mib=historical_peak,
+        )
         with log_path.open("w", encoding="utf-8") as log:
             gpu_memory_baseline = gpu_process_memory_by_pid()
             process = subprocess.Popen(

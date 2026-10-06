@@ -21,6 +21,7 @@ from scripts.run_gpu_rounds import (
     gpu_process_memory_by_pid,
     exact_process_memory_attribution,
     gpu_spawn_capacity,
+    historical_peak_process_memory,
     process_pid_aliases,
     resolve_adaptive_final,
     select_completed_round,
@@ -138,6 +139,48 @@ def test_gpu_spawn_capacity_uses_resume_threshold_before_launch():
     assert gpu_spawn_capacity(sample, limits)["allowed"] is True
 
 
+def test_gpu_spawn_capacity_uses_historical_peak_with_headroom_for_resume():
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+    sample = {
+        "utilization": 10.0,
+        "memory_total_mib": 40_960.0,
+        "memory_used_mib": 30_900.0,
+    }
+
+    capacity = gpu_spawn_capacity(
+        sample,
+        limits,
+        historical_peak_process_memory_mib=8_000.0,
+    )
+
+    assert capacity["capacity_strategy"] == "historical_peak_with_headroom"
+    assert capacity["required_free_memory_mib"] == 10_048.0
+    assert capacity["hard_memory_budget_mib"] == 16_384.0
+    assert capacity["allowed"] is True
+
+
+def test_historical_peak_requires_a_sustained_prior_attempt(tmp_path: Path):
+    short = tmp_path / "mt-short" / "01-pilot" / "resource_monitor.jsonl"
+    short.parent.mkdir(parents=True)
+    short.write_text(
+        "".join(json.dumps({"process_memory_mib": 20_000.0}) + "\n" for _ in range(2)),
+        encoding="utf-8",
+    )
+    sustained = tmp_path / "mt-sustained" / "01-pilot" / "resource_monitor.jsonl"
+    sustained.parent.mkdir(parents=True)
+    sustained.write_text(
+        "".join(
+            json.dumps({"process_memory_mib": float(8_000 + index)}) + "\n"
+            for index in range(50)
+        ),
+        encoding="utf-8",
+    )
+
+    assert historical_peak_process_memory(tmp_path) == 8_049.0
+
+
 def test_gpu_spawn_capacity_waiter_retries_and_records_evidence(tmp_path: Path):
     limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
         "limits"
@@ -208,6 +251,19 @@ def test_gpu_spawn_capacity_waiter_fails_closed_on_sample_error(tmp_path: Path):
     assert result["samples"] == 2
     assert records[0]["reason"] == "gpu_sample_error"
     assert records[0]["allowed"] is False
+
+
+def test_gpu_spawn_capacity_waiter_rejects_invalid_historical_peak(tmp_path: Path):
+    limits = yaml.safe_load((ROOT / "configs" / "gpu_rounds.yaml").read_text(encoding="utf-8"))[
+        "limits"
+    ]
+
+    with pytest.raises(ValueError, match="Historical GPU process-memory peak"):
+        wait_for_gpu_spawn_capacity(
+            limits,
+            tmp_path / "pre_spawn_capacity.jsonl",
+            historical_peak_process_memory_mib=math.nan,
+        )
 
 
 def test_gpu_process_memory_parser_ignores_malformed_rows(monkeypatch: pytest.MonkeyPatch):
