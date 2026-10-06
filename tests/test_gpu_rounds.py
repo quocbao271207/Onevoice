@@ -150,6 +150,28 @@ def test_gpu_memory_uses_only_post_spawn_pids_when_namespaces_differ(
     }
 
 
+def test_gpu_memory_uses_positive_growth_when_host_pid_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("scripts.run_gpu_rounds.process_group_pids", lambda group_id: {10})
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.gpu_process_memory_by_pid",
+        lambda: {1001: 4096.0, 1002: 2048.0, 1003: 512.0},
+    )
+
+    sample = attributed_process_gpu_memory(
+        10,
+        {1001: 1024.0, 1002: 2048.0, 1003: 1024.0},
+    )
+
+    assert sample == {
+        "memory_mib": 3072.0,
+        "attribution": "post_spawn_memory_growth",
+        "gpu_pids": [1001],
+        "process_pids": [10],
+    }
+
+
 def test_gpu_memory_without_pid_match_or_baseline_is_unattributed(
     monkeypatch: pytest.MonkeyPatch,
 ):

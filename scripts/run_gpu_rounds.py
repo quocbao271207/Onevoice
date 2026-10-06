@@ -197,9 +197,10 @@ def attributed_process_gpu_memory(
     """Attribute GPU memory despite host/container PID namespace differences.
 
     NVIDIA may expose host PIDs while ``ps`` exposes container PIDs. Prefer an
-    exact process-group match; when that is impossible, attribute only GPU PIDs
-    that appeared after the pre-spawn baseline so pre-existing shared jobs are
-    never charged to this training round.
+    exact process-group match. When that is impossible, first attribute GPU
+    PIDs that appeared after the pre-spawn baseline. Some container runtimes
+    keep a stable host-side GPU PID, so fall back to positive memory growth on
+    baseline PIDs instead of silently reporting zero.
     """
     process_pids = process_group_pids(group_id)
     current = gpu_process_memory_by_pid()
@@ -209,12 +210,26 @@ def attributed_process_gpu_memory(
         attribution = "process_group_pid"
     elif gpu_memory_baseline is not None:
         gpu_pids = set(current) - set(gpu_memory_baseline)
-        attribution = "post_spawn_pid"
+        if gpu_pids:
+            memory_mib = sum(current[pid] for pid in gpu_pids)
+            attribution = "post_spawn_pid"
+        else:
+            growth_by_pid = {
+                pid: current[pid] - gpu_memory_baseline[pid]
+                for pid in set(current) & set(gpu_memory_baseline)
+                if current[pid] > gpu_memory_baseline[pid]
+            }
+            gpu_pids = set(growth_by_pid)
+            memory_mib = sum(growth_by_pid.values())
+            attribution = "post_spawn_memory_growth"
     else:
         gpu_pids = set()
+        memory_mib = 0.0
         attribution = "unattributed"
+    if direct_gpu_pids:
+        memory_mib = sum(current[pid] for pid in gpu_pids)
     return {
-        "memory_mib": sum(current[pid] for pid in gpu_pids),
+        "memory_mib": memory_mib,
         "attribution": attribution,
         "gpu_pids": sorted(gpu_pids),
         "process_pids": sorted(process_pids),
