@@ -877,6 +877,31 @@ def test_running_stage_pid_blocks_duplicate_launch(monkeypatch: pytest.MonkeyPat
         )
 
 
+def test_failed_stage_preserves_attempt_history(tmp_path: Path):
+    state_path = tmp_path / "state.json"
+    state = {"stages": {}}
+    command = [sys.executable, "-c", "raise SystemExit(1)"]
+
+    with pytest.raises(bakeoff.StageExecutionError):
+        run_stage("stage", command, state_path, state, tmp_path / "attempt-1.log", [])
+    with pytest.raises(bakeoff.StageExecutionError):
+        run_stage("stage", command, state_path, state, tmp_path / "attempt-2.log", [])
+
+    record = state["stages"]["stage"]
+    assert record["attempt"] == 2
+    assert record["attempt_history"] == [
+        {
+            "attempt": 1,
+            "status": "error",
+            "return_code": 1,
+            "started_at": record["attempt_history"][0]["started_at"],
+            "completed_at": record["attempt_history"][0]["completed_at"],
+            "command_sha256": bakeoff.command_digest(command),
+            "log": str(tmp_path / "attempt-1.log"),
+        }
+    ]
+
+
 def test_gpu_stage_waits_for_capacity_before_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1218,6 +1243,141 @@ def test_interrupted_train_unit_passes_verified_checkpoint_to_round_runner(
     command = captured["command"]
     assert command[command.index("--round-name") + 1] == "pilot"
     assert command[command.index("--resume-from-checkpoint") + 1] == str(checkpoint)
+
+
+def test_train_unit_retries_failed_stage_from_verified_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    checkpoint = tmp_path / "checkpoint-100"
+    calls: list[tuple[list[str], Path]] = []
+    monkeypatch.setattr(bakeoff, "write_runtime_round_config", lambda *args: None)
+    monkeypatch.setattr(
+        bakeoff, "verified_resume_checkpoint", lambda output_root, task: checkpoint
+    )
+
+    def run(name, command, state_path, state, log_path, expected_outputs):
+        attempt = len(calls) + 1
+        calls.append((command, log_path))
+        state.setdefault("stages", {})[name] = {
+            "status": "error" if attempt == 1 else "complete",
+            "attempt": attempt,
+        }
+        if attempt == 1:
+            raise bakeoff.StageExecutionError("interrupted")
+
+    monkeypatch.setattr(bakeoff, "run_stage", run)
+    monkeypatch.setattr(
+        bakeoff, "completed_adapter", lambda output_root, task: tmp_path / "adapter"
+    )
+    unit = {
+        "unit_id": "mt_m2m100_418m__vi_to_en",
+        "model": "facebook/m2m100_418M",
+        "revision": "revision",
+        "model_family": "m2m100",
+        "direction": "vi_to_en",
+    }
+
+    train_unit(
+        unit=unit,
+        task="mt",
+        round_name="pilot",
+        steps=400,
+        config=config(),
+        python=sys.executable,
+        state_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        state={"stages": {}},
+        profile=hyperparameter_profiles(config(), "mt")[-1],
+    )
+
+    assert len(calls) == 2
+    assert "--resume-from-checkpoint" not in calls[0][0]
+    assert calls[1][0][calls[1][0].index("--resume-from-checkpoint") + 1] == str(checkpoint)
+    assert calls[1][1].name.endswith(".attempt-2.log")
+
+
+def test_train_unit_does_not_retry_without_verified_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls = 0
+    monkeypatch.setattr(bakeoff, "write_runtime_round_config", lambda *args: None)
+    monkeypatch.setattr(
+        bakeoff, "verified_resume_checkpoint", lambda output_root, task: None
+    )
+
+    def run(name, command, state_path, state, log_path, expected_outputs):
+        nonlocal calls
+        calls += 1
+        state.setdefault("stages", {})[name] = {"status": "error", "attempt": calls}
+        raise bakeoff.StageExecutionError("interrupted")
+
+    monkeypatch.setattr(bakeoff, "run_stage", run)
+    unit = {
+        "unit_id": "mt_m2m100_418m__vi_to_en",
+        "model": "facebook/m2m100_418M",
+        "revision": "revision",
+        "model_family": "m2m100",
+        "direction": "vi_to_en",
+    }
+
+    with pytest.raises(bakeoff.StageExecutionError):
+        train_unit(
+            unit=unit,
+            task="mt",
+            round_name="pilot",
+            steps=400,
+            config=config(),
+            python=sys.executable,
+            state_dir=tmp_path,
+            state_path=tmp_path / "state.json",
+            state={"stages": {}},
+            profile=hyperparameter_profiles(config(), "mt")[-1],
+        )
+
+    assert calls == 1
+
+
+def test_train_unit_bounds_verified_checkpoint_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls = 0
+    monkeypatch.setattr(bakeoff, "write_runtime_round_config", lambda *args: None)
+    monkeypatch.setattr(
+        bakeoff,
+        "verified_resume_checkpoint",
+        lambda output_root, task: tmp_path / "checkpoint-100",
+    )
+
+    def run(name, command, state_path, state, log_path, expected_outputs):
+        nonlocal calls
+        calls += 1
+        state.setdefault("stages", {})[name] = {"status": "error", "attempt": calls}
+        raise bakeoff.StageExecutionError("interrupted")
+
+    monkeypatch.setattr(bakeoff, "run_stage", run)
+    unit = {
+        "unit_id": "mt_m2m100_418m__vi_to_en",
+        "model": "facebook/m2m100_418M",
+        "revision": "revision",
+        "model_family": "m2m100",
+        "direction": "vi_to_en",
+    }
+
+    with pytest.raises(bakeoff.StageExecutionError):
+        train_unit(
+            unit=unit,
+            task="mt",
+            round_name="pilot",
+            steps=400,
+            config=config(),
+            python=sys.executable,
+            state_dir=tmp_path,
+            state_path=tmp_path / "state.json",
+            state={"stages": {}},
+            profile=hyperparameter_profiles(config(), "mt")[-1],
+        )
+
+    assert calls == bakeoff.TRAIN_STAGE_MAX_ATTEMPTS
 
 
 def test_legacy_rescore_is_explicitly_not_vinai_evidence():

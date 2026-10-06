@@ -64,6 +64,11 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 
 
 LOADED_RUNNER_SHA256 = sha256(Path(__file__).resolve())
+TRAIN_STAGE_MAX_ATTEMPTS = 3
+
+
+class StageExecutionError(RuntimeError):
+    """A launched stage returned non-zero or failed to publish its outputs."""
 
 
 def validate_loaded_runner_generation() -> None:
@@ -1281,9 +1286,36 @@ def run_stage(
         # A legacy benchmark did not bind its report to verified predictions.
         # Re-run only the CPU scoring path; --resume-scoring verifies the exact
         # prediction checkpoint and skips model loading and inference.
+    previous_attempt = 0
+    attempt_history: list[dict[str, Any]] = []
+    if isinstance(previous, dict):
+        raw_attempt = previous.get("attempt", 1)
+        if isinstance(raw_attempt, bool) or not isinstance(raw_attempt, int) or raw_attempt < 1:
+            raise ValueError(f"Stage {name} has an invalid attempt counter")
+        previous_attempt = raw_attempt
+        raw_history = previous.get("attempt_history", [])
+        if not isinstance(raw_history, list) or any(
+            not isinstance(item, dict) for item in raw_history
+        ):
+            raise ValueError(f"Stage {name} has invalid attempt history")
+        attempt_history = list(raw_history)
+        if previous.get("status") in {"error", "running"}:
+            attempt_history.append(
+                {
+                    "attempt": previous_attempt,
+                    "status": previous.get("status"),
+                    "return_code": previous.get("return_code"),
+                    "started_at": previous.get("started_at"),
+                    "completed_at": previous.get("completed_at"),
+                    "command_sha256": previous.get("command_sha256"),
+                    "log": previous.get("log"),
+                }
+            )
     state["stage"] = name
     stage_record = {
         "status": "running",
+        "attempt": previous_attempt + 1,
+        "attempt_history": attempt_history,
         "started_at": utc_now(),
         "command": command,
         "command_sha256": digest,
@@ -1337,7 +1369,7 @@ def run_stage(
     if return_code or not all(path.exists() for path in expected_outputs):
         record["status"] = "error"
         atomic_json(state_path, state)
-        raise RuntimeError(f"Stage {name} failed; see {log_path}")
+        raise StageExecutionError(f"Stage {name} failed; see {log_path}")
     try:
         record["output_evidence"] = output_evidence(expected_outputs)
     except (FileNotFoundError, ValueError):
@@ -1597,7 +1629,7 @@ def train_unit(
         steps,
         profile,
     )
-    command = [
+    base_command = [
         python,
         str(ROOT / "scripts/run_gpu_rounds.py"),
         "--task",
@@ -1608,26 +1640,44 @@ def train_unit(
         str(output_root),
     ]
     stage = f"{task}_{unit_id}_{round_name}_{profile_id}_train"
-    previous = state.get("stages", {}).get(stage)
-    if isinstance(previous, dict) and previous.get("status") in {"error", "running"}:
-        resume_checkpoint = verified_resume_checkpoint(output_root, task)
-        if resume_checkpoint is not None:
-            command.extend(
-                [
-                    "--round-name",
-                    round_name,
-                    "--resume-from-checkpoint",
-                    str(resume_checkpoint),
-                ]
+    while True:
+        command = list(base_command)
+        previous = state.get("stages", {}).get(stage)
+        previous_attempt = (
+            int(previous.get("attempt", 1))
+            if isinstance(previous, dict)
+            and previous.get("status") in {"error", "running"}
+            else 0
+        )
+        if isinstance(previous, dict) and previous.get("status") in {"error", "running"}:
+            resume_checkpoint = verified_resume_checkpoint(output_root, task)
+            if resume_checkpoint is not None:
+                command.extend(
+                    [
+                        "--round-name",
+                        round_name,
+                        "--resume-from-checkpoint",
+                        str(resume_checkpoint),
+                    ]
+                )
+        attempt = previous_attempt + 1
+        log_name = f"{stage}.log" if attempt == 1 else f"{stage}.attempt-{attempt}.log"
+        try:
+            run_stage(
+                stage,
+                command,
+                state_path,
+                state,
+                state_dir / "logs" / log_name,
+                [output_root],
             )
-    run_stage(
-        stage,
-        command,
-        state_path,
-        state,
-        state_dir / "logs" / f"{stage}.log",
-        [output_root],
-    )
+            break
+        except StageExecutionError:
+            current = state.get("stages", {}).get(stage, {})
+            if int(current.get("attempt", 0)) >= TRAIN_STAGE_MAX_ATTEMPTS:
+                raise
+            if verified_resume_checkpoint(output_root, task) is None:
+                raise
     return completed_adapter(output_root, task)
 
 
