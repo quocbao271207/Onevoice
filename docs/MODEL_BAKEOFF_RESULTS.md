@@ -62,13 +62,15 @@ State resume còn khóa đúng program-state path, SHA-256 của config, `resear
 Mỗi stage ghi PID và process-group ngay sau `Popen`. Nếu parent gián đoạn, resume kiểm tra PID cũ trước khi ghi đè state; state legacy chưa có PID được đối chiếu exact command qua `/proc/*/cmdline`. Chỉ khi không còn process khớp mới được launch lại, ngăn hai GPU child chạy song song sau crash.
 
 1. Zero-shot trên cùng selection dev.
-2. Pilot 400 steps, effective batch 32.
+2. Pilot 400 steps, effective batch 32. Mỗi challenger/chiều nhận cùng ba profile LoRA: r8/lr1e-4, r16/lr5e-5 và r32/lr2e-5; alpha lần lượt 16/32/64. Chỉ profile qua safety tốt nhất của từng candidate/chiều đi tiếp.
 3. Loại candidate fail safety hoặc thua rõ; giữ tối đa hai.
 4. Semifinal 2.000 steps từ cùng base revision.
 5. Full train giữ các candidate không bị candidate dẫn đầu Pareto-dominance theo 95% CI; một metric tốt không được che một metric khác kém rõ rệt.
 6. MT EN→VI và VI→EN được chọn độc lập.
 
 Giới hạn `keep` của successive halving được áp dụng riêng trong từng chiều MT, không xếp chung hai chiều. Vì vậy candidate EN→VI điểm cao không thể chiếm hết slot và loại toàn bộ VI→EN; finalist Pareto/95% CI cũng được xét trong từng chiều. ASR không có phân chiều nên vẫn dùng một ranking chung.
+
+Hyperparameter không được chọn theo locked test. Toàn bộ profile dùng cùng selection-dev checksum, số bước và sample cap; profile thắng được khóa trong runtime config, stage name và result record rồi dùng lại cho semifinal/full. Sửa profile làm đổi config SHA-256 và bị invocation binding từ chối khi resume.
 
 So sánh theo effective train samples, không theo thời gian. Safety là hard gate: thuốc/liều/số/đơn vị/phủ định phải 0 failure; terminology và code-switch cũng có policy riêng. Sau safety, MT bắt buộc đủ cả BLEU và chrF2 theo chiều cùng bootstrap 95% CI; ASR bắt buộc đủ WER, CER và code-switch WER, trong đó WER có bootstrap 95% CI. Chỉ thay Candidate A khi ít nhất một metric có CI tốt hơn rõ rệt và không metric có CI nào thụt lùi rõ rệt; CER/code-switch vẫn phải hữu hạn và code-switch phải qua policy riêng. Winner search duyệt toàn bộ challenger đã qua safety theo thứ hạng và chọn challenger cao nhất thực sự thỏa luật đa metric; một model đứng đầu point estimate nhưng có CI regression không được che mất model xếp sau có Pareto improvement hợp lệ.
 

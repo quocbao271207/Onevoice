@@ -17,6 +17,7 @@ from scripts.run_model_bakeoff import (
     completed_adapter,
     critical_safety_pass,
     deployment_expectations,
+    hyperparameter_profiles,
     interval_stronger,
     invocation_binding,
     license_gate,
@@ -72,6 +73,9 @@ def test_bakeoff_fairness_and_selection_checksums_are_locked():
     assert data["prerequisite"]["candidate_a_locked_evaluation"]["asr"][
         "require_content_manifest"
     ] is True
+    for task in ("mt", "asr"):
+        profiles = hyperparameter_profiles(data, task)
+        assert [profile["lora_rank"] for profile in profiles] == [8, 16, 32]
     required = set(data["promotion_gate"]["critical_slices"] + data["promotion_gate"]["policy_slices"])
     for task in ("mt", "asr"):
         rows = [
@@ -751,6 +755,12 @@ def test_selection_identity_ignores_later_blind_results_but_binds_winners():
     assert selection_identity(finalized) != selection_identity(comparison)
 
     finalized = json.loads(json.dumps(comparison))
+    finalized["results"]["mt"]["winners"]["en_to_vi"]["profile"] = {
+        "id": "r32_lr2e5"
+    }
+    assert selection_identity(finalized) != selection_identity(comparison)
+
+    finalized = json.loads(json.dumps(comparison))
     finalized["candidate_a_locked_evaluations"] = {
         "asr": {"gate": {"sha256": "d" * 64}}
     }
@@ -927,7 +937,10 @@ def test_m2m100_runtime_round_builds_a_dry_run_command(tmp_path: Path):
     data = config()
     item = candidate("mt_m2m100_418m")
     runtime = tmp_path / "runtime.yaml"
-    write_runtime_round_config(runtime, data, "mt", item, "en_to_vi", "pilot", 400)
+    profile = hyperparameter_profiles(data, "mt")[-1]
+    write_runtime_round_config(
+        runtime, data, "mt", item, "en_to_vi", "pilot", 400, profile
+    )
     output = tmp_path / "runs"
     result = subprocess.run(
         [
@@ -952,6 +965,8 @@ def test_m2m100_runtime_round_builds_a_dry_run_command(tmp_path: Path):
     assert command[command.index("--model-family") + 1] == "m2m100"
     assert command[command.index("--direction") + 1] == "en_to_vi"
     assert command[command.index("--max-steps") + 1] == "400"
+    assert command[command.index("--learning-rate") + 1] == "2e-05"
+    assert command[command.index("--lora-rank") + 1] == "32"
 
 
 def test_completed_bakeoff_adapter_requires_verified_round_bundle(tmp_path: Path):

@@ -70,6 +70,18 @@ successive_halving:
   comparison_unit: effective_train_samples
   bootstrap_repeats: 1000
 
+hyperparameter_search:
+  selection: best_safety_eligible_profile_per_candidate_direction
+  profiles:
+    mt:
+      - {id: r8_lr1e4, learning_rate: 1.0e-4, lora_rank: 8, lora_alpha: 16, lora_dropout: 0.05}
+      - {id: r16_lr5e5, learning_rate: 5.0e-5, lora_rank: 16, lora_alpha: 32, lora_dropout: 0.10}
+      - {id: r32_lr2e5, learning_rate: 2.0e-5, lora_rank: 32, lora_alpha: 64, lora_dropout: 0.10}
+    asr:
+      - {id: r8_lr1e4, learning_rate: 1.0e-4, lora_rank: 8, lora_alpha: 16, lora_dropout: 0.05}
+      - {id: r16_lr5e5, learning_rate: 5.0e-5, lora_rank: 16, lora_alpha: 32, lora_dropout: 0.10}
+      - {id: r32_lr2e5, learning_rate: 2.0e-5, lora_rank: 32, lora_alpha: 64, lora_dropout: 0.10}
+
 promotion_gate:
   critical_failure_rate_max: 0.0
   critical_slices: [drug_name, dose, number, unit, negation]

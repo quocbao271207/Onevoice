@@ -342,6 +342,58 @@ def validate_resources(config: dict[str, Any]) -> None:
         raise ValueError("ASR code-switch WER limit must be finite and in [0, 1]")
 
 
+def hyperparameter_profiles(
+    config: dict[str, Any], task: str
+) -> list[dict[str, Any]]:
+    search = config.get("hyperparameter_search")
+    expected_policy = "best_safety_eligible_profile_per_candidate_direction"
+    if not isinstance(search, dict) or search.get("selection") != expected_policy:
+        raise ValueError("Unsupported or missing hyperparameter search policy")
+    profiles = search.get("profiles", {}).get(task)
+    if not isinstance(profiles, list) or len(profiles) < 2:
+        raise ValueError(f"{task} requires at least two hyperparameter profiles")
+    ids = []
+    validated = []
+    for raw in profiles:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid {task} hyperparameter profile")
+        profile = deepcopy(raw)
+        profile_id = str(profile.get("id") or "")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_id):
+            raise ValueError(f"Invalid {task} hyperparameter profile id: {profile_id!r}")
+        try:
+            learning_rate = float(profile["learning_rate"])
+            rank = int(profile["lora_rank"])
+            alpha = int(profile["lora_alpha"])
+            dropout = float(profile["lora_dropout"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {task} hyperparameter profile: {profile_id}") from exc
+        if (
+            not math.isfinite(learning_rate)
+            or learning_rate <= 0.0
+            or isinstance(profile["lora_rank"], bool)
+            or isinstance(profile["lora_alpha"], bool)
+            or rank <= 0
+            or alpha <= 0
+            or not math.isfinite(dropout)
+            or not 0.0 <= dropout < 1.0
+        ):
+            raise ValueError(f"Unsafe {task} hyperparameter profile: {profile_id}")
+        ids.append(profile_id)
+        validated.append(
+            {
+                "id": profile_id,
+                "learning_rate": learning_rate,
+                "lora_rank": rank,
+                "lora_alpha": alpha,
+                "lora_dropout": dropout,
+            }
+        )
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"Duplicate {task} hyperparameter profile ids")
+    return validated
+
+
 def validate_selection_artifacts(config: dict[str, Any]) -> dict[str, str]:
     hashes = {}
     forbidden = {(ROOT / value).resolve() for value in config["data"]["forbidden_selection_inputs"]}
@@ -1279,6 +1331,7 @@ def write_runtime_round_config(
     direction: str | None,
     round_name: str,
     steps: int,
+    profile: dict[str, Any] | None = None,
 ) -> None:
     halving = config["successive_halving"]
     limit_train = (
@@ -1305,6 +1358,7 @@ def write_runtime_round_config(
     }
     if task == "mt":
         common.update({"model_family": candidate["model_family"], "direction": direction})
+    selected_profile = profile or hyperparameter_profiles(config, task)[0]
     runtime = {
         "version": 1,
         "limits": config["resources"],
@@ -1323,10 +1377,10 @@ def write_runtime_round_config(
                         "name": round_name,
                         "max_steps": steps,
                         "epochs": 1.0 if task == "mt" else 5.0,
-                        "learning_rate": 1.0e-4,
-                        "lora_rank": 8,
-                        "lora_alpha": 16,
-                        "lora_dropout": 0.05,
+                        "learning_rate": selected_profile["learning_rate"],
+                        "lora_rank": selected_profile["lora_rank"],
+                        "lora_alpha": selected_profile["lora_alpha"],
+                        "lora_dropout": selected_profile["lora_dropout"],
                     }
                 ],
             }
@@ -1369,10 +1423,16 @@ def train_unit(
     state_dir: Path,
     state_path: Path,
     state: dict[str, Any],
+    profile: dict[str, Any],
 ) -> Path:
     unit_id = unit["unit_id"]
-    output_root = state_dir / "training" / task / unit_id / round_name
-    runtime_config = state_dir / "runtime-configs" / f"{task}-{unit_id}-{round_name}.yaml"
+    profile_id = str(profile["id"])
+    output_root = state_dir / "training" / task / unit_id / round_name / profile_id
+    runtime_config = (
+        state_dir
+        / "runtime-configs"
+        / f"{task}-{unit_id}-{round_name}-{profile_id}.yaml"
+    )
     write_runtime_round_config(
         runtime_config,
         config,
@@ -1381,6 +1441,7 @@ def train_unit(
         unit.get("direction"),
         round_name,
         steps,
+        profile,
     )
     command = [
         python,
@@ -1392,7 +1453,7 @@ def train_unit(
         "--output-root",
         str(output_root),
     ]
-    stage = f"{task}_{unit_id}_{round_name}_train"
+    stage = f"{task}_{unit_id}_{round_name}_{profile_id}_train"
     run_stage(
         stage,
         command,
@@ -1623,6 +1684,7 @@ def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
                 "adapter": winner.get("adapter"),
                 "adapter_manifest_sha256": winner.get("adapter_manifest_sha256"),
                 "direction": winner.get("direction"),
+                "profile": winner.get("profile"),
             }
             for key, winner in sorted(task_winners.items())
         }
@@ -1701,6 +1763,8 @@ def run_task_bakeoff(
 
     zero_shot = []
     pilot = []
+    pilot_profiles = []
+    profiles = hyperparameter_profiles(config, task) if units else []
     for unit in units:
         zero_report = benchmark_unit(
             unit=unit,
@@ -1727,34 +1791,38 @@ def run_task_bakeoff(
                 ),
             }
         )
-        adapter = train_unit(
-            unit=unit,
-            task=task,
-            round_name="pilot",
-            steps=int(config["successive_halving"]["pilot"]["train_steps"]),
-            config=config,
-            python=python,
-            state_dir=state_dir,
-            state_path=state_path,
-            state=state,
-        )
-        report = benchmark_unit(
-            unit=unit,
-            task=task,
-            label="pilot",
-            adapter=adapter,
-            config=config,
-            python=python,
-            state_dir=state_dir,
-            state_path=state_path,
-            state=state,
-            direction=unit.get("direction"),
-        )
-        pilot.append(
-            {
+        profile_entries = []
+        for profile in profiles:
+            profile_id = str(profile["id"])
+            adapter = train_unit(
+                unit=unit,
+                task=task,
+                round_name="pilot",
+                steps=int(config["successive_halving"]["pilot"]["train_steps"]),
+                config=config,
+                python=python,
+                state_dir=state_dir,
+                state_path=state_path,
+                state=state,
+                profile=profile,
+            )
+            report = benchmark_unit(
+                unit=unit,
+                task=task,
+                label=f"pilot_{profile_id}",
+                adapter=adapter,
+                config=config,
+                python=python,
+                state_dir=state_dir,
+                state_path=state_path,
+                state=state,
+                direction=unit.get("direction"),
+            )
+            entry = {
                 "unit": unit["unit_id"],
                 "candidate": unit,
                 "adapter": str(adapter),
+                "profile": profile,
                 "score": report_score(
                     report,
                     task,
@@ -1764,7 +1832,11 @@ def run_task_bakeoff(
                     asr_code_switch_wer_max,
                 ),
             }
-        )
+            profile_entries.append(entry)
+            pilot_profiles.append(entry)
+        ranked_profiles = rank_scores(profile_entries)
+        if ranked_profiles:
+            pilot.append(ranked_profiles[0])
 
     semifinalists = select_semifinalists(
         pilot,
@@ -1774,6 +1846,7 @@ def run_task_bakeoff(
     semifinal = []
     for entry in semifinalists:
         unit = entry["candidate"]
+        profile = entry["profile"]
         adapter = train_unit(
             unit=unit,
             task=task,
@@ -1784,11 +1857,12 @@ def run_task_bakeoff(
             state_dir=state_dir,
             state_path=state_path,
             state=state,
+            profile=profile,
         )
         report = benchmark_unit(
             unit=unit,
             task=task,
-            label="semifinal",
+            label=f"semifinal_{profile['id']}",
             adapter=adapter,
             config=config,
             python=python,
@@ -1802,6 +1876,7 @@ def run_task_bakeoff(
                 "unit": unit["unit_id"],
                 "candidate": unit,
                 "adapter": str(adapter),
+                "profile": profile,
                 "score": report_score(
                     report,
                     task,
@@ -1818,6 +1893,7 @@ def run_task_bakeoff(
     full = []
     for entry in finalists:
         unit = entry["candidate"]
+        profile = entry["profile"]
         adapter = train_unit(
             unit=unit,
             task=task,
@@ -1828,11 +1904,12 @@ def run_task_bakeoff(
             state_dir=state_dir,
             state_path=state_path,
             state=state,
+            profile=profile,
         )
         report = benchmark_unit(
             unit=unit,
             task=task,
-            label="full",
+            label=f"full_{profile['id']}",
             adapter=adapter,
             config=config,
             python=python,
@@ -1846,6 +1923,7 @@ def run_task_bakeoff(
                 "unit": unit["unit_id"],
                 "candidate": unit,
                 "adapter": str(adapter),
+                "profile": profile,
                 "score": report_score(
                     report,
                     task,
@@ -1891,6 +1969,7 @@ def run_task_bakeoff(
             "direction": direction,
             "score": baseline_score,
             "decision": "candidate_a_retained",
+            "profile": None,
         }
         challenger = strongest_eligible_challenger(ranked, baseline_score)
         if challenger is not None:
@@ -1902,6 +1981,7 @@ def run_task_bakeoff(
                     "manifest_sha256"
                 ],
                 "direction": direction,
+                "profile": challenger["profile"],
                 "score": challenger_score,
                 "decision": (
                     "challenger_selected_after_candidate_a_safety_failure"
@@ -1914,6 +1994,7 @@ def run_task_bakeoff(
         "task": task,
         "excluded_by_license": excluded,
         "zero_shot": zero_shot,
+        "pilot_profiles": pilot_profiles,
         "pilot": pilot,
         "semifinal": semifinal,
         "full": full,
@@ -1923,6 +2004,9 @@ def run_task_bakeoff(
 
 def preflight(config: dict[str, Any], research_approvals: set[str]) -> dict[str, Any]:
     validate_resources(config)
+    profiles = {
+        task: hyperparameter_profiles(config, task) for task in ("mt", "asr")
+    }
     validate_candidate_matrix(config)
     hashes = validate_selection_artifacts(config)
     licenses = {}
@@ -1936,6 +2020,7 @@ def preflight(config: dict[str, Any], research_approvals: set[str]) -> dict[str,
         "licenses": licenses,
         "workflow": config["workflow"],
         "resource_policy": config["resources"],
+        "hyperparameter_profiles": profiles,
     }
 
 
