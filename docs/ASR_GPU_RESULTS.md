@@ -15,6 +15,20 @@ Full run đạt 2.871/2.871 bước. Checkpoint tốt nhất theo WER là bướ
 
 ## Locked candidate evaluation
 
-Lần chạy tự động đầu tiên kết thúc với trạng thái hạ tầng `error`, **không phải clinical fail**. Whisper encoder được nạp `bfloat16` nhưng benchmark đưa `input_features` `float32`, gây lỗi `Input type (torch.cuda.FloatTensor) and weight type (CUDABFloat16Type) should be the same` trước prediction đầu tiên. Vì vậy chưa có WER locked, code-switch WER hay kết quả riêng cho thuốc/liều/số/đơn vị/phủ định từ lần chạy này.
+Lần chạy tự động đầu tiên kết thúc với trạng thái hạ tầng `error`, **không phải clinical fail**. Whisper encoder được nạp `bfloat16` nhưng benchmark đưa `input_features` `float32`, gây lỗi `Input type (torch.cuda.FloatTensor) and weight type (CUDABFloat16Type) should be the same` trước prediction đầu tiên. Benchmark sau đó được sửa để ép feature tensor theo dtype thực của convolution đầu vào encoder, kể cả khi PEFT giữ tham số LoRA ở fp32; regression test mô phỏng PEFT wrapper khóa hành vi này.
 
-Benchmark hiện ép feature tensor theo dtype thực của convolution đầu vào encoder, kể cả khi PEFT giữ tham số LoRA ở fp32. Regression test mô phỏng PEFT wrapper khóa hành vi này. Candidate suite phải được chạy lại trọn vẹn trước bake-off; chỉ report có predictions, provenance và clinical gate hợp lệ mới được dùng làm Candidate A reference. Fine-tune và eval loss/WER validation không tự chứng minh an toàn.
+Rerun đầy đủ bằng commit `af8e0e7` đã hoàn tất ngày 06/10/2026 với `status=fail`, `error=null` và `promotion_allowed=false`. Đây là kết quả clinical thật, không còn là lỗi hạ tầng:
+
+| Gate | Kết quả | Ngưỡng | Pass |
+| --- | ---: | ---: | :---: |
+| WER Việt tổng | 28,0009% | ≤ 19% | Không |
+| WER code-switch | 26,3934% | ≤ 21% | Không |
+| Tên thuốc | 92,3077% lỗi | 0% | Không |
+| Liều lượng | 100% lỗi | 0% | Không |
+| Số | 77,7778% lỗi | 0% | Không |
+| Đơn vị | 77,7778% lỗi | 0% | Không |
+| Phủ định | 16,6667% lỗi | 0% | Không |
+| Thuật ngữ | 62,5% lỗi | 0% | Không |
+| Code-switch clinical | 87,5% lỗi | 0% | Không |
+
+Bundle canonical đã tải về `test/program-20261005-014500`: archive 786.454 byte có SHA-256 `f2a2cf05b4473e88311746283f598e2d0261f2dab147c554f3b41c860b61fec6`; manifest 2.505 byte và sidecar đều khớp. Verifier đã đọc lại 11 regular member/6.170.110 byte, gồm hai report, hai prediction, hai provenance, hai resource monitor, log và `candidate_gate.json`; gate member có SHA-256 `72a3d460cf4e49609d30b8150d7e76d102c5b63e25e7e3f83df4a46d8e8d8637`. Candidate A được giữ làm reference fail-closed cho bake-off, không promotion.
