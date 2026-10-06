@@ -274,6 +274,35 @@ def attach_adapter(model: Any, adapter: Path | None) -> Any:
     return PeftModel.from_pretrained(model, str(adapter))
 
 
+def asr_encoder_input_dtype(model: Any) -> torch.dtype:
+    """Return the dtype actually consumed by Whisper's first encoder conv.
+
+    PEFT may keep LoRA parameters in fp32 even when the wrapped Whisper base
+    model was loaded in fp16/bf16. Looking at the first model parameter is
+    therefore unsafe; bind the feature tensor to the encoder convolution that
+    receives it.
+    """
+    candidates = []
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        candidates.append(get_base_model())
+    candidates.append(model)
+    for candidate in candidates:
+        get_encoder = getattr(candidate, "get_encoder", None)
+        if not callable(get_encoder):
+            continue
+        encoder = get_encoder()
+        conv1 = getattr(encoder, "conv1", None)
+        weight = getattr(conv1, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.dtype.is_floating_point:
+            return weight.dtype
+    raise TypeError("Unable to resolve Whisper encoder input dtype")
+
+
+def prepare_asr_input_features(input_features: torch.Tensor, model: Any, device: str) -> torch.Tensor:
+    return input_features.to(device=device, dtype=asr_encoder_input_dtype(model))
+
+
 def asr_prediction_slices(row: dict[str, Any]) -> dict[str, Any]:
     """Preserve selection/blind dimensions in saved ASR predictions and reports."""
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
@@ -364,7 +393,10 @@ def run_asr(
             }
             if prompt_ids is not None:
                 generation_kwargs["prompt_ids"] = prompt_ids
-            generated = model.generate(features.input_features.to(device), **generation_kwargs)
+            generated = model.generate(
+                prepare_asr_input_features(features.input_features, model, device),
+                **generation_kwargs,
+            )
             hypotheses = processor.tokenizer.batch_decode(generated, skip_special_tokens=True)
             for row, hypothesis in zip(chunk, hypotheses):
                 predictions.append(

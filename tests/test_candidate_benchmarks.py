@@ -24,6 +24,7 @@ from scripts.run_baseline_benchmarks import (
     model_load_kwargs,
     prediction_checkpoint_specification,
     prediction_provenance_path,
+    prepare_asr_input_features,
     prepare_runtime,
     resolve_device,
     source_balanced_sample,
@@ -59,6 +60,34 @@ def test_candidate_benchmark_memory_fraction_cannot_exceed_40_percent():
 def test_cuda_dtype_selection_is_explicit(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     assert model_load_kwargs("cuda", "bf16") == {"torch_dtype": torch.bfloat16}
+
+
+def test_asr_features_follow_wrapped_whisper_encoder_dtype():
+    class Encoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conv1 = torch.nn.Conv1d(80, 80, 3).to(dtype=torch.bfloat16)
+
+    class BaseModel:
+        def __init__(self) -> None:
+            self.encoder = Encoder()
+
+        def get_encoder(self) -> Encoder:
+            return self.encoder
+
+    class PeftLikeWrapper:
+        def __init__(self) -> None:
+            self.base = BaseModel()
+            self.lora_parameter = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+
+        def get_base_model(self) -> BaseModel:
+            return self.base
+
+    inputs = torch.randn(2, 80, 3000, dtype=torch.float32)
+    prepared = prepare_asr_input_features(inputs, PeftLikeWrapper(), "cpu")
+
+    assert prepared.dtype == torch.bfloat16
+    assert prepared.device.type == "cpu"
 
 
 def test_source_balanced_sample_can_take_full_manifest():
