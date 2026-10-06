@@ -19,6 +19,7 @@ from scripts.run_gpu_rounds import (
     cli_args,
     configured_rounds,
     gpu_process_memory_by_pid,
+    process_pid_aliases,
     resolve_adaptive_final,
     select_completed_round,
     utilization_throttle_reason,
@@ -128,6 +129,45 @@ def test_gpu_memory_prefers_exact_process_group_pids(monkeypatch: pytest.MonkeyP
         "attribution": "process_group_pid",
         "gpu_pids": [10],
         "process_pids": [10, 11],
+    }
+
+
+def test_process_pid_aliases_reads_linux_namespace_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    status = tmp_path / "356822" / "status"
+    status.parent.mkdir()
+    status.write_text(
+        "Name:\tpython\nNSpid:\t451951\t356822\nState:\tR (running)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("scripts.run_gpu_rounds.os.name", "posix")
+
+    assert process_pid_aliases({356822}, tmp_path) == {356822, 451951}
+
+
+def test_gpu_memory_prefers_namespace_pid_over_unrelated_new_gpu_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.process_group_pids", lambda group_id: {356822}
+    )
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.process_pid_aliases",
+        lambda pids: {*pids, 451951},
+    )
+    monkeypatch.setattr(
+        "scripts.run_gpu_rounds.gpu_process_memory_by_pid",
+        lambda: {451951: 3130.0, 489181: 4678.0, 494517: 1626.0},
+    )
+
+    sample = attributed_process_gpu_memory(356820, {})
+
+    assert sample == {
+        "memory_mib": 3130.0,
+        "attribution": "process_namespace_pid",
+        "gpu_pids": [451951],
+        "process_pids": [356822],
     }
 
 

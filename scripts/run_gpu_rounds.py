@@ -166,6 +166,41 @@ def process_group_pids(group_id: int) -> set[int]:
     }
 
 
+def process_pid_aliases(
+    process_pids: set[int], proc_root: Path = Path("/proc")
+) -> set[int]:
+    """Return container PIDs plus their host/ancestor namespace aliases.
+
+    ``nvidia-smi`` commonly reports the host PID while ``ps`` inside a
+    container reports the innermost namespace PID. Linux exposes the complete
+    mapping in ``/proc/<pid>/status`` as ``NSpid``. Reading every alias lets the
+    hard-memory guard identify the actual training process instead of
+    attributing unrelated GPU jobs that happened to start after the baseline.
+    """
+    aliases = set(process_pids)
+    if os.name != "posix":
+        return aliases
+    for pid in process_pids:
+        try:
+            status = (proc_root / str(pid) / "status").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        nspid = next(
+            (line for line in status.splitlines() if line.startswith("NSpid:")),
+            None,
+        )
+        if nspid is None:
+            continue
+        aliases.update(
+            int(value)
+            for value in nspid.split()[1:]
+            if value.isdigit()
+        )
+    return aliases
+
+
 def gpu_process_memory_by_pid() -> dict[int, float]:
     """Return compute-process memory keyed by the PID reported by NVIDIA."""
     result = subprocess.run(
@@ -203,11 +238,16 @@ def attributed_process_gpu_memory(
     baseline PIDs instead of silently reporting zero.
     """
     process_pids = process_group_pids(group_id)
+    process_aliases = process_pid_aliases(process_pids)
     current = gpu_process_memory_by_pid()
-    direct_gpu_pids = process_pids & set(current)
+    direct_gpu_pids = process_aliases & set(current)
     if direct_gpu_pids:
         gpu_pids = direct_gpu_pids
-        attribution = "process_group_pid"
+        attribution = (
+            "process_group_pid"
+            if direct_gpu_pids & process_pids
+            else "process_namespace_pid"
+        )
     elif gpu_memory_baseline is not None:
         gpu_pids = set(current) - set(gpu_memory_baseline)
         if gpu_pids:
