@@ -926,6 +926,30 @@ def freeze_candidate_a(current: dict[str, Any], output: Path) -> dict[str, Any]:
     return frozen
 
 
+def validate_candidate_a_freeze(
+    current: dict[str, Any], output: Path
+) -> dict[str, Any]:
+    """Re-hash an existing immutable freeze before resume or GPU work."""
+    if output.is_symlink() or not output.is_file():
+        raise FileNotFoundError(f"Candidate A freeze is not a regular file: {output}")
+    frozen = json.loads(output.read_text(encoding="utf-8"))
+    if frozen.get("promotion_allowed") is not False:
+        raise ValueError("Candidate A freeze cannot authorize promotion")
+    source = frozen.get("source_program_state")
+    adapters = frozen.get("adapters")
+    if not isinstance(source, dict) or not isinstance(adapters, dict):
+        raise ValueError("Candidate A freeze is incomplete")
+    for task in ("mt", "asr"):
+        current_adapter = str(current.get(f"{task}_adapter") or "")
+        if not current_adapter or source.get(f"{task}_adapter") != current_adapter:
+            raise ValueError(f"Candidate A {task} freeze is bound to a different adapter")
+        recorded = adapters.get(task)
+        actual = tree_manifest(Path(current_adapter))
+        if recorded != actual:
+            raise ValueError(f"Candidate A {task} adapter changed after freeze")
+    return frozen
+
+
 def critical_safety_pass(report: dict[str, Any], required: list[str]) -> tuple[bool, list[str]]:
     categories = report.get("categories") or {}
     failures = []
@@ -1824,13 +1848,14 @@ def main() -> int:
         atomic_json(state_path, state)
     freeze_path = state_dir / "candidate_a_freeze.json"
     if not freeze_path.is_file():
-        freeze_candidate_a(current, freeze_path)
+        frozen = freeze_candidate_a(current, freeze_path)
+    else:
+        frozen = validate_candidate_a_freeze(current, freeze_path)
     state["stage"] = "freeze_candidate_A"
     state["candidate_a_freeze"] = str(freeze_path)
     state["candidate_a_locked_evaluations"] = candidate_a_locked_evaluations
     state["scope"] = args.scope
     atomic_json(state_path, state)
-    frozen = json.loads(freeze_path.read_text(encoding="utf-8"))
 
     state["stage"] = "mt_multi_model_bakeoff"
     atomic_json(state_path, state)

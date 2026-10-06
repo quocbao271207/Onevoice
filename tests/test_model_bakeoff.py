@@ -26,6 +26,7 @@ from scripts.run_model_bakeoff import (
     tree_manifest,
     validate_candidate_matrix,
     validate_candidate_a_locked_evaluation,
+    validate_candidate_a_freeze,
     validate_deployment_draft,
     validate_deployment_report,
     validate_resources,
@@ -161,6 +162,27 @@ def test_bakeoff_binds_terminal_candidate_a_gate_and_canonical_archive(
     assert record["gate"]["sha256"] == bakeoff.sha256(gate_path)
     assert record["archive"]["sha256"] == digest
     assert record["archive"]["content_manifest_verified"] is True
+
+
+def test_existing_candidate_a_freeze_is_rehashed_before_resume(tmp_path: Path):
+    mt_adapter = tmp_path / "mt"
+    asr_adapter = tmp_path / "asr"
+    for adapter, payload in ((mt_adapter, b"mt"), (asr_adapter, b"asr")):
+        adapter.mkdir()
+        (adapter / "adapter_model.safetensors").write_bytes(payload)
+    current = {
+        "execution_status": "complete",
+        "mt_adapter": str(mt_adapter),
+        "asr_adapter": str(asr_adapter),
+    }
+    freeze = tmp_path / "candidate_a_freeze.json"
+
+    frozen = bakeoff.freeze_candidate_a(current, freeze)
+    assert validate_candidate_a_freeze(current, freeze) == frozen
+
+    (asr_adapter / "adapter_model.safetensors").write_bytes(b"mutated")
+    with pytest.raises(ValueError, match="adapter changed after freeze"):
+        validate_candidate_a_freeze(current, freeze)
 
 
 def test_adapter_tree_manifest_uses_portable_paths(tmp_path: Path):

@@ -53,6 +53,8 @@ Selection comparison phải chứa checksum của policy đa metric/95% CI và t
 
 Trước bất kỳ GPU stage bake-off nào, runner bây giờ kiểm tra lại locked evaluation của cả hai Candidate A. `status` chỉ được là `pass` hoặc `fail` với `error=null`; `error` hạ tầng, gate rỗng, sai adapter, sai base model/revision hay sai promotion flag đều chặn bake-off trước khi nạp CUDA. Gate phải có đủ aggregate metric, toàn bộ critical/policy slice, trạng thái nhất quán với từng check, locked-input hash hợp lệ và cả hai resource run trả mã 0 dưới đúng policy GPU. ASR bắt buộc có archive, sidecar và canonical content manifest khớp từng member. MT legacy không có manifest chỉ được miễn theo cấu hình `legacy_reference_only=true`, vì gate `fail` đã biết và model này không thể tự promotion. Hash gate/archive của hai task được ghi vào state, comparison và selection identity; thay bằng chứng sau khi chọn winner sẽ làm snapshot blind không còn khớp.
 
+Resume không tin file `candidate_a_freeze.json` chỉ vì nó đã tồn tại. Runner băm lại từng file của cả adapter MT/ASR, so khớp root/path/bytes/SHA-256/manifest digest và kiểm tra adapter binding trong program state; freeze cũ, bị sửa hoặc trỏ sang checkpoint khác sẽ dừng fail-closed trước bake-off.
+
 1. Zero-shot trên cùng selection dev.
 2. Pilot 400 steps, effective batch 32.
 3. Loại candidate fail safety hoặc thua rõ; giữ tối đa hai.
