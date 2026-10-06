@@ -7,11 +7,13 @@ Ngày mở vòng: 05/10/2026.
 Chưa model bổ sung nào được gọi là `benchmarked`. Candidate A vẫn đang được tạo bởi pipeline hiện hữu và không bị restart hay thay đổi process đang chạy:
 
 - MT Candidate A: `facebook/nllb-200-distilled-600M`, full-data LoRA đã hoàn tất 33.521 bước; candidate suite kết thúc ngày 06/10/2026 với `status=fail`, `error=null`. Hard gate phát hiện lỗi liều 11,11%, số 8,33%, phủ định 5,56%, thuật ngữ 27,78% và code-switch 50%; model không được promotion.
-- ASR Candidate A: `vinai/PhoWhisper-small`, state machine hiện hữu đã tự chuyển sang `asr_training` và đang chạy pilot đầu tiên; không có controller hoặc GPU child trùng được khởi động.
+- ASR Candidate A: `vinai/PhoWhisper-small`; ba pilot 150 bước đã hoàn tất và chọn LoRA r32 theo `eval_wer=31,2608` (r16: 33,9176; r8: 43,1929). Full-data adaptive run đang tiếp tục tuần tự; không có controller hoặc GPU child trùng được khởi động.
 - Các challenger đều là `planned`; `data/reports/model_bakeoff/comparison.json` là nguồn trạng thái máy đọc được.
 - Candidate A đạt gate cũ vẫn chỉ được đóng băng làm chuẩn tham chiếu. `promotion_allowed` luôn là `false` cho đến khi hoàn tất bake-off, blind v2 và deployment gate.
 
 Artifact MT legacy đã được tải về `test/program-20261005-014500`: archive 3.938.906 byte có SHA-256 `d908ddc739acb9067514b0139a291bb67c91c465b7f096418064ebc5bf83cf81`, khớp sidecar gốc. Runner cũ không phát hành canonical `.manifest.json` và archive thiếu provenance cho full predictions, nên artifact này không đủ điều kiện resume/promotion theo runner mới. Bản kê `mt-candidate.tar.gz.derived-manifest.json` chỉ xác minh forensic 12 member/22.861.924 byte và luôn ghi `resume_eligible=false`; `download_manifest.json` khóa lại toàn bộ file đã tải. Đây vẫn chỉ là một phần chương trình: ASR Candidate A, challenger training, blind v2 và deployment benchmark còn ở phía sau.
+
+Checkpoint ASR full-data bước 500 đã được watcher phát hành và tải về local ngày 06/10/2026. Archive 28.892.956 byte có SHA-256 `acb7e618ec12b4f433243b8a1bb5377c14cdd07b68ef935d08b322b2b3e05d34`; sidecar, manifest và index khớp, 15/15 member (34.771.506 byte nội dung) đều qua kiểm tra hash/path/type. `eval_loss` giảm từ 1,5151 ở bước 250 xuống 1,1474; `eval_wer` giảm từ 67,3243 xuống 39,1998, nên checkpoint 500 là best hiện tại. Đây là validation trend, không phải locked-test safety evidence và chưa cho phép promotion.
 
 ## Candidate và license gate
 
