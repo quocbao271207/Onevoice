@@ -1042,6 +1042,56 @@ def test_completed_benchmark_accepts_runner_generation_only_change(tmp_path: Pat
     assert state["stages"]["stage"]["command"] == old_command
 
 
+def test_runner_generation_compatibility_accepts_same_interpreter_alias(
+    tmp_path: Path,
+):
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    old_command = [
+        str(python),
+        "/repo/scripts/run_baseline_benchmarks.py",
+        "--task",
+        "mt",
+        "--bakeoff-runner-sha256",
+        "a" * 64,
+    ]
+    current_command = [
+        str(alias_parent / ".." / python.name),
+        *old_command[1:-1],
+        "b" * 64,
+    ]
+
+    assert bakeoff.runner_generation_only_command_change(
+        old_command,
+        current_command,
+    )
+
+
+def test_runner_generation_compatibility_rejects_different_interpreter(
+    tmp_path: Path,
+):
+    old_python = tmp_path / "old-python"
+    current_python = tmp_path / "current-python"
+    old_python.write_text("", encoding="utf-8")
+    current_python.write_text("", encoding="utf-8")
+    old_command = [
+        str(old_python),
+        "/repo/scripts/run_baseline_benchmarks.py",
+        "--task",
+        "mt",
+        "--bakeoff-runner-sha256",
+        "a" * 64,
+    ]
+    current_command = [str(current_python), *old_command[1:-1], "b" * 64]
+
+    assert not bakeoff.runner_generation_only_command_change(
+        old_command,
+        current_command,
+    )
+
+
 def test_runner_generation_compatibility_rejects_other_command_changes():
     old_command = [
         "python",

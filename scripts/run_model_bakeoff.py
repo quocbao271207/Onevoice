@@ -218,9 +218,11 @@ def runner_generation_only_command_change(
     """Allow immutable completed evidence across a runner-only code upgrade.
 
     Benchmark reports retain the runner hash that produced them. On resume, a
-    newer runner may safely skip that completed stage only when the sole command
-    difference is the 64-character ``--bakeoff-runner-sha256`` value; ``run_stage``
-    still verifies the recorded output fingerprint before returning.
+    newer runner may safely skip that completed stage only when the command
+    differs by the 64-character ``--bakeoff-runner-sha256`` value and,
+    optionally, by two interpreter spellings that resolve to the same regular
+    file. ``run_stage`` still verifies the recorded output fingerprint before
+    returning.
     """
     if not isinstance(previous_command, list) or not all(
         isinstance(item, str) for item in previous_command
@@ -248,6 +250,22 @@ def runner_generation_only_command_change(
         return False
     previous[previous_index] = "<runner-generation>"
     current[current_index] = "<runner-generation>"
+    if previous[0] != current[0]:
+        try:
+            previous_python = Path(previous[0])
+            current_python = Path(current[0])
+            same_python = (
+                previous_python.is_file()
+                and current_python.is_file()
+                and previous_python.resolve(strict=True)
+                == current_python.resolve(strict=True)
+            )
+        except (OSError, RuntimeError):
+            same_python = False
+        if not same_python:
+            return False
+        previous[0] = "<python-executable>"
+        current[0] = "<python-executable>"
     return previous == current
 
 
