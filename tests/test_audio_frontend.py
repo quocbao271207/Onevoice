@@ -327,9 +327,10 @@ def test_microphone_stream_requires_ready_frontend_and_sounddevice(monkeypatch):
 
 def test_pipeline_does_not_denoise_an_already_processed_stream_segment(
     monkeypatch,
+    mark_pipeline_ready,
 ):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     segment = np.zeros(1_600, dtype=np.float32)
 
     def unexpected_denoise(*_args, **_kwargs):
@@ -360,9 +361,11 @@ def test_pipeline_does_not_denoise_an_already_processed_stream_segment(
     assert result.safety_issues == ["empty_asr_transcript"]
 
 
-def test_pipeline_rejects_invalid_preprocessed_audio_contract():
+def test_pipeline_rejects_invalid_preprocessed_audio_contract(
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     segment = np.zeros(1_600, dtype=np.float32)
 
     with pytest.raises(ValueError, match="must be a boolean"):
@@ -380,9 +383,12 @@ def test_pipeline_rejects_invalid_preprocessed_audio_contract():
         pipeline.run_interactive(on_result=object())
 
 
-def test_interactive_pipeline_surfaces_result_before_playback(monkeypatch):
+def test_interactive_pipeline_surfaces_result_before_playback(
+    monkeypatch,
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     segment = np.zeros(1_600, dtype=np.float32)
     result = SimpleNamespace(output_audio=np.zeros(8, dtype=np.float32))
     events = []

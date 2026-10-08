@@ -124,9 +124,12 @@ def test_valid_custom_cache_is_loaded_without_logging_raw_phrase(tmp_path, caplo
     assert "Dùng aspirin 5 mg" not in caplog.text
 
 
-def test_pipeline_rejects_cache_hit_for_wrong_target_language(monkeypatch):
+def test_pipeline_rejects_cache_hit_for_wrong_target_language(
+    monkeypatch,
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     monkeypatch.setattr(
         pipeline.flash_cache,
         "lookup",

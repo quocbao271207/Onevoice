@@ -526,12 +526,9 @@ class MediVoicePipeline:
             logger.info("[5/5] Flash Cache disabled by configuration")
 
         component_status = self._component_readiness()
-        failed_components = [
-            name
-            for name, ready in component_status.items()
-            if not ready
-            and not (name == "flash_cache" and not self.flash_cache_enabled)
-        ]
+        failed_components = self._failed_required_components(
+            component_status
+        )
         if failed_components:
             raise RuntimeError(
                 "Pipeline component readiness check failed: "
@@ -555,6 +552,17 @@ class MediVoicePipeline:
             "flash_cache": self.flash_cache.is_ready is True,
         }
 
+    def _failed_required_components(
+        self,
+        components: dict[str, bool],
+    ) -> list[str]:
+        return [
+            name
+            for name, ready in components.items()
+            if not ready
+            and not (name == "flash_cache" and not self.flash_cache_enabled)
+        ]
+
     def get_status(self) -> dict:
         """Return verified startup readiness for every pipeline component."""
         components = self._component_readiness()
@@ -574,6 +582,20 @@ class MediVoicePipeline:
             "flash_cache_enabled": self.flash_cache_enabled,
             "components": components,
         }
+
+    def _require_ready(self) -> None:
+        status = self.get_status()
+        if status["ready"]:
+            return
+        failed_components = self._failed_required_components(
+            status["components"]
+        )
+        if not status["loaded"] and not failed_components:
+            failed_components = ["pipeline"]
+        raise RuntimeError(
+            "Pipeline is not ready; unavailable components: "
+            + ", ".join(failed_components)
+        )
 
     def translate_speech(
         self,
@@ -601,8 +623,7 @@ class MediVoicePipeline:
         Returns:
             PipelineResult with all stage outputs and latency breakdown
         """
-        if not self._is_loaded:
-            raise RuntimeError("Pipeline not loaded. Call load() first.")
+        self._require_ready()
         if type(audio_frontend_applied) is not bool:
             raise ValueError("audio_frontend_applied must be a boolean")
         if (
@@ -881,8 +902,7 @@ class MediVoicePipeline:
         Text-only translation (no ASR/TTS).
         Useful for testing the MT engine directly.
         """
-        if not self._is_loaded:
-            raise RuntimeError("Pipeline not loaded. Call load() first.")
+        self._require_ready()
 
         target_lang = self._resolve_target_language(source_lang, target_lang)
         validate_mt_source_text(
@@ -932,8 +952,7 @@ class MediVoicePipeline:
         Run the pipeline in interactive mode with microphone input.
         Press Ctrl+C to stop.
         """
-        if not self._is_loaded:
-            raise RuntimeError("Pipeline not loaded. Call load() first.")
+        self._require_ready()
         if on_result is not None and not callable(on_result):
             raise ValueError("on_result must be callable")
 

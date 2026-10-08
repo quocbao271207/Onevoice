@@ -149,10 +149,11 @@ def test_audio_config_rounds_silence_detection_up_to_full_chunks():
     assert config.silence_chunks == 2
 
 
-def test_pipeline_rejects_invalid_direction_before_cache_lookup():
+def test_pipeline_rejects_invalid_direction_before_cache_lookup(
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
-    pipeline.flash_cache.load()
+    mark_pipeline_ready(pipeline)
 
     import pytest
 
@@ -160,9 +161,12 @@ def test_pipeline_rejects_invalid_direction_before_cache_lookup():
         pipeline.translate_text("Tiêm epinephrine ngay!", "vi", "vi")
 
 
-def test_text_only_pipeline_exposes_swapped_drug_dose_safety_failure(monkeypatch):
+def test_text_only_pipeline_exposes_swapped_drug_dose_safety_failure(
+    monkeypatch,
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     monkeypatch.setattr(pipeline.flash_cache, "lookup", lambda *_: None)
     monkeypatch.setattr(
         pipeline.mt_engine,
@@ -196,12 +200,13 @@ def test_text_only_pipeline_exposes_swapped_drug_dose_safety_failure(monkeypatch
 def test_speech_pipeline_blocks_unsafe_candidate_and_redacts_logs(
     monkeypatch,
     caplog,
+    mark_pipeline_ready,
 ):
     import numpy as np
     from types import SimpleNamespace
 
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     monkeypatch.setattr(
         pipeline.audio_frontend.denoiser,
         "suppress",
@@ -366,10 +371,11 @@ def test_mt_engine_rejects_generation_that_never_reaches_eos():
         engine.translate("Give aspirin now.", "en", "vi")
 
 
-def test_text_only_cache_hit_preserves_confirmation_and_safety_metadata():
+def test_text_only_cache_hit_preserves_confirmation_and_safety_metadata(
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
-    pipeline.flash_cache.load()
+    mark_pipeline_ready(pipeline)
 
     result = pipeline.translate_text("Tiêm epinephrine ngay!", "vi", "en")
 

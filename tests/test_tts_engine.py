@@ -211,9 +211,12 @@ def test_pipeline_audio_sink_rechecks_safety_before_device_dispatch(monkeypatch)
     assert dispatched[0][1] == 22_050
 
 
-def test_pipeline_revalidates_cached_audio_before_return(monkeypatch):
+def test_pipeline_revalidates_cached_audio_before_return(
+    monkeypatch,
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     monkeypatch.setattr(
         pipeline.audio_frontend.denoiser,
         "suppress",

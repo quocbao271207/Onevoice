@@ -1,6 +1,7 @@
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from src.pipeline.asr_engine import ASREngine
@@ -67,6 +68,38 @@ def test_pipeline_load_is_idempotent_after_verified_readiness():
         pipeline.flash_cache,
     ):
         assert stage.load_count == 1
+
+
+def test_runtime_entrypoints_recheck_component_readiness(monkeypatch):
+    pipeline = fake_pipeline(tts_ready=False)
+    pipeline._is_loaded = True
+    pipeline.audio_frontend.is_ready = True
+    pipeline.asr_engine.is_ready = True
+    pipeline.mt_engine.is_ready = True
+    pipeline.flash_cache.is_ready = True
+
+    def unexpected_runtime_call(*_args, **_kwargs):
+        raise AssertionError("Unready pipeline must stop before runtime work")
+
+    pipeline.flash_cache.lookup = unexpected_runtime_call
+    pipeline.audio_frontend.stream_from_microphone = unexpected_runtime_call
+    monkeypatch.setattr(
+        pipeline.audio_frontend,
+        "get_status",
+        unexpected_runtime_call,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="tts"):
+        pipeline.translate_text("Stable.", "en", "vi")
+    with pytest.raises(RuntimeError, match="tts"):
+        pipeline.translate_speech(
+            np.zeros(160, dtype=np.float32),
+            source_lang="en",
+            target_lang="vi",
+        )
+    with pytest.raises(RuntimeError, match="tts"):
+        pipeline.run_interactive()
 
 
 def test_disabled_cache_is_not_required_for_pipeline_readiness():

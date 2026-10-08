@@ -153,9 +153,12 @@ def test_asr_language_detection_never_defaults_after_runtime_failure():
         engine.detect_language(np.zeros(1600, dtype=np.float32), 16000)
 
 
-def test_pipeline_rejects_overlength_audio_before_frontend_dispatch(monkeypatch):
+def test_pipeline_rejects_overlength_audio_before_frontend_dispatch(
+    monkeypatch,
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     pipeline.asr_engine.max_input_duration_seconds = 0.01
 
     def unexpected_frontend(*_args, **_kwargs):
@@ -175,9 +178,12 @@ def test_pipeline_rejects_overlength_audio_before_frontend_dispatch(monkeypatch)
         )
 
 
-def test_pipeline_marks_empty_asr_transcript_as_safety_blocked(monkeypatch):
+def test_pipeline_marks_empty_asr_transcript_as_safety_blocked(
+    monkeypatch,
+    mark_pipeline_ready,
+):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
-    pipeline._is_loaded = True
+    mark_pipeline_ready(pipeline)
     monkeypatch.setattr(
         pipeline.audio_frontend.denoiser,
         "suppress",
