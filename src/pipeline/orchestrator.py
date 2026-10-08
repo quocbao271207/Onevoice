@@ -19,9 +19,11 @@ This orchestrator manages:
 """
 
 import logging
+import math
 import time
 import yaml
 import numpy as np
+from collections import deque
 from functools import wraps
 from threading import Lock, RLock
 from typing import Callable, Optional, Dict
@@ -64,6 +66,7 @@ def _exclusive_interactive_session(method):
     return wrapped
 
 MAX_PIPELINE_CONFIG_BYTES = 1_000_000
+MAX_LATENCY_HISTORY_SAMPLES = 10_000
 ALLOWED_PIPELINE_CONFIG_SECTIONS = {
     "pipeline",
     "runtime",
@@ -321,7 +324,9 @@ class MediVoicePipeline:
         # Performance tracking
         self._total_translations = 0
         self._cache_hits = 0
-        self._latency_history = []
+        self._latency_history = deque(
+            maxlen=MAX_LATENCY_HISTORY_SAMPLES
+        )
 
     def _load_config(self, config_path: Optional[str]) -> dict:
         """Load pipeline configuration from YAML file."""
@@ -750,7 +755,6 @@ class MediVoicePipeline:
                 target_lang,
             )
             # Cache HIT — bypass MT engine
-            self._cache_hits += 1
             translated_text = cached.translated_text
             mt_latency = latency_breakdown["cache_lookup_ms"]
             from_cache = True
@@ -788,7 +792,10 @@ class MediVoicePipeline:
                         cached.audio_sample_rate,
                     )
                 total_latency = (time.perf_counter() - pipeline_start) * 1000
-                self._total_translations += 1
+                self._record_translation_latency(
+                    total_latency,
+                    cache_hit=True,
+                )
                 return PipelineResult(
                     source_audio_duration_s=source_audio_duration,
                     asr_text=asr_result.text,
@@ -861,8 +868,10 @@ class MediVoicePipeline:
         total_latency = (time.perf_counter() - pipeline_start) * 1000
         overall_rtf = (total_latency / 1000) / source_audio_duration if source_audio_duration > 0 else 0
 
-        self._total_translations += 1
-        self._latency_history.append(total_latency)
+        self._record_translation_latency(
+            total_latency,
+            cache_hit=from_cache,
+        )
 
         result = PipelineResult(
             source_audio_duration_s=source_audio_duration,
@@ -1008,16 +1017,43 @@ class MediVoicePipeline:
     @_serialized_runtime
     def get_performance_stats(self) -> Dict:
         """Get pipeline performance statistics."""
+        latency_samples = len(self._latency_history)
         stats = {
             "total_translations": self._total_translations,
             "cache_hits": self._cache_hits,
             "cache_hit_rate": self._cache_hits / max(1, self._total_translations),
+            "latency_window_samples": latency_samples,
+            "latency_window_capacity": MAX_LATENCY_HISTORY_SAMPLES,
+            "latency_samples_dropped": max(
+                0,
+                self._total_translations - latency_samples,
+            ),
         }
         if self._latency_history:
-            stats["avg_latency_ms"] = sum(self._latency_history) / len(self._latency_history)
-            stats["min_latency_ms"] = min(self._latency_history)
-            stats["max_latency_ms"] = max(self._latency_history)
-            stats["p95_latency_ms"] = sorted(self._latency_history)[
-                int(0.95 * len(self._latency_history))
+            ordered = sorted(self._latency_history)
+            stats["avg_latency_ms"] = sum(ordered) / latency_samples
+            stats["min_latency_ms"] = ordered[0]
+            stats["max_latency_ms"] = ordered[-1]
+            stats["p95_latency_ms"] = ordered[
+                math.ceil(0.95 * latency_samples) - 1
             ]
         return stats
+
+    def _record_translation_latency(
+        self,
+        latency_ms: float,
+        *,
+        cache_hit: bool = False,
+    ) -> None:
+        if (
+            isinstance(latency_ms, bool)
+            or not isinstance(latency_ms, (int, float))
+            or not math.isfinite(float(latency_ms))
+            or float(latency_ms) < 0.0
+        ):
+            raise RuntimeError("Translation latency must be finite and non-negative")
+        if type(cache_hit) is not bool:
+            raise RuntimeError("cache_hit telemetry flag must be a boolean")
+        self._total_translations += 1
+        self._cache_hits += int(cache_hit)
+        self._latency_history.append(float(latency_ms))

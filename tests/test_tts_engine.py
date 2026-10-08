@@ -253,6 +253,59 @@ def test_pipeline_revalidates_cached_audio_before_return(
             target_lang="vi",
         )
 
+    stats = pipeline.get_performance_stats()
+    assert stats["total_translations"] == 0
+    assert stats["cache_hits"] == 0
+    assert stats["latency_window_samples"] == 0
+
+
+def test_pipeline_records_pre_synthesized_cache_latency(
+    monkeypatch,
+    mark_pipeline_ready,
+):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    mark_pipeline_ready(pipeline)
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        lambda audio, _sample_rate: audio,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="Check the pulse",
+            language="en",
+            confidence=1.0,
+            latency_ms=1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline.flash_cache,
+        "lookup",
+        lambda *_args: SimpleNamespace(
+            source_lang="en",
+            translated_text="Kiểm tra mạch",
+            target_lang="vi",
+            audio=np.zeros(8, dtype=np.float32),
+            audio_sample_rate=22050,
+            requires_confirmation=False,
+        ),
+    )
+
+    result = pipeline.translate_speech(
+        np.zeros(1600, dtype=np.float32),
+        source_lang="en",
+        target_lang="vi",
+    )
+    stats = pipeline.get_performance_stats()
+
+    assert result.from_cache
+    assert stats["total_translations"] == 1
+    assert stats["cache_hits"] == 1
+    assert stats["latency_window_samples"] == 1
+    assert len(pipeline._latency_history) == 1
+
 
 def test_pipeline_applies_tts_boundary_configuration():
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")

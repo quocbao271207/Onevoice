@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from src.pipeline import orchestrator as orchestrator_module
 from src.pipeline.asr_engine import ASREngine
 from src.pipeline.audio_frontend import AudioFrontend
 from src.pipeline.flash_cache import FlashCache
@@ -200,6 +201,30 @@ def test_interactive_session_lock_releases_after_validation_failure(
 
     assert pipeline._interactive_lock.acquire(blocking=False)
     pipeline._interactive_lock.release()
+
+
+def test_performance_latency_window_is_bounded_and_reports_nearest_rank_p95():
+    import math
+
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    capacity = orchestrator_module.MAX_LATENCY_HISTORY_SAMPLES
+    submitted = capacity + 3
+
+    for latency_ms in range(submitted):
+        pipeline._record_translation_latency(float(latency_ms))
+
+    retained = list(pipeline._latency_history)
+    stats = pipeline.get_performance_stats()
+    p95_index = math.ceil(0.95 * len(retained)) - 1
+
+    assert len(retained) == capacity
+    assert retained[0] == 3.0
+    assert retained[-1] == float(submitted - 1)
+    assert stats["total_translations"] == submitted
+    assert stats["latency_window_samples"] == capacity
+    assert stats["latency_window_capacity"] == capacity
+    assert stats["latency_samples_dropped"] == 3
+    assert stats["p95_latency_ms"] == sorted(retained)[p95_index]
 
 
 def test_disabled_cache_is_not_required_for_pipeline_readiness():
