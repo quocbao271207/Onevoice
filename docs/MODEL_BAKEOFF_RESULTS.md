@@ -145,7 +145,19 @@ python scripts/prepare_deployment_benchmark.py --action template \
   --selection-comparison data/reports/model_bakeoff/comparison.json
 ```
 
-CLI chỉ tạo draft sau khi `comparison.json` đã ở trạng thái `blind_complete`. Trên QCS6490 thật, trước tiên chạy `python scripts/capture_qcs6490_identity.py --output data/reports/model_bakeoff/board-evidence/qcs6490-identity.json`. Benchmark harness trên board phải xuất raw JSON schema 1 với `capture_source=qcs6490_runtime_sampler`, timestamp có timezone, ít nhất 30 mẫu latency/power/thermal, nguồn sensor và peak RAM/VRAM. Không tự đổi raw JSON thành evidence: dùng sealer để kiểm live board, timestamp, sample contract và artifact binding rồi ghi bất biến:
+CLI chỉ tạo draft sau khi `comparison.json` đã ở trạng thái `blind_complete`. Trên QCS6490 thật, trước tiên chạy `python scripts/capture_qcs6490_identity.py --output data/reports/model_bakeoff/board-evidence/qcs6490-identity.json`. Dùng sampler chính thức để chạy trực tiếp argv inference (không qua shell), bỏ warm-up, lấy ít nhất 30 latency và poll power/thermal sysfs trong suốt mỗi run; scale phải khai báo theo đơn vị thật của sensor. `--minimum-duration-seconds 1800` buộc soak tối thiểu 30 phút để lộ throttling, còn mỗi invocation vẫn có timeout hữu hạn:
+
+```bash
+python scripts/capture_qcs6490_runtime.py \
+  --power-sensor-path /sys/<board-power-sensor> --power-scale-to-mw <scale> \
+  --temperature-sensor-path /sys/class/thermal/<zone>/temp --temperature-scale-to-c 0.001 \
+  --runs 30 --warmup-runs 3 --sample-interval-ms 100 \
+  --timeout-seconds 300 --minimum-duration-seconds 1800 \
+  --output <raw-sampler-output.json> \
+  -- /opt/onevoice/bin/infer-winner --input <locked-fixture>
+```
+
+Sampler xác minh device-tree/sysfs QCS6490 trước khi spawn command, không ghi stdout/stderr lâm sàng, dừng cả process group khi timeout/lỗi sensor, và fail nếu không quan sát được RSS dương. Power/thermal giữ toàn bộ mẫu poll; latency giữ một mẫu cho mỗi invocation; `peak_vram_bytes=0` cho đường NPU/CPU không có VRAM. Output schema 1 có `capture_source=qcs6490_runtime_sampler`, timestamp có timezone, nguồn sensor và peak RAM. Không tự đổi raw JSON thành evidence: dùng sealer để kiểm lại live board, timestamp, sample contract và artifact binding rồi ghi bất biến:
 
 ```bash
 python scripts/seal_qcs6490_measurement.py \
