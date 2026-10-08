@@ -813,6 +813,14 @@ class MediVoicePipeline:
 
     def play(self, result: PipelineResult):
         """Play the translated audio output."""
+        if result.safety_passed is not True:
+            raise RuntimeError(
+                "Refusing playback: translation failed clinical safety gate"
+            )
+        if result.requires_confirmation is not False:
+            raise RuntimeError(
+                "Refusing playback: explicit confirmation is required"
+            )
         if result.output_audio is not None:
             self.tts_engine.play_audio(result.output_audio, result.output_sample_rate)
         else:

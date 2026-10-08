@@ -239,5 +239,16 @@ class TTSEngine:
             import sounddevice as sd
         except ImportError as exc:
             raise RuntimeError("Install sounddevice to play audio interactively") from exc
-        sd.play(audio, sample_rate)
-        sd.wait()
+        try:
+            sd.play(audio, sample_rate)
+            sd.wait()
+        except BaseException:
+            try:
+                sd.stop()
+            except Exception as stop_exc:
+                logger.error(
+                    "Failed to stop audio output after interruption "
+                    "error_type=%s",
+                    type(stop_exc).__name__,
+                )
+            raise

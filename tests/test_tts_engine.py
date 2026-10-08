@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -123,6 +124,91 @@ def test_tts_stops_consuming_chunks_as_soon_as_duration_limit_is_crossed():
 def test_play_audio_validates_before_device_dispatch():
     with pytest.raises(ValueError, match="finite"):
         TTSEngine.play_audio(np.array([np.nan], dtype=np.float32), 22050)
+
+
+def test_play_audio_stops_device_when_wait_is_interrupted(monkeypatch):
+    events = []
+
+    def interrupted_wait():
+        events.append("wait")
+        raise KeyboardInterrupt
+
+    fake_sounddevice = SimpleNamespace(
+        play=lambda audio, rate: events.append(("play", audio.copy(), rate)),
+        wait=interrupted_wait,
+        stop=lambda: events.append("stop"),
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sounddevice)
+    audio = np.array([0.0, 0.25], dtype=np.float32)
+
+    with pytest.raises(KeyboardInterrupt):
+        TTSEngine.play_audio(audio, 22_050)
+
+    assert events[0][0] == "play"
+    assert np.array_equal(events[0][1], audio)
+    assert events[0][2] == 22_050
+    assert events[1:] == ["wait", "stop"]
+
+
+def test_pipeline_audio_sink_rechecks_safety_before_device_dispatch(monkeypatch):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    dispatched = []
+    monkeypatch.setattr(
+        pipeline.tts_engine,
+        "play_audio",
+        lambda audio, rate: dispatched.append((audio, rate)),
+    )
+    audio = np.zeros(8, dtype=np.float32)
+
+    with pytest.raises(RuntimeError, match="clinical safety gate"):
+        pipeline.play(
+            SimpleNamespace(
+                output_audio=audio,
+                output_sample_rate=22_050,
+                safety_passed=False,
+                requires_confirmation=False,
+            )
+        )
+    with pytest.raises(RuntimeError, match="explicit confirmation"):
+        pipeline.play(
+            SimpleNamespace(
+                output_audio=audio,
+                output_sample_rate=22_050,
+                safety_passed=True,
+                requires_confirmation=True,
+            )
+        )
+    with pytest.raises(RuntimeError, match="clinical safety gate"):
+        pipeline.play(
+            SimpleNamespace(
+                output_audio=audio,
+                output_sample_rate=22_050,
+                safety_passed="true",
+                requires_confirmation=False,
+            )
+        )
+    with pytest.raises(RuntimeError, match="explicit confirmation"):
+        pipeline.play(
+            SimpleNamespace(
+                output_audio=audio,
+                output_sample_rate=22_050,
+                safety_passed=True,
+                requires_confirmation="false",
+            )
+        )
+
+    assert dispatched == []
+    pipeline.play(
+        SimpleNamespace(
+            output_audio=audio,
+            output_sample_rate=22_050,
+            safety_passed=True,
+            requires_confirmation=False,
+        )
+    )
+    assert len(dispatched) == 1
+    assert np.array_equal(dispatched[0][0], audio)
+    assert dispatched[0][1] == 22_050
 
 
 def test_pipeline_revalidates_cached_audio_before_return(monkeypatch):
