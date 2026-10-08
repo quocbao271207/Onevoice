@@ -211,6 +211,20 @@ def resume_scoring_command_compatible(
     )
 
 
+def resolved_command_executable(command_token: str) -> Path | None:
+    """Resolve a command executable using the same working directory as stages."""
+    executable = Path(command_token)
+    if not executable.is_absolute():
+        executable = ROOT / executable
+    try:
+        if not executable.is_file():
+            return None
+        resolved = executable.resolve(strict=True)
+        return resolved if resolved.is_file() else None
+    except (OSError, RuntimeError):
+        return None
+
+
 def interpreter_alias_only_command_change(
     previous_command: Any,
     current_command: list[str],
@@ -236,17 +250,13 @@ def interpreter_alias_only_command_change(
     current = list(current_command)
     if previous[0] == current[0] or previous[1:] != current[1:]:
         return False
-    try:
-        previous_executable = Path(previous[0])
-        current_executable = Path(current[0])
-        return (
-            previous_executable.is_file()
-            and current_executable.is_file()
-            and previous_executable.resolve(strict=True)
-            == current_executable.resolve(strict=True)
-        )
-    except (OSError, RuntimeError):
-        return False
+    previous_executable = resolved_command_executable(previous[0])
+    current_executable = resolved_command_executable(current[0])
+    return (
+        previous_executable is not None
+        and current_executable is not None
+        and previous_executable == current_executable
+    )
 
 
 def runner_generation_only_command_change(
@@ -289,18 +299,13 @@ def runner_generation_only_command_change(
     previous[previous_index] = "<runner-generation>"
     current[current_index] = "<runner-generation>"
     if previous[0] != current[0]:
-        try:
-            previous_python = Path(previous[0])
-            current_python = Path(current[0])
-            same_python = (
-                previous_python.is_file()
-                and current_python.is_file()
-                and previous_python.resolve(strict=True)
-                == current_python.resolve(strict=True)
-            )
-        except (OSError, RuntimeError):
-            same_python = False
-        if not same_python:
+        previous_python = resolved_command_executable(previous[0])
+        current_python = resolved_command_executable(current[0])
+        if (
+            previous_python is None
+            or current_python is None
+            or previous_python != current_python
+        ):
             return False
         previous[0] = "<python-executable>"
         current[0] = "<python-executable>"

@@ -1078,6 +1078,33 @@ def test_completed_training_accepts_same_interpreter_alias(tmp_path: Path):
     assert state["stages"]["stage"]["command"] == old_command
 
 
+def test_interpreter_alias_resolution_uses_stage_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    python = repo / "python"
+    python.write_text("", encoding="utf-8")
+    alias_parent = repo / "alias"
+    alias_parent.mkdir()
+    unrelated_cwd = tmp_path / "waiter-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.setattr(bakeoff, "ROOT", repo)
+    monkeypatch.chdir(unrelated_cwd)
+
+    old_command = ["./python", "/repo/scripts/run_gpu_rounds.py", "--task", "mt"]
+    current_command = [
+        "./alias/../python",
+        *old_command[1:],
+    ]
+
+    assert bakeoff.interpreter_alias_only_command_change(
+        old_command,
+        current_command,
+    )
+
+
 def test_completed_training_alias_requires_recorded_output_evidence(tmp_path: Path):
     state_path = tmp_path / "state.json"
     output = tmp_path / "training-output"
