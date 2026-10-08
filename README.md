@@ -2,7 +2,7 @@
 
 Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-device trên Qualcomm QCS6490. Đây là dự án do **một người** phát triển; dữ liệu đã vượt EDA/QA gate và GPU fine-tune theo phiên đang được điều phối, lưu checkpoint và kiểm chứng độc lập.
 
-> Trạng thái kiểm tra lại 27/09/2026: **data/GPU-ready; local LoRA training path đã smoke pass; release gate đang khóa**. EDA, merge chống leakage, materialize, signal QC, human QA 48/48 và GPU preflight đều pass. Hai fine-tune CPU smoke một bước đã tạo adapter thật nhưng đều ghi `promotion_allowed=false`. Baseline chưa đạt WER/BLEU target; suite lâm sàng 32 chiều còn fail phủ định, thuật ngữ và code-switch dù giữ đúng thuốc/liều/số/đơn vị trong mẫu này. Whisper Small w8a16 tham chiếu đã profile thành công trên NPU; PhoWhisper, Piper và NLLB vẫn còn các BYOM/QNN blocker nêu trong `project_analysis.md`. Latency toàn tuyến trên board vật lý chưa đo.
+> Trạng thái kiểm tra lại 08/10/2026: **data/GPU-ready; Candidate A đã huấn luyện xong nhưng fail clinical gate; bake-off chưa hoàn tất; release gate vẫn khóa**. NLLB-600M và PhoWhisper-small Candidate A chỉ được giữ làm reference, không được promotion. M2M100 EN→VI zero/r8/r16/r32 và VI→EN zero/r8/r16 đều hoàn tất nhưng fail clinical gate. Pilot VI→EN r32 kết thúc bất thường gần bước 110/400; checkpoint 100 đã được tải và xác minh, nhưng chưa có checkpoint 200 và không được coi là kết quả benchmark. Recovery runner gần nhất dừng fail-closed trước training vì interpreter alias tương đối được kiểm tra theo sai working directory; lỗi đã được sửa local cùng đường `--resume-audit` chỉ đọc, còn remote chưa được resume. Whisper-small multilingual và PhoWhisper-base vẫn chờ chạy tuần tự; blind v2, INT8/QNN parity và latency toàn tuyến trên QCS6490 vật lý chưa hoàn tất.
 
 ## 📁 Cấu trúc Tài liệu Dự án
 
@@ -48,9 +48,9 @@ Kết quả regression gần nhất được ghi trong `project_analysis.md`; kh
 
 ## Kế hoạch thực thi tiếp theo
 
-1. Chạy specialized AIMET recipe trên Linux cho PhoWhisper weights; encoder handoff đã có, decoder còn phải tạo teacher-forced token/KV-cache calibration thật. Không retry generic cloud-PTQ graph.
-2. Giữ Piper CPU fallback cho đến khi có source exporter loại được `NonZero/ReduceMax→Range`; graph mới phải qua local QNN gate trước khi upload. Sau đó mới export NLLB base theo encoder/decoder/KV-cache tĩnh.
-3. Hoàn tất candidate MT full-data đang chạy, tải ngay checkpoint/report/checksum về local và chấm locked MT suite.
-4. Chạy ba pilot ASR rồi để controller tự chọn cấu hình cho vòng ASR full-data; không chạy ASR và MT đồng thời trên một GPU.
-5. Đóng băng NLLB/PhoWhisper Candidate A, sau đó chạy bake-off M2M100/VinAI (nếu license gate mở), Whisper-small/PhoWhisper-base bằng successive halving.
-6. Chỉ promotion winner vượt hard safety gate, cải thiện ngoài 95% CI trên blind v2 mở một lần, rồi pass INT8 parity/QNN và benchmark board QCS6490 thật.
+1. Trước recovery, chủ động đưa remote tracked checkout tới một HEAD đã review có bản sửa interpreter alias và `--resume-audit`; chạy audit dưới đúng interpreter. Chỉ khi audit pass và không có GPU child sống mới khởi động đúng một runner.
+2. Resume M2M100 VI→EN r32 chỉ từ checkpoint 100 đã xác minh; tải và kiểm tra archive/manifest/sidecar/index ngay khi checkpoint 200/300/400 xuất hiện. Không biến lần dừng bất thường cũ thành benchmark evidence.
+3. Tiếp tục ASR challenger theo đúng thứ tự Whisper-small multilingual rồi PhoWhisper-base. VinAI AGPL vẫn khóa khi chưa có phê duyệt research-license rõ ràng và không đủ điều kiện production.
+4. Chỉ chọn winner sau hard safety gate và luật đa metric/95% CI; blind v2 chỉ được mở một lần trên dữ liệu chưa từng thấy và phải fail-closed khi dữ liệu chưa sẵn sàng.
+5. Sau khi có winner, chạy INT8 parity/QNN và đo deployment trên QCS6490 vật lý. Arduino, cloud host hoặc profile model tham chiếu không thay thế được evidence board thật.
+6. Giữ Piper CPU/text-only fallback an toàn trong khi hoàn thiện exporter; mọi fallback phải giữ ASR/MT safety bắt buộc và không tự phát audio lâm sàng khi chưa có xác nhận.

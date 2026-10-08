@@ -3,7 +3,7 @@
 > Cập nhật gần nhất: **08/10/2026 (Asia/Bangkok)**
 > Chủ dự án: **1 người**
 > Cách dùng máy: kiểm tra dữ liệu và chạy thử trên máy local; **chỉ thuê GPU online khi fine-tune**
-> Trạng thái tổng: **DỮ LIỆU/GPU-READY, LOCAL TRAINING PATH ĐÃ SMOKE PASS, RELEASE GATE ĐANG KHÓA** — ASR/MT LoRA đã chạy một bước thật trên CPU và không được promote; baseline chưa đạt accuracy gate, đồng thời suite lâm sàng còn lỗi phủ định/thuật ngữ/code-switch. PhoWhisper/NLLB vẫn cần full GPU fine-tune và QCS6490 BYOM parity trước release.
+> Trạng thái tổng: **DỮ LIỆU/GPU-READY, CANDIDATE A ĐÃ HUẤN LUYỆN XONG NHƯNG FAIL CLINICAL GATE, BAKE-OFF CHƯA HOÀN TẤT, RELEASE GATE ĐANG KHÓA** — NLLB-600M và PhoWhisper-small Candidate A chỉ là reference. Các profile M2M100 đã hoàn tất đều fail clinical gate; VI→EN r32 bị gián đoạn sau checkpoint 100 đã xác minh và recovery chưa được chạy lại trên remote. Whisper-small multilingual/PhoWhisper-base, blind v2, INT8/QNN parity và phép đo QCS6490 vật lý còn thiếu.
 > Nguồn sự thật vận hành: **chỉ `project_analysis.md`**. Mọi thay đổi trạng thái, giả định, kết quả đo và blocker phải cập nhật ngay dưới phần liên quan trong file này; hai DOCX proposal là bản lưu lịch sử và phải giữ nguyên byte-for-byte.
 
 ## Cách đọc nhanh và mục tiêu của từng thuật ngữ
@@ -66,6 +66,9 @@ voice EN → ASR → text EN → MT → text VN → TTS → voice VN
 
 | Thời điểm | Trạng thái | Việc đã làm và lý do |
 |---|---|---|
+| 08/10/2026 | ✅ Safe TTS degradation | Pipeline có fallback text-only cấu hình rõ khi TTS artifact/device/output/runtime hỏng sau ASR/MT an toàn: giữ bản dịch, phát mã lỗi ổn định đã khử dữ liệu nhạy cảm, không phát audio lỗi và ghi telemetry riêng. Có thể tắt fallback để giữ fail-closed cũ. Full local suite: 424 pass, 1 skip; compileall và dependency check pass. |
+| 08/10/2026 | ✅ Clinical playback confirmation | Audio sink revalidate source/translation safety ngay trước phát; CLI file mode yêu cầu người dùng nhập đúng `PLAY`, còn cache action chỉ phát qua API xác nhận rõ. Không có xác nhận hoặc validation fail thì không phát audio. Full local suite: 416 pass, 1 skip. |
+| 08/10/2026 | ✅ Bake-off recovery hardening | Sửa đối chiếu interpreter alias tương đối theo stage root thực tế thay vì working directory của auditor; thêm `--resume-audit` chỉ đọc để kiểm command digest, interpreter identity, runner generation và output evidence của mọi completed stage trước recovery. Remote chưa pull/restart và không có process mới do thay đổi này. |
 | 08/10/2026 | ✅ Bounded runtime telemetry | Latency telemetry 24/7 không còn giữ list tăng vô hạn: pipeline dùng rolling deque tối đa 10.000 translation hoàn tất, công bố sample count/capacity/dropped count và giữ counter tổng độc lập. Mọi đường thành công, gồm cache hit dùng audio dựng sẵn, đều đi qua một recorder; cache/audio validation exception không còn tăng `cache_hits` hoặc `total_translations`, nên hit rate không bị đếm false success. P95 sửa sang nearest-rank `ceil(0,95×n)-1` thay vì lệch một mẫu; min/max/average cùng đọc snapshot bounded dưới runtime lock. Regression đẩy quá capacity, đối chiếu retained range/drop count/p95 và kiểm cả cache success/failure. Full local suite: 401 pass, 1 skip. |
 | 08/10/2026 | ✅ Pipeline concurrency isolation | Một `MediVoicePipeline` nay serialize toàn bộ operation hữu hạn chia sẻ model/counter/audio sink: component load, speech/text translation, playback và performance snapshot. Reentrant lock cho phép operation pipeline lồng nhau cùng thread mà không deadlock; exception luôn nhả lock. Microphone session có lock riêng non-blocking: session thứ hai fail-fast thay vì reset/chia sẻ buffer, nhưng `get_status()` vẫn đọc được khi phiên live kéo dài. Regression instrumented xác minh boundary giữ lock, lời gọi lồng đạt depth 2 rồi nhả sạch, stats snapshot nhất quán, duplicate interactive bị chặn và validation failure nhả session lock. Full local suite: 399 pass, 1 skip. |
 | 08/10/2026 | ✅ MT concurrent-direction isolation | `MTEngine` nay khóa một critical section duy nhất từ lúc gán `tokenizer.src_lang` qua tokenize, device transfer, generation, EOS validation đến decode, nên request VI→EN và EN→VI đồng thời không thể đổi hướng tokenizer dùng chung hoặc chạy chồng model state. Thời gian chờ lock được tính vào latency thực. Load/reload hạ readiness và publish model/tokenizer/path dưới cùng lock để không tráo runtime object giữa inference. Regression dùng lock instrumented xác minh mọi shared-state/model operation nằm trong đúng một section và exception model luôn nhả lock, không deadlock request sau. Full local suite: 396 pass, 1 skip. |
@@ -604,11 +607,12 @@ Mỗi phase có một mục tiêu rõ để tránh làm nhiều việc cùng lú
 
 ### Phase E — GPU fine-tune (điểm dừng hiện tại)
 
-**Mục tiêu:** huấn luyện thêm PhoWhisper cho **voice VN → text VN** và NLLB cho **text VN ↔ text EN**. **Lý do:** model gốc đã chạy được nhưng chưa tối ưu cho dữ liệu y tế đã chọn.
+**Mục tiêu:** huấn luyện và so sánh ASR/MT trên selection-dev, rồi chỉ mở blind test cho winner vượt hard safety gate. **Lý do:** một training run hoàn tất không đủ chứng minh an toàn y tế hoặc đủ điều kiện promotion.
 
-- [ ] Fine-tune PhoWhisper-small.
-- [ ] Fine-tune một checkpoint NLLB joint EN↔VI.
-- [ ] Chọn checkpoint theo locked validation; chỉ test một lần khi chốt.
+- [x] Fine-tune PhoWhisper-small Candidate A full-data; locked evaluation fail clinical gate nên chỉ giữ làm reference.
+- [x] Fine-tune NLLB-600M Candidate A full-data; locked evaluation fail clinical gate nên chỉ giữ làm reference.
+- [ ] Hoàn tất challenger bake-off: M2M100 VI→EN r32 phải resume từ checkpoint 100 đã xác minh; sau đó chạy Whisper-small multilingual rồi PhoWhisper-base tuần tự. Các profile MT hoàn tất trước đó đều fail clinical gate và không được promotion.
+- [ ] Chọn winner theo locked selection-dev, hard safety và 95% CI; chỉ mở blind v2 một lần khi dữ liệu unseen sẵn sàng. Chưa có winner hợp lệ.
 
 ### Phase F — Tối ưu và đưa lên thiết bị sau GPU
 
