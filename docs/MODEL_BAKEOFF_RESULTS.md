@@ -145,4 +145,17 @@ python scripts/prepare_deployment_benchmark.py --action template \
   --selection-comparison data/reports/model_bakeoff/comparison.json
 ```
 
-CLI chỉ tạo draft sau khi `comparison.json` đã ở trạng thái `blind_complete`. Trên QCS6490 thật, chạy `python scripts/capture_qcs6490_identity.py --output data/reports/model_bakeoff/board-evidence/qcs6490-identity.json`, rồi chép identity evidence, measurement evidence và artifact thực tế về đúng các đường dẫn tương ứng trong project. Mỗi measurement JSON phải nằm dưới `data/reports/model_bakeoff/board-evidence/measurements/` và chứa `version=1`, `capture_source=physical_qcs6490`, `captured_at` có timezone, binding task/direction/candidate/adapter/identity/artifact, ít nhất 30 `latency_samples_ms`, `power_samples_mw`, `temperature_samples_c`, nguồn `power_sensor`/`temperature_sensor`, `peak_ram_bytes` và `peak_vram_bytes`. Trong `.draft.json` chỉ điền `measured_at`, `device.os`, `device.identity_evidence_path`, `artifact_path` và `measurement_evidence_path`; không tự điền metric tổng hợp. Sau đó chạy `--action finalize` với cùng comparison. CLI tự khóa checksum evidence, tính các percentile/peak, SHA-256/kích thước từng artifact và chỉ tạo `deployment_selected_winners.json` nếu toàn bộ physical-board gate pass; draft legacy thiếu measurement binding bị từ chối và draft/report có sẵn không bị ghi đè.
+CLI chỉ tạo draft sau khi `comparison.json` đã ở trạng thái `blind_complete`. Trên QCS6490 thật, trước tiên chạy `python scripts/capture_qcs6490_identity.py --output data/reports/model_bakeoff/board-evidence/qcs6490-identity.json`. Benchmark harness trên board phải xuất raw JSON schema 1 với `capture_source=qcs6490_runtime_sampler`, timestamp có timezone, ít nhất 30 mẫu latency/power/thermal, nguồn sensor và peak RAM/VRAM. Không tự đổi raw JSON thành evidence: dùng sealer để kiểm live board, timestamp, sample contract và artifact binding rồi ghi bất biến:
+
+```bash
+python scripts/seal_qcs6490_measurement.py \
+  --identity-evidence data/reports/model_bakeoff/board-evidence/qcs6490-identity.json \
+  --artifact models/<winner-artifact> \
+  --raw-measurement <raw-sampler-output.json> \
+  --task mt --direction en_to_vi \
+  --candidate-id <winner-id> \
+  --adapter-manifest-sha256 <64-hex> \
+  --output data/reports/model_bakeoff/board-evidence/measurements/<winner>.json
+```
+
+Lặp lại cho hai chiều MT và ASR (ASR bỏ `--direction`), rồi chép identity/measurement evidence cùng artifact thực tế về đúng project. Trong `.draft.json` chỉ điền `measured_at`, `device.os`, `device.identity_evidence_path`, `artifact_path` và `measurement_evidence_path`; không tự điền metric tổng hợp. Chạy `prepare_deployment_benchmark.py --action finalize` với cùng comparison. CLI tự khóa checksum evidence, tính các percentile/peak, SHA-256/kích thước từng artifact và chỉ tạo `deployment_selected_winners.json` nếu toàn bộ physical-board gate pass; draft legacy thiếu measurement binding bị từ chối và draft/report có sẵn không bị ghi đè.

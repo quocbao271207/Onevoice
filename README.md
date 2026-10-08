@@ -22,6 +22,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/run_blind_candidate_suite.py` — khóa checksum và mở blind test v2 đúng một lần cho winner cuối
 - `scripts/prepare_deployment_benchmark.py` — tạo draft đã khóa winner/adapter và chỉ finalize evidence QCS6490 sau khi measurement artifact bất biến khớp board/model, tự tính latency/power/thermal và vượt physical-board gate
 - `scripts/capture_qcs6490_identity.py` — chạy trên board thật để khóa device-tree/sysfs ARM64; Arduino/cloud metadata không được tính là evidence QCS6490
+- `scripts/seal_qcs6490_measurement.py` — chạy trên board thật để kiểm live identity, raw latency/power/thermal, timestamp, memory và compiled artifact trước khi phát hành measurement evidence bất biến
 - `scripts/create_verified_backup.py` — tạo backup data/model/report nguyên tử; manifest v2 khóa SHA-256 từng file và từng archive, cấm symlink/special member và tự đọc lại toàn bộ tar trước khi công bố
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
