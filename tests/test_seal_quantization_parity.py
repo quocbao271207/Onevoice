@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.seal_quantization_parity as parity_sealer
 from scripts.candidate_evidence import canonical_sha256
 from scripts.capture_compiled_predictions import resolve_command_template
 from scripts.run_model_bakeoff import (
@@ -427,3 +428,118 @@ def test_parity_writer_is_immutable(tmp_path: Path):
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         write_exclusive(output, {"version": 2})
     assert json.loads(output.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_sealer_rejects_duplicate_prediction_fields(tmp_path: Path):
+    manifest, reference, quantized, artifact = mt_fixture(tmp_path)
+    first, *remaining = quantized.read_text(encoding="utf-8").splitlines()
+    row = json.loads(first)
+    duplicate = (
+        json.dumps(row, ensure_ascii=False)[:-1]
+        + ',"hypothesis":"tampered duplicate"}'
+    )
+    quantized.write_text(
+        "\n".join([duplicate, *remaining]) + "\n",
+        encoding="utf-8",
+    )
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSONL"):
+        seal_quantization_parity(
+            task="mt",
+            direction="en_to_vi",
+            candidate_id="mt-winner",
+            adapter_manifest_sha256="a" * 64,
+            artifact_path=artifact,
+            manifest_path=manifest,
+            reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
+            quantized_predictions_path=quantized,
+            quantized_provenance_path=quantized_provenance,
+            now=NOW,
+        )
+
+
+def test_sealer_caps_compiled_artifact_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest, reference, quantized, artifact = mt_fixture(tmp_path)
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
+    monkeypatch.setattr(parity_sealer, "MAX_DEPLOYMENT_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(ValueError, match="exceeds 4 bytes"):
+        seal_quantization_parity(
+            task="mt",
+            direction="en_to_vi",
+            candidate_id="mt-winner",
+            adapter_manifest_sha256="a" * 64,
+            artifact_path=artifact,
+            manifest_path=manifest,
+            reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
+            quantized_predictions_path=quantized,
+            quantized_provenance_path=quantized_provenance,
+            now=NOW,
+        )
+
+
+def test_parity_writer_rejects_non_finite_json(tmp_path: Path):
+    output = tmp_path / "parity.json"
+
+    with pytest.raises(ValueError, match="not serializable"):
+        write_exclusive(output, {"metric": float("nan")})
+
+    assert not output.exists()
+
+
+def test_sealer_rejects_linked_prediction_input(tmp_path: Path):
+    manifest, reference, quantized, artifact = mt_fixture(tmp_path)
+    linked = tmp_path / "quantized-link.jsonl"
+    try:
+        linked.symlink_to(quantized.name)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        seal_quantization_parity(
+            task="mt",
+            direction="en_to_vi",
+            candidate_id="mt-winner",
+            adapter_manifest_sha256="a" * 64,
+            artifact_path=artifact,
+            manifest_path=manifest,
+            reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
+            quantized_predictions_path=linked,
+            quantized_provenance_path=quantized_provenance,
+            now=NOW,
+        )

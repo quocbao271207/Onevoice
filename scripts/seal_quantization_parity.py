@@ -9,8 +9,8 @@ file is written.  This evidence is required by the physical deployment gate.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
 import re
 import sys
 from collections import defaultdict
@@ -32,6 +32,7 @@ from scripts.capture_compiled_predictions import (  # noqa: E402
     compiled_prediction_provenance_failures,
 )
 from scripts.run_model_bakeoff import (  # noqa: E402
+    MAX_DEPLOYMENT_ARTIFACT_BYTES,
     MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
     QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
     QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION,
@@ -39,8 +40,13 @@ from scripts.run_model_bakeoff import (  # noqa: E402
     QUANTIZATION_PARITY_SLICES,
     SHA256_RE,
     quantization_parity_evidence_failures,
-    sha256,
+    read_json_mapping,
 )
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    resolve_regular_file_without_links,
+)
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 MAX_PREDICTION_BYTES = 250_000_000
@@ -51,46 +57,112 @@ BOOTSTRAP_SEED = 20261005
 CANDIDATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-def _regular_file(path: Path, *, label: str, maximum_bytes: int) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
-    size = path.stat().st_size
-    if size < 1 or size > maximum_bytes:
-        raise ValueError(f"{label} size is outside the valid range")
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON document contains a duplicate key")
+        result[key] = value
+    return result
 
 
-def _read_jsonl(path: Path, *, label: str) -> list[dict[str, Any]]:
-    _regular_file(path, label=label, maximum_bytes=MAX_PREDICTION_BYTES)
-    rows: list[dict[str, Any]] = []
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("JSON document contains a non-finite number")
+
+
+def _decode_jsonl_row(
+    raw_line: bytes,
+    *,
+    label: str,
+    line_number: int,
+) -> dict[str, Any]:
     try:
-        with path.open("r", encoding="utf-8", errors="strict") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                if len(line.encode("utf-8")) > MAX_JSONL_LINE_BYTES:
+        row = json.loads(
+            raw_line.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError(
+            f"{label} line {line_number} is not valid strict UTF-8 JSONL"
+        ) from None
+    if not isinstance(row, dict):
+        raise ValueError(f"{label} line {line_number} is not an object")
+    return row
+
+
+def _read_jsonl(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[list[dict[str, Any]], str, int]:
+    path = resolve_regular_file_without_links(
+        path,
+        label=label,
+        maximum_bytes=MAX_PREDICTION_BYTES,
+    )
+    expected_digest, expected_size = sha256_stable_regular_file(
+        path,
+        maximum_bytes=MAX_PREDICTION_BYTES,
+        label=label,
+    )
+    rows: list[dict[str, Any]] = []
+    digest = hashlib.sha256()
+    observed_size = 0
+    try:
+        with path.open("rb") as handle:
+            line_number = 0
+            while raw_line := handle.readline(MAX_JSONL_LINE_BYTES + 1):
+                line_number += 1
+                if len(raw_line) > MAX_JSONL_LINE_BYTES:
                     raise ValueError(f"{label} line {line_number} is too large")
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError(f"{label} line {line_number} is not an object")
+                observed_size += len(raw_line)
+                if observed_size > MAX_PREDICTION_BYTES:
+                    raise ValueError(f"{label} exceeds {MAX_PREDICTION_BYTES} bytes")
+                digest.update(raw_line)
+                if not raw_line.strip():
+                    continue
+                row = _decode_jsonl_row(
+                    raw_line,
+                    label=label,
+                    line_number=line_number,
+                )
                 rows.append(row)
                 if len(rows) > MAX_PREDICTION_ROWS:
                     raise ValueError(f"{label} has too many rows")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not valid UTF-8 JSONL") from exc
+    except OSError:
+        raise ValueError(f"Unable to read {label}") from None
+    if observed_size != expected_size or digest.hexdigest() != expected_digest:
+        raise RuntimeError(f"{label} changed while parsing")
     if not rows:
         raise ValueError(f"{label} is empty")
-    return rows
+    return rows, expected_digest, expected_size
 
 
-def _read_json(path: Path, *, label: str) -> dict[str, Any]:
-    _regular_file(path, label=label, maximum_bytes=MAX_PROVENANCE_BYTES)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8", errors="strict"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    return payload
+def _read_json(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[dict[str, Any], str, int]:
+    path = resolve_regular_file_without_links(
+        path,
+        label=label,
+        maximum_bytes=MAX_PROVENANCE_BYTES,
+    )
+    digest, size = sha256_stable_regular_file(
+        path,
+        maximum_bytes=MAX_PROVENANCE_BYTES,
+        label=label,
+    )
+    payload = read_json_mapping(
+        path,
+        maximum_bytes=MAX_PROVENANCE_BYTES,
+        label=label,
+        expected_sha256=digest,
+    )
+    return payload, digest, size
 
 
 def _verify_reference_provenance(
@@ -99,11 +171,16 @@ def _verify_reference_provenance(
     task: str,
     direction: str | None,
     adapter_manifest_sha256: str,
-    manifest_path: Path,
-    predictions_path: Path,
+    manifest_sha256: str,
+    manifest_bytes: int,
+    predictions_sha256: str,
+    predictions_bytes: int,
     prediction_rows: int,
-) -> dict[str, Any]:
-    provenance = _read_json(path, label="Reference prediction provenance")
+) -> tuple[dict[str, Any], str, int]:
+    provenance, provenance_sha256, provenance_bytes = _read_json(
+        path,
+        label="Reference prediction provenance",
+    )
     specification = provenance.get("specification")
     prediction = provenance.get("predictions")
     decoding = provenance.get("decoding")
@@ -132,13 +209,13 @@ def _verify_reference_provenance(
     manifest = specification.get("manifest")
     if (
         not isinstance(manifest, dict)
-        or manifest.get("bytes") != manifest_path.stat().st_size
-        or manifest.get("sha256") != sha256(manifest_path)
+        or manifest.get("bytes") != manifest_bytes
+        or manifest.get("sha256") != manifest_sha256
     ):
         raise ValueError("Reference prediction provenance manifest mismatch")
     if (
-        prediction.get("bytes") != predictions_path.stat().st_size
-        or prediction.get("sha256") != sha256(predictions_path)
+        prediction.get("bytes") != predictions_bytes
+        or prediction.get("sha256") != predictions_sha256
         or prediction.get("rows") != prediction_rows
     ):
         raise ValueError("Reference prediction provenance prediction mismatch")
@@ -150,7 +227,11 @@ def _verify_reference_provenance(
         or decoding.get("num_beams") != num_beams
     ):
         raise ValueError("Reference prediction provenance decoding mismatch")
-    return {"num_beams": num_beams, "do_sample": False}
+    return (
+        {"num_beams": num_beams, "do_sample": False},
+        provenance_sha256,
+        provenance_bytes,
+    )
 
 
 def _verify_quantized_provenance(
@@ -161,12 +242,18 @@ def _verify_quantized_provenance(
     candidate_id: str,
     adapter_manifest_sha256: str,
     decoding: dict[str, Any],
-    artifact_path: Path,
-    manifest_path: Path,
-    predictions_path: Path,
+    artifact_sha256: str,
+    artifact_bytes: int,
+    manifest_sha256: str,
+    manifest_bytes: int,
+    predictions_sha256: str,
+    predictions_bytes: int,
     prediction_rows: int,
-) -> None:
-    provenance = _read_json(path, label="Quantized prediction provenance")
+) -> tuple[str, int]:
+    provenance, provenance_sha256, provenance_bytes = _read_json(
+        path,
+        label="Quantized prediction provenance",
+    )
     expected = {
         "task": task,
         "direction": direction,
@@ -174,16 +261,16 @@ def _verify_quantized_provenance(
         "adapter_manifest_sha256": adapter_manifest_sha256,
         "decoding": decoding,
         "artifact": {
-            "bytes": artifact_path.stat().st_size,
-            "sha256": sha256(artifact_path),
+            "bytes": artifact_bytes,
+            "sha256": artifact_sha256,
         },
         "manifest": {
-            "bytes": manifest_path.stat().st_size,
-            "sha256": sha256(manifest_path),
+            "bytes": manifest_bytes,
+            "sha256": manifest_sha256,
         },
         "predictions": {
-            "bytes": predictions_path.stat().st_size,
-            "sha256": sha256(predictions_path),
+            "bytes": predictions_bytes,
+            "sha256": predictions_sha256,
             "rows": prediction_rows,
         },
     }
@@ -192,6 +279,7 @@ def _verify_quantized_provenance(
         raise ValueError(
             "Quantized prediction provenance failed: " + ", ".join(failures)
         )
+    return provenance_sha256, provenance_bytes
 
 
 def _row_key(row: dict[str, Any], *, task: str, label: str) -> tuple[str, ...]:
@@ -540,19 +628,33 @@ def seal_quantization_parity(
     if not SHA256_RE.fullmatch(str(adapter_manifest_sha256 or "")):
         raise ValueError("adapter_manifest_sha256 is invalid")
 
-    _regular_file(
+    artifact_path = resolve_regular_file_without_links(
         artifact_path,
         label="Compiled deployment artifact",
-        maximum_bytes=sys.maxsize,
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
     )
-    manifest_rows = _read_jsonl(manifest_path, label="Parity manifest")
-    reference_rows = _read_jsonl(
-        reference_predictions_path,
-        label="Reference predictions",
+    artifact_sha256, artifact_bytes = sha256_stable_regular_file(
+        artifact_path,
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+        label="Compiled deployment artifact",
     )
-    quantized_rows = _read_jsonl(
-        quantized_predictions_path,
-        label="Quantized predictions",
+    manifest_rows, manifest_sha256, manifest_bytes = _read_jsonl(
+        manifest_path,
+        label="Parity manifest",
+    )
+    (
+        reference_rows,
+        reference_predictions_sha256,
+        reference_predictions_bytes,
+    ) = _read_jsonl(
+        reference_predictions_path, label="Reference predictions"
+    )
+    (
+        quantized_rows,
+        quantized_predictions_sha256,
+        quantized_predictions_bytes,
+    ) = _read_jsonl(
+        quantized_predictions_path, label="Quantized predictions"
     )
     reference_rows, quantized_rows = _validate_prediction_pair(
         reference_rows,
@@ -569,25 +671,37 @@ def seal_quantization_parity(
         task=task,
         direction=direction,
     )
-    decoding = _verify_reference_provenance(
+    (
+        decoding,
+        reference_provenance_sha256,
+        reference_provenance_bytes,
+    ) = _verify_reference_provenance(
         reference_provenance_path,
         task=task,
         direction=direction,
         adapter_manifest_sha256=adapter_manifest_sha256,
-        manifest_path=manifest_path,
-        predictions_path=reference_predictions_path,
+        manifest_sha256=manifest_sha256,
+        manifest_bytes=manifest_bytes,
+        predictions_sha256=reference_predictions_sha256,
+        predictions_bytes=reference_predictions_bytes,
         prediction_rows=len(reference_rows),
     )
-    _verify_quantized_provenance(
+    (
+        quantized_provenance_sha256,
+        quantized_provenance_bytes,
+    ) = _verify_quantized_provenance(
         quantized_provenance_path,
         task=task,
         direction=direction,
         candidate_id=candidate_id,
         adapter_manifest_sha256=adapter_manifest_sha256,
         decoding=decoding,
-        artifact_path=artifact_path,
-        manifest_path=manifest_path,
-        predictions_path=quantized_predictions_path,
+        artifact_sha256=artifact_sha256,
+        artifact_bytes=artifact_bytes,
+        manifest_sha256=manifest_sha256,
+        manifest_bytes=manifest_bytes,
+        predictions_sha256=quantized_predictions_sha256,
+        predictions_bytes=quantized_predictions_bytes,
         prediction_rows=len(quantized_rows),
     )
 
@@ -635,18 +749,18 @@ def seal_quantization_parity(
         "direction": direction,
         "candidate_id": candidate_id,
         "adapter_manifest_sha256": adapter_manifest_sha256,
-        "artifact_sha256": sha256(artifact_path),
-        "artifact_bytes": artifact_path.stat().st_size,
-        "manifest_sha256": sha256(manifest_path),
-        "manifest_bytes": manifest_path.stat().st_size,
-        "reference_predictions_sha256": sha256(reference_predictions_path),
-        "reference_predictions_bytes": reference_predictions_path.stat().st_size,
-        "reference_provenance_sha256": sha256(reference_provenance_path),
-        "reference_provenance_bytes": reference_provenance_path.stat().st_size,
-        "quantized_predictions_sha256": sha256(quantized_predictions_path),
-        "quantized_predictions_bytes": quantized_predictions_path.stat().st_size,
-        "quantized_provenance_sha256": sha256(quantized_provenance_path),
-        "quantized_provenance_bytes": quantized_provenance_path.stat().st_size,
+        "artifact_sha256": artifact_sha256,
+        "artifact_bytes": artifact_bytes,
+        "manifest_sha256": manifest_sha256,
+        "manifest_bytes": manifest_bytes,
+        "reference_predictions_sha256": reference_predictions_sha256,
+        "reference_predictions_bytes": reference_predictions_bytes,
+        "reference_provenance_sha256": reference_provenance_sha256,
+        "reference_provenance_bytes": reference_provenance_bytes,
+        "quantized_predictions_sha256": quantized_predictions_sha256,
+        "quantized_predictions_bytes": quantized_predictions_bytes,
+        "quantized_provenance_sha256": quantized_provenance_sha256,
+        "quantized_provenance_bytes": quantized_provenance_bytes,
         "decoding": decoding,
         "samples": len(reference_rows),
         "bootstrap": {
@@ -665,18 +779,17 @@ def seal_quantization_parity(
 
 
 def write_exclusive(path: Path, payload: dict[str, Any]) -> None:
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite parity evidence: {path}")
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    if len(serialized.encode("utf-8")) > MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES:
-        raise ValueError("Quantization parity evidence is too large")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(serialized, encoding="utf-8")
     try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_durable_json_exclusive(
+            path,
+            payload,
+            maximum_bytes=MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
+            label="Quantization parity evidence",
+        )
+    except FileExistsError:
+        raise FileExistsError(
+            f"Refusing to overwrite parity evidence: {path}"
+        ) from None
 
 
 def main() -> int:

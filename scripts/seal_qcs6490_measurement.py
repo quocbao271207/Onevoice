@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -33,8 +32,7 @@ from scripts.run_model_bakeoff import (
 )
 from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
 from src.pipeline.evidence_paths import (  # noqa: E402
-    is_link_or_junction,
-    resolve_regular_file,
+    resolve_regular_file_without_links,
 )
 from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
@@ -67,14 +65,8 @@ def _resolve_regular_input(
     maximum_bytes: int,
     label: str,
 ) -> Path:
-    absolute = Path(os.path.abspath(path))
-    current = Path(absolute.parts[0])
-    for part in absolute.parts[1:]:
-        current /= part
-        if is_link_or_junction(current):
-            raise ValueError(f"{label} cannot traverse a symlink or junction")
-    return resolve_regular_file(
-        absolute,
+    return resolve_regular_file_without_links(
+        path,
         label=label,
         maximum_bytes=maximum_bytes,
     )
