@@ -15,6 +15,7 @@ import math
 import os
 import sys
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.run_model_bakeoff import (  # noqa: E402
+    MAX_DEPLOYMENT_MEASUREMENT_BYTES,
     deployment_required_metrics,
     deployment_expectations,
     load_config,
@@ -106,6 +108,7 @@ def build_template(
             {
                 **winner,
                 "artifact_path": "",
+                "measurement_evidence_path": "",
                 "latency_samples_ms": [],
                 "power_sensor": "",
                 "power_samples_mw": [],
@@ -132,6 +135,61 @@ def _resolve_artifact(path_value: Any, project_root: Path) -> Path:
     if not path.is_absolute():
         path = project_root / path
     return path.resolve()
+
+
+def _load_measurement_evidence(
+    record: dict[str, Any],
+    expected_record: dict[str, Any],
+    *,
+    identity_sha256: str,
+    artifact: Path,
+    project_root: Path,
+) -> tuple[Path, dict[str, Any]]:
+    value = str(record.get("measurement_evidence_path") or "").strip()
+    if not value:
+        raise ValueError("Physical measurement evidence path is missing")
+    path = Path(value)
+    if not path.is_absolute():
+        path = project_root / path
+    path = path.resolve()
+    evidence_root = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/measurements"
+    ).resolve()
+    if evidence_root not in path.parents:
+        raise ValueError("Physical measurement evidence must be under board-evidence/measurements")
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"Physical measurement evidence is missing: {path}")
+    if path.stat().st_size > MAX_DEPLOYMENT_MEASUREMENT_BYTES:
+        raise ValueError("Physical measurement evidence is too large")
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Physical measurement evidence is not valid JSON") from exc
+    if not isinstance(evidence, dict):
+        raise ValueError("Physical measurement evidence payload is invalid")
+    if evidence.get("version") != 1:
+        raise ValueError("Physical measurement evidence version is invalid")
+    if evidence.get("capture_source") != "physical_qcs6490":
+        raise ValueError("Physical measurement evidence source is invalid")
+    for field in ("task", "direction", "candidate_id", "adapter_manifest_sha256"):
+        if evidence.get(field) != expected_record.get(field):
+            raise ValueError(f"Physical measurement evidence {field} binding changed")
+    if evidence.get("identity_evidence_sha256") != identity_sha256:
+        raise ValueError("Physical measurement evidence identity binding changed")
+    artifact_sha = sha256(artifact)
+    if evidence.get("artifact_sha256") != artifact_sha:
+        raise ValueError("Physical measurement evidence artifact checksum changed")
+    if evidence.get("artifact_bytes") != artifact.stat().st_size:
+        raise ValueError("Physical measurement evidence artifact size changed")
+    captured_at = str(evidence.get("captured_at") or "")
+    try:
+        captured_time = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        if captured_time.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError as exc:
+        raise ValueError("Physical measurement evidence timestamp is invalid") from exc
+    return path, evidence
 
 
 def _parse_samples(
@@ -219,6 +277,26 @@ def finalize_report(
             raise ValueError(f"Deployment candidate binding changed: {key}")
         if record.get("adapter_manifest_sha256") != expected_record["adapter_manifest_sha256"]:
             raise ValueError(f"Deployment adapter binding changed: {key}")
+        artifact = _resolve_artifact(record.get("artifact_path"), project_root)
+        if not artifact.is_file():
+            raise FileNotFoundError(f"Deployment artifact is missing: {artifact}")
+        measurement_path, measurement = _load_measurement_evidence(
+            record,
+            expected_record,
+            identity_sha256=device["identity_evidence_sha256"],
+            artifact=artifact,
+            project_root=project_root,
+        )
+        for field in (
+            "latency_samples_ms",
+            "power_sensor",
+            "power_samples_mw",
+            "temperature_sensor",
+            "temperature_samples_c",
+            "peak_ram_bytes",
+            "peak_vram_bytes",
+        ):
+            record[field] = deepcopy(measurement.get(field))
         parsed_samples = _parse_samples(
             record,
             "latency_samples_ms",
@@ -234,11 +312,11 @@ def finalize_report(
             "temperature_samples_c",
             minimum=-273.15,
         )
-        artifact = _resolve_artifact(record.get("artifact_path"), project_root)
-        if not artifact.is_file():
-            raise FileNotFoundError(f"Deployment artifact is missing: {artifact}")
         record.update(
             {
+                "measurement_evidence_path": str(measurement_path),
+                "measurement_evidence_sha256": sha256(measurement_path),
+                "measurement_captured_at": measurement["captured_at"],
                 "measurement_runs": len(parsed_samples),
                 "latency_samples_ms": parsed_samples,
                 "latency_p50_ms": percentile_linear(parsed_samples, 0.50),

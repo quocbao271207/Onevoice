@@ -49,6 +49,7 @@ from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
 
 
 def utc_now() -> str:
@@ -1102,6 +1103,7 @@ def validate_deployment_report(
         failures.append("measured_at:invalid")
 
     device = report.get("device")
+    device_identity_sha = ""
     if not isinstance(device, dict):
         failures.append("device:missing")
     else:
@@ -1117,6 +1119,7 @@ def validate_deployment_report(
 
         identity_value = str(device.get("identity_evidence_path") or "").strip()
         identity_sha = str(device.get("identity_evidence_sha256") or "")
+        device_identity_sha = identity_sha
         if not identity_value:
             failures.append("device.identity_evidence_path:missing")
         else:
@@ -1202,6 +1205,93 @@ def validate_deployment_report(
         artifact_sha = str(record.get("artifact_sha256") or "")
         if not SHA256_RE.fullmatch(artifact_sha):
             failures.append(f"{label}:artifact_sha256_invalid")
+        measurement_value = str(record.get("measurement_evidence_path") or "").strip()
+        measurement_sha = str(record.get("measurement_evidence_sha256") or "")
+        measurement: dict[str, Any] | None = None
+        if not measurement_value:
+            failures.append(f"{label}:measurement_evidence_path_missing")
+        else:
+            measurement_path = Path(measurement_value)
+            if not measurement_path.is_absolute():
+                measurement_path = project_root / measurement_path
+            measurement_path = measurement_path.resolve()
+            measurement_root = (
+                project_root
+                / "data/reports/model_bakeoff/board-evidence/measurements"
+            ).resolve()
+            if measurement_root not in measurement_path.parents:
+                failures.append(f"{label}:measurement_evidence_path_outside_board_evidence")
+            elif measurement_path.is_symlink() or not measurement_path.is_file():
+                failures.append(f"{label}:measurement_evidence_missing")
+            elif measurement_path.stat().st_size > MAX_DEPLOYMENT_MEASUREMENT_BYTES:
+                failures.append(f"{label}:measurement_evidence_too_large")
+            else:
+                if not SHA256_RE.fullmatch(measurement_sha):
+                    failures.append(f"{label}:measurement_evidence_sha256_invalid")
+                elif sha256(measurement_path) != measurement_sha:
+                    failures.append(f"{label}:measurement_evidence_sha256_mismatch")
+                try:
+                    loaded_measurement = json.loads(
+                        measurement_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    failures.append(f"{label}:measurement_evidence_invalid_json")
+                else:
+                    if not isinstance(loaded_measurement, dict):
+                        failures.append(f"{label}:measurement_evidence_invalid")
+                    else:
+                        measurement = loaded_measurement
+        if measurement is not None:
+            if measurement.get("version") != 1:
+                failures.append(f"{label}:measurement_evidence_version_invalid")
+            if measurement.get("capture_source") != "physical_qcs6490":
+                failures.append(f"{label}:measurement_evidence_source_invalid")
+            bindings = {
+                "task": record.get("task"),
+                "direction": record.get("direction"),
+                "candidate_id": expected["candidate_id"],
+                "adapter_manifest_sha256": expected["adapter_manifest_sha256"],
+                "identity_evidence_sha256": device_identity_sha,
+                "artifact_sha256": artifact_sha,
+                "artifact_bytes": record.get("model_bytes"),
+            }
+            for field, bound_value in bindings.items():
+                if measurement.get(field) != bound_value:
+                    failures.append(f"{label}:measurement_evidence_{field}_mismatch")
+            measurement_fields = (
+                "latency_samples_ms",
+                "power_sensor",
+                "power_samples_mw",
+                "temperature_sensor",
+                "temperature_samples_c",
+                "peak_ram_bytes",
+                "peak_vram_bytes",
+            )
+            for field in measurement_fields:
+                if measurement.get(field) != record.get(field):
+                    failures.append(f"{label}:measurement_evidence_{field}_mismatch")
+            if measurement.get("captured_at") != record.get(
+                "measurement_captured_at"
+            ):
+                failures.append(
+                    f"{label}:measurement_evidence_captured_at_mismatch"
+                )
+            captured_at = str(measurement.get("captured_at") or "")
+            try:
+                captured_time = datetime.fromisoformat(
+                    captured_at.replace("Z", "+00:00")
+                )
+                if captured_time.tzinfo is None:
+                    raise ValueError("timezone required")
+            except ValueError:
+                captured_time = None
+                failures.append(f"{label}:measurement_evidence_timestamp_invalid")
+            if (
+                measured_time is not None
+                and captured_time is not None
+                and abs((measured_time - captured_time).total_seconds()) > 86_400
+            ):
+                failures.append(f"{label}:measurement_evidence_not_same_session")
         runs = record.get("measurement_runs")
         if isinstance(runs, bool) or not isinstance(runs, int) or runs < min_runs:
             failures.append(f"{label}:insufficient_measurement_runs")
@@ -1404,6 +1494,8 @@ def validate_deployment_draft(
         for source_key in ("power_sensor", "temperature_sensor"):
             if not isinstance(record.get(source_key), str):
                 failures.append(f"{label}:{source_key}_missing")
+        if not isinstance(record.get("measurement_evidence_path"), str):
+            failures.append(f"{label}:measurement_evidence_path_missing")
     return not failures, failures
 
 

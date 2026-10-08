@@ -84,6 +84,53 @@ def write_identity_evidence(
     return path
 
 
+def write_measurement_evidence(
+    project_root: Path,
+    identity: Path,
+    artifact: Path,
+    winner: dict,
+    *,
+    index: int,
+    power_samples: list[float] | None = None,
+) -> Path:
+    latency_samples = [100.0 + index + run for run in range(30)]
+    measured_power = power_samples if power_samples is not None else [
+        2500.0 + index + run * 10.0 for run in range(30)
+    ]
+    temperature_samples = [45.0 + index + run * 0.1 for run in range(30)]
+    path = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/measurements"
+        / f"winner-{index}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "capture_source": "physical_qcs6490",
+                "captured_at": "2026-10-06T12:00:00+07:00",
+                "task": winner["task"],
+                "direction": winner.get("direction"),
+                "candidate_id": winner["candidate_id"],
+                "adapter_manifest_sha256": winner["adapter_manifest_sha256"],
+                "identity_evidence_sha256": sha256(identity),
+                "artifact_sha256": sha256(artifact),
+                "artifact_bytes": artifact.stat().st_size,
+                "latency_samples_ms": latency_samples,
+                "power_sensor": "sysfs:ina231/system_power",
+                "power_samples_mw": measured_power,
+                "temperature_sensor": "sysfs:thermal_zone0/temp",
+                "temperature_samples_c": temperature_samples,
+                "peak_ram_bytes": 100_000_000 + index,
+                "peak_vram_bytes": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_template_binds_all_selected_winners(tmp_path: Path):
     selection, comparison, _, _ = deployment_fixture(tmp_path)
 
@@ -100,6 +147,7 @@ def test_template_binds_all_selected_winners(tmp_path: Path):
         ("asr", None, "asr-vi"),
     }
     assert all(len(winner["adapter_manifest_sha256"]) == 64 for winner in report["winners"])
+    assert all(winner["measurement_evidence_path"] == "" for winner in report["winners"])
     assert all(winner["power_samples_mw"] == [] for winner in report["winners"])
     assert all(winner["temperature_samples_c"] == [] for winner in report["winners"])
 
@@ -120,20 +168,19 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
     for index, winner in enumerate(draft["winners"]):
         artifact = models / f"winner-{index}.bin"
         artifact.write_bytes(f"compiled-{index}".encode())
+        measurement = write_measurement_evidence(
+            project_root,
+            identity,
+            artifact,
+            winner,
+            index=index,
+        )
         winner.update(
             {
                 "artifact_path": str(artifact.relative_to(project_root)),
-                "latency_samples_ms": [100.0 + index + run for run in range(30)],
-                "power_sensor": "sysfs:ina231/system_power",
-                "power_samples_mw": [
-                    2500.0 + index + run * 10.0 for run in range(30)
-                ],
-                "temperature_sensor": "sysfs:thermal_zone0/temp",
-                "temperature_samples_c": [
-                    45.0 + index + run * 0.1 for run in range(30)
-                ],
-                "peak_ram_bytes": 100_000_000 + index,
-                "peak_vram_bytes": 0,
+                "measurement_evidence_path": str(
+                    measurement.relative_to(project_root)
+                ),
             }
         )
 
@@ -156,6 +203,9 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
         assert winner["power_avg_mw"] == pytest.approx(2645.0 + index)
         assert winner["power_p95_mw"] == pytest.approx(2775.5 + index)
         assert winner["temperature_peak_c"] == pytest.approx(47.9 + index)
+        assert winner["measurement_evidence_sha256"] == sha256(
+            project_root / winner["measurement_evidence_path"]
+        )
         assert winner["artifact_sha256"] == sha256(artifact)
         assert winner["model_bytes"] == artifact.stat().st_size
 
@@ -193,17 +243,20 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
     )
     outside = tmp_path / "outside-model.bin"
     outside.write_bytes(b"not-qcs-artifact")
-    for winner in draft["winners"]:
+    for index, winner in enumerate(draft["winners"]):
+        measurement = write_measurement_evidence(
+            project_root,
+            identity,
+            outside,
+            winner,
+            index=index,
+        )
         winner.update(
             {
                 "artifact_path": str(outside),
-                "latency_samples_ms": [100.0 + run for run in range(30)],
-                "power_sensor": "sysfs:ina231/system_power",
-                "power_samples_mw": [2500.0 + run for run in range(30)],
-                "temperature_sensor": "sysfs:thermal_zone0/temp",
-                "temperature_samples_c": [45.0 + run * 0.1 for run in range(30)],
-                "peak_ram_bytes": 1,
-                "peak_vram_bytes": 0,
+                "measurement_evidence_path": str(
+                    measurement.relative_to(project_root)
+                ),
             }
         )
 
@@ -227,16 +280,20 @@ def test_finalize_rejects_missing_power_or_thermal_samples(tmp_path: Path):
     for index, winner in enumerate(draft["winners"]):
         artifact = models / f"winner-{index}.bin"
         artifact.write_bytes(b"compiled")
+        measurement = write_measurement_evidence(
+            project_root,
+            identity,
+            artifact,
+            winner,
+            index=index,
+            power_samples=[],
+        )
         winner.update(
             {
                 "artifact_path": str(artifact.relative_to(project_root)),
-                "latency_samples_ms": [100.0 + run for run in range(30)],
-                "power_sensor": "sysfs:ina231/system_power",
-                "power_samples_mw": [],
-                "temperature_sensor": "sysfs:thermal_zone0/temp",
-                "temperature_samples_c": [45.0 + run * 0.1 for run in range(30)],
-                "peak_ram_bytes": 1,
-                "peak_vram_bytes": 0,
+                "measurement_evidence_path": str(
+                    measurement.relative_to(project_root)
+                ),
             }
         )
 

@@ -1780,6 +1780,42 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "peak_vram_bytes": 0,
         "model_bytes": artifact.stat().st_size,
     }
+    measurement = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/measurements/mt-en-to-vi.json"
+    )
+    measurement.parent.mkdir(parents=True)
+    measurement.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "capture_source": "physical_qcs6490",
+                "captured_at": "2026-10-06T12:00:00+07:00",
+                "task": winner["task"],
+                "direction": winner["direction"],
+                "candidate_id": winner["candidate_id"],
+                "adapter_manifest_sha256": winner["adapter_manifest_sha256"],
+                "identity_evidence_sha256": bakeoff.sha256(identity),
+                "artifact_sha256": winner["artifact_sha256"],
+                "artifact_bytes": winner["model_bytes"],
+                "latency_samples_ms": latency_samples,
+                "power_sensor": winner["power_sensor"],
+                "power_samples_mw": power_samples,
+                "temperature_sensor": winner["temperature_sensor"],
+                "temperature_samples_c": temperature_samples,
+                "peak_ram_bytes": winner["peak_ram_bytes"],
+                "peak_vram_bytes": winner["peak_vram_bytes"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    winner.update(
+        {
+            "measurement_evidence_path": str(measurement.relative_to(project_root)),
+            "measurement_evidence_sha256": bakeoff.sha256(measurement),
+            "measurement_captured_at": "2026-10-06T12:00:00+07:00",
+        }
+    )
     report = {
         "version": 1,
         "status": "pass",
@@ -1807,6 +1843,19 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "model_bytes",
     ]
     assert validate_deployment_report(report, expected, metrics, 30, project_root) == (True, [])
+
+    original_measurement = measurement.read_text(encoding="utf-8")
+    measurement.write_text(original_measurement + "\n", encoding="utf-8")
+    passed, failures = validate_deployment_report(
+        report,
+        expected,
+        metrics,
+        30,
+        project_root,
+    )
+    assert passed is False
+    assert "winner:mt/en_to_vi:measurement_evidence_sha256_mismatch" in failures
+    measurement.write_text(original_measurement, encoding="utf-8")
 
     report["measured_at"] = "2026-10-08T12:00:01+07:00"
     passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
@@ -1870,6 +1919,7 @@ def test_deployment_draft_is_bound_to_current_selection_and_winners(tmp_path: Pa
             {
                 **expected[0],
                 "latency_samples_ms": [],
+                "measurement_evidence_path": "",
                 "power_sensor": "",
                 "power_samples_mw": [],
                 "temperature_sensor": "",
@@ -1918,3 +1968,4 @@ def test_deployment_draft_rejects_legacy_template_without_sensor_fields(
     assert "winner:mt/en_to_vi:temperature_samples_c_missing" in failures
     assert "winner:mt/en_to_vi:power_sensor_missing" in failures
     assert "winner:mt/en_to_vi:temperature_sensor_missing" in failures
+    assert "winner:mt/en_to_vi:measurement_evidence_path_missing" in failures
