@@ -362,6 +362,16 @@ So sánh bốn cột:
 
 Không chấp nhận model chỉ nhanh hơn nhưng safety hoặc thuật ngữ xấu đi.
 
+Mỗi winner phải sinh hai prediction JSONL trên **cùng manifest khóa**: float
+reference và compiled INT8/QNN. Chạy `scripts/seal_quantization_parity.py` để
+tái tính metric thay vì tin report tổng hợp: sealer kiểm toàn bộ metadata đầu
+vào ngoài `hypothesis` giống hệt, khóa checksum manifest/predictions/artifact,
+dùng paired bootstrap 1.000 lần và chỉ pass khi cả point estimate lẫn cận trên
+95% CI có relative degradation không quá 2%. ASR bắt buộc ít nhất 32
+group/speaker độc lập. Cả float và compiled output phải có zero failure trên
+drug name, dose, number, unit, negation, terminology và code-switch. Deployment
+finalizer từ chối winner thiếu parity artifact bất biến này.
+
 ## 13. Phase 8 — Board integration và acceptance cuối
 
 ### Tích hợp

@@ -1,10 +1,10 @@
 """Prepare and finalize physical-QCS6490 evidence for selected winners.
 
 The template action binds a measurement draft to the exact selected adapters.
-After board measurements and compiled artifacts have been copied back under
-``models/``, the finalize action computes immutable artifact identities plus
-latency/power/thermal metrics, validates the complete report, and writes it
-atomically.
+After board measurements, quantization-parity evidence and compiled artifacts
+have been copied back, the finalize action computes immutable artifact
+identities plus latency/power/thermal metrics, validates the complete report,
+and writes it atomically.
 """
 
 from __future__ import annotations
@@ -25,10 +25,16 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.run_model_bakeoff import (  # noqa: E402
     MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+    MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
+    QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
+    QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION,
+    QUANTIZATION_PARITY_MIN_SAMPLES,
+    QUANTIZATION_PARITY_SLICES,
     deployment_required_metrics,
     deployment_expectations,
     load_config,
     percentile_linear,
+    quantization_parity_evidence_failures,
     sha256,
     validate_deployment_report,
 )
@@ -108,6 +114,7 @@ def build_template(
             {
                 **winner,
                 "artifact_path": "",
+                "parity_evidence_path": "",
                 "measurement_evidence_path": "",
                 "latency_samples_ms": [],
                 "power_sensor": "",
@@ -189,6 +196,44 @@ def _load_measurement_evidence(
             raise ValueError("timezone required")
     except ValueError as exc:
         raise ValueError("Physical measurement evidence timestamp is invalid") from exc
+    return path, evidence
+
+
+def _load_parity_evidence(
+    record: dict[str, Any],
+    expected_record: dict[str, Any],
+    *,
+    artifact: Path,
+    project_root: Path,
+) -> tuple[Path, dict[str, Any]]:
+    value = str(record.get("parity_evidence_path") or "").strip()
+    if not value:
+        raise ValueError("Quantization parity evidence path is missing")
+    path = Path(value)
+    if not path.is_absolute():
+        path = project_root / path
+    path = path.resolve()
+    evidence_root = (
+        project_root / "data/reports/model_bakeoff/board-evidence/parity"
+    ).resolve()
+    if evidence_root not in path.parents:
+        raise ValueError("Quantization parity evidence must be under board-evidence/parity")
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"Quantization parity evidence is missing: {path}")
+    if path.stat().st_size > MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES:
+        raise ValueError("Quantization parity evidence is too large")
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Quantization parity evidence is not valid JSON") from exc
+    failures = quantization_parity_evidence_failures(
+        evidence,
+        expected=expected_record,
+        artifact_sha256=sha256(artifact),
+        artifact_bytes=artifact.stat().st_size,
+    )
+    if failures:
+        raise ValueError("Quantization parity evidence failed: " + ", ".join(failures))
     return path, evidence
 
 
@@ -280,6 +325,12 @@ def finalize_report(
         artifact = _resolve_artifact(record.get("artifact_path"), project_root)
         if not artifact.is_file():
             raise FileNotFoundError(f"Deployment artifact is missing: {artifact}")
+        parity_path, parity = _load_parity_evidence(
+            record,
+            expected_record,
+            artifact=artifact,
+            project_root=project_root,
+        )
         measurement_path, measurement = _load_measurement_evidence(
             record,
             expected_record,
@@ -314,6 +365,20 @@ def finalize_report(
         )
         record.update(
             {
+                "parity_evidence_path": str(parity_path),
+                "parity_evidence_sha256": sha256(parity_path),
+                "parity_evaluated_at": parity["evaluated_at"],
+                "parity_manifest_sha256": parity["manifest_sha256"],
+                "parity_reference_predictions_sha256": parity[
+                    "reference_predictions_sha256"
+                ],
+                "parity_quantized_predictions_sha256": parity[
+                    "quantized_predictions_sha256"
+                ],
+                "parity_samples": parity["samples"],
+                "parity_bootstrap": deepcopy(parity["bootstrap"]),
+                "parity_metrics": deepcopy(parity["metrics"]),
+                "parity_safety_slices": deepcopy(parity["safety_slices"]),
                 "measurement_evidence_path": str(measurement_path),
                 "measurement_evidence_sha256": sha256(measurement_path),
                 "measurement_captured_at": measurement["captured_at"],
@@ -338,6 +403,15 @@ def finalize_report(
     final["deployment_gate"] = {
         "required_metrics": required_metrics,
         "minimum_measurement_runs": int(gate["deployment_min_runs"]),
+        "quantization_parity": {
+            "maximum_relative_degradation": (
+                QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION
+            ),
+            "minimum_samples": QUANTIZATION_PARITY_MIN_SAMPLES,
+            "minimum_bootstrap_repeats": QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
+            "asr_minimum_independent_groups": 32,
+            "required_zero_failure_slices": list(QUANTIZATION_PARITY_SLICES),
+        },
     }
     passed, failures = validate_deployment_report(
         final,

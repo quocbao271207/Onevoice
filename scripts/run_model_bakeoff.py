@@ -50,6 +50,23 @@ from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
+MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES = 1_000_000
+QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION = 0.02
+QUANTIZATION_PARITY_MIN_SAMPLES = 32
+QUANTIZATION_PARITY_BOOTSTRAP_REPEATS = 1_000
+QUANTIZATION_PARITY_SLICES = (
+    "drug_name",
+    "dose",
+    "number",
+    "unit",
+    "negation",
+    "terminology",
+    "code_switch",
+)
+QUANTIZATION_PARITY_METRICS = {
+    "mt": ("sacrebleu", "chrf2"),
+    "asr": ("wer", "cer", "code_switch_wer"),
+}
 
 
 def utc_now() -> str:
@@ -1073,6 +1090,249 @@ def deployment_required_metrics(configured: list[str]) -> list[str]:
     return list(dict.fromkeys([*configured, *mandatory]))
 
 
+def _parity_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _relative_metric_degradation(
+    reference: float,
+    quantized: float,
+    *,
+    greater_is_better: bool,
+) -> float | None:
+    if reference == 0.0:
+        if greater_is_better and quantized >= 0.0:
+            return 0.0
+        return 0.0 if quantized == 0.0 else None
+    delta = reference - quantized if greater_is_better else quantized - reference
+    return delta / abs(reference)
+
+
+def quantization_parity_evidence_failures(
+    evidence: Any,
+    *,
+    expected: dict[str, Any] | None = None,
+    artifact_sha256: str | None = None,
+    artifact_bytes: int | None = None,
+) -> list[str]:
+    """Validate immutable float-vs-compiled parity evidence and safety gates."""
+    if not isinstance(evidence, dict):
+        return ["payload_invalid"]
+    failures: list[str] = []
+    expected_fields = {
+        "version",
+        "status",
+        "evidence_source",
+        "evaluated_at",
+        "task",
+        "direction",
+        "candidate_id",
+        "adapter_manifest_sha256",
+        "artifact_sha256",
+        "artifact_bytes",
+        "manifest_sha256",
+        "manifest_bytes",
+        "reference_predictions_sha256",
+        "reference_predictions_bytes",
+        "quantized_predictions_sha256",
+        "quantized_predictions_bytes",
+        "samples",
+        "bootstrap",
+        "metrics",
+        "safety_slices",
+    }
+    if set(evidence) != expected_fields:
+        failures.append("fields_invalid")
+    if evidence.get("version") != 1:
+        failures.append("version_invalid")
+    if evidence.get("status") != "pass":
+        failures.append("status_not_pass")
+    if evidence.get("evidence_source") != "onevoice_quantization_parity":
+        failures.append("evidence_source_invalid")
+
+    evaluated_at = str(evidence.get("evaluated_at") or "")
+    try:
+        evaluated_time = datetime.fromisoformat(evaluated_at.replace("Z", "+00:00"))
+        if evaluated_time.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError:
+        failures.append("evaluated_at_invalid")
+
+    task = str(evidence.get("task") or "")
+    direction = evidence.get("direction")
+    candidate_id = str(evidence.get("candidate_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", candidate_id):
+        failures.append("candidate_id_invalid")
+    if task not in QUANTIZATION_PARITY_METRICS:
+        failures.append("task_invalid")
+    elif task == "mt" and direction not in {"en_to_vi", "vi_to_en"}:
+        failures.append("direction_invalid")
+    elif task == "asr" and direction is not None:
+        failures.append("direction_invalid")
+
+    if expected is not None:
+        for field in ("task", "direction", "candidate_id", "adapter_manifest_sha256"):
+            if evidence.get(field) != expected.get(field):
+                failures.append(f"{field}_mismatch")
+    if artifact_sha256 is not None and evidence.get("artifact_sha256") != artifact_sha256:
+        failures.append("artifact_sha256_mismatch")
+    if artifact_bytes is not None and evidence.get("artifact_bytes") != artifact_bytes:
+        failures.append("artifact_bytes_mismatch")
+
+    for field in (
+        "adapter_manifest_sha256",
+        "artifact_sha256",
+        "manifest_sha256",
+        "reference_predictions_sha256",
+        "quantized_predictions_sha256",
+    ):
+        if not SHA256_RE.fullmatch(str(evidence.get(field) or "")):
+            failures.append(f"{field}_invalid")
+    for field in (
+        "artifact_bytes",
+        "manifest_bytes",
+        "reference_predictions_bytes",
+        "quantized_predictions_bytes",
+    ):
+        value = evidence.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            failures.append(f"{field}_invalid")
+
+    samples = evidence.get("samples")
+    if (
+        isinstance(samples, bool)
+        or not isinstance(samples, int)
+        or samples < QUANTIZATION_PARITY_MIN_SAMPLES
+        or samples > 100_000
+    ):
+        failures.append("samples_insufficient")
+
+    bootstrap = evidence.get("bootstrap")
+    if not isinstance(bootstrap, dict):
+        failures.append("bootstrap_missing")
+    else:
+        if set(bootstrap) != {"unit", "clusters", "repeats", "seed"}:
+            failures.append("bootstrap_fields_invalid")
+        unit = bootstrap.get("unit")
+        expected_units = {"group", "speaker"} if task == "asr" else {"row"}
+        if unit not in expected_units:
+            failures.append("bootstrap_unit_invalid")
+        clusters = bootstrap.get("clusters")
+        minimum_clusters = 32 if task == "asr" else QUANTIZATION_PARITY_MIN_SAMPLES
+        if (
+            isinstance(clusters, bool)
+            or not isinstance(clusters, int)
+            or clusters < minimum_clusters
+            or (isinstance(samples, int) and clusters > samples)
+        ):
+            failures.append("bootstrap_clusters_insufficient")
+        elif task == "mt" and clusters != samples:
+            failures.append("bootstrap_clusters_mismatch")
+        repeats = bootstrap.get("repeats")
+        if (
+            isinstance(repeats, bool)
+            or not isinstance(repeats, int)
+            or repeats < QUANTIZATION_PARITY_BOOTSTRAP_REPEATS
+        ):
+            failures.append("bootstrap_repeats_insufficient")
+        if bootstrap.get("seed") != 20261005:
+            failures.append("bootstrap_seed_invalid")
+
+    metrics = evidence.get("metrics")
+    expected_metrics = set(QUANTIZATION_PARITY_METRICS.get(task, ()))
+    if not isinstance(metrics, dict) or set(metrics) != expected_metrics:
+        failures.append("metrics_set_invalid")
+    else:
+        for name in sorted(expected_metrics):
+            metric = metrics.get(name)
+            prefix = f"metric_{name}"
+            if not isinstance(metric, dict):
+                failures.append(f"{prefix}_invalid")
+                continue
+            if set(metric) != {
+                "reference",
+                "quantized",
+                "relative_degradation",
+                "relative_degradation_bootstrap_95ci",
+                "maximum_relative_degradation",
+            }:
+                failures.append(f"{prefix}_fields_invalid")
+            reference = _parity_number(metric.get("reference"))
+            quantized = _parity_number(metric.get("quantized"))
+            relative = _parity_number(metric.get("relative_degradation"))
+            if reference is None or reference < 0:
+                failures.append(f"{prefix}_reference_invalid")
+            if quantized is None or quantized < 0:
+                failures.append(f"{prefix}_quantized_invalid")
+            if relative is None:
+                failures.append(f"{prefix}_relative_degradation_invalid")
+            if metric.get("maximum_relative_degradation") != (
+                QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION
+            ):
+                failures.append(f"{prefix}_threshold_invalid")
+            interval = metric.get("relative_degradation_bootstrap_95ci")
+            parsed_interval: tuple[float, float] | None = None
+            if isinstance(interval, list) and len(interval) == 2:
+                lower = _parity_number(interval[0])
+                upper = _parity_number(interval[1])
+                if lower is not None and upper is not None and lower <= upper:
+                    parsed_interval = (lower, upper)
+            if parsed_interval is None:
+                failures.append(f"{prefix}_bootstrap_95ci_invalid")
+            elif parsed_interval[1] > QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION:
+                failures.append(f"{prefix}_bootstrap_95ci_above_policy")
+            if reference is not None and quantized is not None:
+                calculated = _relative_metric_degradation(
+                    reference,
+                    quantized,
+                    greater_is_better=task == "mt",
+                )
+                if calculated is None:
+                    failures.append(f"{prefix}_relative_degradation_undefined")
+                elif relative is not None:
+                    tolerance = max(1e-9, abs(calculated) * 1e-6)
+                    if abs(relative - calculated) > tolerance:
+                        failures.append(f"{prefix}_relative_degradation_mismatch")
+                    elif relative > QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION:
+                        failures.append(f"{prefix}_relative_degradation_above_policy")
+
+    slices = evidence.get("safety_slices")
+    if not isinstance(slices, dict) or set(slices) != set(QUANTIZATION_PARITY_SLICES):
+        failures.append("safety_slices_set_invalid")
+    else:
+        for name in QUANTIZATION_PARITY_SLICES:
+            record = slices.get(name)
+            prefix = f"safety_{name}"
+            if not isinstance(record, dict):
+                failures.append(f"{prefix}_invalid")
+                continue
+            if set(record) != {
+                "samples",
+                "reference_failures",
+                "quantized_failures",
+            }:
+                failures.append(f"{prefix}_fields_invalid")
+            slice_samples = record.get("samples")
+            if (
+                isinstance(slice_samples, bool)
+                or not isinstance(slice_samples, int)
+                or slice_samples < 1
+                or (isinstance(samples, int) and slice_samples > samples)
+            ):
+                failures.append(f"{prefix}_samples_invalid")
+            for field in ("reference_failures", "quantized_failures"):
+                value = record.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                    failures.append(f"{prefix}_{field}_nonzero")
+    return failures
+
+
 def validate_deployment_report(
     report: dict[str, Any],
     expected_winners: list[dict[str, Any]],
@@ -1091,6 +1351,28 @@ def validate_deployment_report(
         failures.append("target:not_qcs6490")
     if report.get("measurement_source") != "physical_board":
         failures.append("measurement_source:not_physical_board")
+
+    gate = report.get("deployment_gate")
+    expected_gate_metrics = deployment_required_metrics(required_metrics)
+    if not isinstance(gate, dict):
+        failures.append("deployment_gate:missing")
+    else:
+        if gate.get("required_metrics") != expected_gate_metrics:
+            failures.append("deployment_gate:required_metrics_mismatch")
+        if gate.get("minimum_measurement_runs") != min_runs:
+            failures.append("deployment_gate:minimum_measurement_runs_mismatch")
+        parity_policy = gate.get("quantization_parity")
+        expected_parity_policy = {
+            "maximum_relative_degradation": (
+                QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION
+            ),
+            "minimum_samples": QUANTIZATION_PARITY_MIN_SAMPLES,
+            "minimum_bootstrap_repeats": QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
+            "asr_minimum_independent_groups": 32,
+            "required_zero_failure_slices": list(QUANTIZATION_PARITY_SLICES),
+        }
+        if parity_policy != expected_parity_policy:
+            failures.append("deployment_gate:quantization_parity_policy_mismatch")
 
     measured_at = str(report.get("measured_at") or "")
     measured_time: datetime | None = None
@@ -1205,6 +1487,69 @@ def validate_deployment_report(
         artifact_sha = str(record.get("artifact_sha256") or "")
         if not SHA256_RE.fullmatch(artifact_sha):
             failures.append(f"{label}:artifact_sha256_invalid")
+        parity_value = str(record.get("parity_evidence_path") or "").strip()
+        parity_sha = str(record.get("parity_evidence_sha256") or "")
+        parity: dict[str, Any] | None = None
+        if not parity_value:
+            failures.append(f"{label}:parity_evidence_path_missing")
+        else:
+            parity_path = Path(parity_value)
+            if not parity_path.is_absolute():
+                parity_path = project_root / parity_path
+            parity_path = parity_path.resolve()
+            parity_root = (
+                project_root
+                / "data/reports/model_bakeoff/board-evidence/parity"
+            ).resolve()
+            if parity_root not in parity_path.parents:
+                failures.append(f"{label}:parity_evidence_path_outside_board_evidence")
+            elif parity_path.is_symlink() or not parity_path.is_file():
+                failures.append(f"{label}:parity_evidence_missing")
+            elif parity_path.stat().st_size > MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES:
+                failures.append(f"{label}:parity_evidence_too_large")
+            else:
+                if not SHA256_RE.fullmatch(parity_sha):
+                    failures.append(f"{label}:parity_evidence_sha256_invalid")
+                elif sha256(parity_path) != parity_sha:
+                    failures.append(f"{label}:parity_evidence_sha256_mismatch")
+                try:
+                    loaded_parity = json.loads(
+                        parity_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    failures.append(f"{label}:parity_evidence_invalid_json")
+                else:
+                    if not isinstance(loaded_parity, dict):
+                        failures.append(f"{label}:parity_evidence_invalid")
+                    else:
+                        parity = loaded_parity
+        if parity is not None:
+            for parity_failure in quantization_parity_evidence_failures(
+                parity,
+                expected=expected,
+                artifact_sha256=artifact_sha,
+                artifact_bytes=record.get("model_bytes"),
+            ):
+                failures.append(f"{label}:parity_evidence_{parity_failure}")
+            parity_fields = {
+                "evaluated_at": "parity_evaluated_at",
+                "manifest_sha256": "parity_manifest_sha256",
+                "reference_predictions_sha256": (
+                    "parity_reference_predictions_sha256"
+                ),
+                "quantized_predictions_sha256": (
+                    "parity_quantized_predictions_sha256"
+                ),
+                "samples": "parity_samples",
+                "bootstrap": "parity_bootstrap",
+                "metrics": "parity_metrics",
+                "safety_slices": "parity_safety_slices",
+            }
+            for evidence_field, record_field in parity_fields.items():
+                if parity.get(evidence_field) != record.get(record_field):
+                    failures.append(
+                        f"{label}:parity_evidence_{evidence_field}_mismatch"
+                    )
         measurement_value = str(record.get("measurement_evidence_path") or "").strip()
         measurement_sha = str(record.get("measurement_evidence_sha256") or "")
         measurement: dict[str, Any] | None = None
@@ -1494,6 +1839,8 @@ def validate_deployment_draft(
         for source_key in ("power_sensor", "temperature_sensor"):
             if not isinstance(record.get(source_key), str):
                 failures.append(f"{label}:{source_key}_missing")
+        if not isinstance(record.get("parity_evidence_path"), str):
+            failures.append(f"{label}:parity_evidence_path_missing")
         if not isinstance(record.get("measurement_evidence_path"), str):
             failures.append(f"{label}:measurement_evidence_path_missing")
     return not failures, failures

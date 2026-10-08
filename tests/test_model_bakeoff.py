@@ -1780,6 +1780,73 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "peak_vram_bytes": 0,
         "model_bytes": artifact.stat().st_size,
     }
+    parity_payload = {
+        "version": 1,
+        "status": "pass",
+        "evidence_source": "onevoice_quantization_parity",
+        "evaluated_at": "2026-10-06T11:00:00+07:00",
+        "task": winner["task"],
+        "direction": winner["direction"],
+        "candidate_id": winner["candidate_id"],
+        "adapter_manifest_sha256": winner["adapter_manifest_sha256"],
+        "artifact_sha256": winner["artifact_sha256"],
+        "artifact_bytes": winner["model_bytes"],
+        "manifest_sha256": "b" * 64,
+        "manifest_bytes": 1000,
+        "reference_predictions_sha256": "c" * 64,
+        "reference_predictions_bytes": 2000,
+        "quantized_predictions_sha256": "d" * 64,
+        "quantized_predictions_bytes": 2000,
+        "samples": 32,
+        "bootstrap": {
+            "unit": "row",
+            "clusters": 32,
+            "repeats": 1000,
+            "seed": 20261005,
+        },
+        "metrics": {
+            name: {
+                "reference": 50.0,
+                "quantized": 50.0,
+                "relative_degradation": 0.0,
+                "relative_degradation_bootstrap_95ci": [0.0, 0.0],
+                "maximum_relative_degradation": 0.02,
+            }
+            for name in ("sacrebleu", "chrf2")
+        },
+        "safety_slices": {
+            name: {
+                "samples": 4,
+                "reference_failures": 0,
+                "quantized_failures": 0,
+            }
+            for name in bakeoff.QUANTIZATION_PARITY_SLICES
+        },
+    }
+    parity = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/parity/mt-en-to-vi.json"
+    )
+    parity.parent.mkdir(parents=True)
+    parity.write_text(json.dumps(parity_payload), encoding="utf-8")
+    winner.update(
+        {
+            "parity_evidence_path": str(parity.relative_to(project_root)),
+            "parity_evidence_sha256": bakeoff.sha256(parity),
+            "parity_evaluated_at": parity_payload["evaluated_at"],
+            "parity_manifest_sha256": parity_payload["manifest_sha256"],
+            "parity_reference_predictions_sha256": parity_payload[
+                "reference_predictions_sha256"
+            ],
+            "parity_quantized_predictions_sha256": parity_payload[
+                "quantized_predictions_sha256"
+            ],
+            "parity_samples": parity_payload["samples"],
+            "parity_bootstrap": parity_payload["bootstrap"],
+            "parity_metrics": parity_payload["metrics"],
+            "parity_safety_slices": parity_payload["safety_slices"],
+        }
+    )
     measurement = (
         project_root
         / "data/reports/model_bakeoff/board-evidence/measurements/mt-en-to-vi.json"
@@ -1830,6 +1897,28 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
             "identity_evidence_path": str(identity.relative_to(project_root)),
             "identity_evidence_sha256": bakeoff.sha256(identity),
         },
+        "deployment_gate": {
+            "required_metrics": [
+                "latency_p50_ms",
+                "latency_p95_ms",
+                "power_avg_mw",
+                "power_p95_mw",
+                "temperature_peak_c",
+                "peak_ram_bytes",
+                "peak_vram_bytes",
+                "model_bytes",
+            ],
+            "minimum_measurement_runs": 30,
+            "quantization_parity": {
+                "maximum_relative_degradation": 0.02,
+                "minimum_samples": 32,
+                "minimum_bootstrap_repeats": 1000,
+                "asr_minimum_independent_groups": 32,
+                "required_zero_failure_slices": list(
+                    bakeoff.QUANTIZATION_PARITY_SLICES
+                ),
+            },
+        },
         "winners": [winner],
     }
     metrics = [
@@ -1843,6 +1932,54 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "model_bytes",
     ]
     assert validate_deployment_report(report, expected, metrics, 30, project_root) == (True, [])
+
+    deployment_gate = report.pop("deployment_gate")
+    passed, failures = validate_deployment_report(
+        report,
+        expected,
+        metrics,
+        30,
+        project_root,
+    )
+    assert passed is False
+    assert "deployment_gate:missing" in failures
+    report["deployment_gate"] = deployment_gate
+
+    original_parity = parity.read_text(encoding="utf-8")
+    parity.write_text(original_parity + "\n", encoding="utf-8")
+    passed, failures = validate_deployment_report(
+        report,
+        expected,
+        metrics,
+        30,
+        project_root,
+    )
+    assert passed is False
+    assert "winner:mt/en_to_vi:parity_evidence_sha256_mismatch" in failures
+    parity.write_text(original_parity, encoding="utf-8")
+
+    invalid_parity = json.loads(original_parity)
+    invalid_parity["metrics"]["sacrebleu"][
+        "relative_degradation_bootstrap_95ci"
+    ] = [0.0, 0.03]
+    parity.write_text(json.dumps(invalid_parity), encoding="utf-8")
+    winner["parity_evidence_sha256"] = bakeoff.sha256(parity)
+    winner["parity_metrics"] = invalid_parity["metrics"]
+    passed, failures = validate_deployment_report(
+        report,
+        expected,
+        metrics,
+        30,
+        project_root,
+    )
+    assert passed is False
+    assert (
+        "winner:mt/en_to_vi:parity_evidence_"
+        "metric_sacrebleu_bootstrap_95ci_above_policy"
+    ) in failures
+    parity.write_text(original_parity, encoding="utf-8")
+    winner["parity_evidence_sha256"] = bakeoff.sha256(parity)
+    winner["parity_metrics"] = parity_payload["metrics"]
 
     original_measurement = measurement.read_text(encoding="utf-8")
     measurement.write_text(original_measurement + "\n", encoding="utf-8")
@@ -1919,6 +2056,7 @@ def test_deployment_draft_is_bound_to_current_selection_and_winners(tmp_path: Pa
             {
                 **expected[0],
                 "latency_samples_ms": [],
+                "parity_evidence_path": "",
                 "measurement_evidence_path": "",
                 "power_sensor": "",
                 "power_samples_mw": [],
@@ -1968,4 +2106,5 @@ def test_deployment_draft_rejects_legacy_template_without_sensor_fields(
     assert "winner:mt/en_to_vi:temperature_samples_c_missing" in failures
     assert "winner:mt/en_to_vi:power_sensor_missing" in failures
     assert "winner:mt/en_to_vi:temperature_sensor_missing" in failures
+    assert "winner:mt/en_to_vi:parity_evidence_path_missing" in failures
     assert "winner:mt/en_to_vi:measurement_evidence_path_missing" in failures

@@ -11,7 +11,7 @@ from scripts.prepare_deployment_benchmark import (
     finalize_report,
     selected_winner_specs,
 )
-from scripts.run_model_bakeoff import sha256
+from scripts.run_model_bakeoff import QUANTIZATION_PARITY_SLICES, sha256
 
 
 def deployment_fixture(tmp_path: Path) -> tuple[Path, dict, dict, Path]:
@@ -131,6 +131,75 @@ def write_measurement_evidence(
     return path
 
 
+def write_parity_evidence(
+    project_root: Path,
+    artifact: Path,
+    winner: dict,
+    *,
+    index: int,
+) -> Path:
+    metric_names = (
+        ("sacrebleu", "chrf2")
+        if winner["task"] == "mt"
+        else ("wer", "cer", "code_switch_wer")
+    )
+    path = (
+        project_root
+        / "data/reports/model_bakeoff/board-evidence/parity"
+        / f"winner-{index}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "status": "pass",
+                "evidence_source": "onevoice_quantization_parity",
+                "evaluated_at": "2026-10-06T11:00:00+07:00",
+                "task": winner["task"],
+                "direction": winner.get("direction"),
+                "candidate_id": winner["candidate_id"],
+                "adapter_manifest_sha256": winner["adapter_manifest_sha256"],
+                "artifact_sha256": sha256(artifact),
+                "artifact_bytes": artifact.stat().st_size,
+                "manifest_sha256": "b" * 64,
+                "manifest_bytes": 1000,
+                "reference_predictions_sha256": "c" * 64,
+                "reference_predictions_bytes": 2000,
+                "quantized_predictions_sha256": "d" * 64,
+                "quantized_predictions_bytes": 2000,
+                "samples": 32,
+                "bootstrap": {
+                    "unit": "row" if winner["task"] == "mt" else "group",
+                    "clusters": 32,
+                    "repeats": 1000,
+                    "seed": 20261005,
+                },
+                "metrics": {
+                    name: {
+                        "reference": 50.0 if winner["task"] == "mt" else 0.1,
+                        "quantized": 50.0 if winner["task"] == "mt" else 0.1,
+                        "relative_degradation": 0.0,
+                        "relative_degradation_bootstrap_95ci": [0.0, 0.0],
+                        "maximum_relative_degradation": 0.02,
+                    }
+                    for name in metric_names
+                },
+                "safety_slices": {
+                    name: {
+                        "samples": 4,
+                        "reference_failures": 0,
+                        "quantized_failures": 0,
+                    }
+                    for name in QUANTIZATION_PARITY_SLICES
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_template_binds_all_selected_winners(tmp_path: Path):
     selection, comparison, _, _ = deployment_fixture(tmp_path)
 
@@ -147,6 +216,7 @@ def test_template_binds_all_selected_winners(tmp_path: Path):
         ("asr", None, "asr-vi"),
     }
     assert all(len(winner["adapter_manifest_sha256"]) == 64 for winner in report["winners"])
+    assert all(winner["parity_evidence_path"] == "" for winner in report["winners"])
     assert all(winner["measurement_evidence_path"] == "" for winner in report["winners"])
     assert all(winner["power_samples_mw"] == [] for winner in report["winners"])
     assert all(winner["temperature_samples_c"] == [] for winner in report["winners"])
@@ -168,6 +238,12 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
     for index, winner in enumerate(draft["winners"]):
         artifact = models / f"winner-{index}.bin"
         artifact.write_bytes(f"compiled-{index}".encode())
+        parity = write_parity_evidence(
+            project_root,
+            artifact,
+            winner,
+            index=index,
+        )
         measurement = write_measurement_evidence(
             project_root,
             identity,
@@ -178,6 +254,7 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
         winner.update(
             {
                 "artifact_path": str(artifact.relative_to(project_root)),
+                "parity_evidence_path": str(parity.relative_to(project_root)),
                 "measurement_evidence_path": str(
                     measurement.relative_to(project_root)
                 ),
@@ -195,9 +272,20 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
         "power_p95_mw",
         "temperature_peak_c",
     }
+    assert report["deployment_gate"]["quantization_parity"] == {
+        "maximum_relative_degradation": 0.02,
+        "minimum_samples": 32,
+        "minimum_bootstrap_repeats": 1000,
+        "asr_minimum_independent_groups": 32,
+        "required_zero_failure_slices": list(QUANTIZATION_PARITY_SLICES),
+    }
     for index, winner in enumerate(report["winners"]):
         artifact = models / f"winner-{index}.bin"
         assert winner["measurement_runs"] == 30
+        assert winner["parity_samples"] == 32
+        assert winner["parity_evidence_sha256"] == sha256(
+            project_root / winner["parity_evidence_path"]
+        )
         assert winner["latency_p50_ms"] == pytest.approx(114.5 + index)
         assert winner["latency_p95_ms"] == pytest.approx(127.55 + index)
         assert winner["power_avg_mw"] == pytest.approx(2645.0 + index)
@@ -244,6 +332,12 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
     outside = tmp_path / "outside-model.bin"
     outside.write_bytes(b"not-qcs-artifact")
     for index, winner in enumerate(draft["winners"]):
+        parity = write_parity_evidence(
+            project_root,
+            outside,
+            winner,
+            index=index,
+        )
         measurement = write_measurement_evidence(
             project_root,
             identity,
@@ -254,6 +348,7 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
         winner.update(
             {
                 "artifact_path": str(outside),
+                "parity_evidence_path": str(parity.relative_to(project_root)),
                 "measurement_evidence_path": str(
                     measurement.relative_to(project_root)
                 ),
@@ -280,6 +375,12 @@ def test_finalize_rejects_missing_power_or_thermal_samples(tmp_path: Path):
     for index, winner in enumerate(draft["winners"]):
         artifact = models / f"winner-{index}.bin"
         artifact.write_bytes(b"compiled")
+        parity = write_parity_evidence(
+            project_root,
+            artifact,
+            winner,
+            index=index,
+        )
         measurement = write_measurement_evidence(
             project_root,
             identity,
@@ -291,6 +392,7 @@ def test_finalize_rejects_missing_power_or_thermal_samples(tmp_path: Path):
         winner.update(
             {
                 "artifact_path": str(artifact.relative_to(project_root)),
+                "parity_evidence_path": str(parity.relative_to(project_root)),
                 "measurement_evidence_path": str(
                     measurement.relative_to(project_root)
                 ),
