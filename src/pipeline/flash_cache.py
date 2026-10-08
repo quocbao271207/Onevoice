@@ -191,8 +191,15 @@ class FlashCache:
         self.allow_fuzzy = False
         self._is_loaded = False
 
+    @property
+    def is_ready(self) -> bool:
+        return self._is_loaded and bool(self.cache)
+
     def load(self):
         """Validate and atomically publish default plus custom phrases."""
+        if self.is_ready:
+            logger.info("Flash Cache already ready; skipping reload")
+            return
         logger.info("Loading Flash Cache with emergency phrases...")
         staged_cache: Dict[str, CachedPhrase] = {}
 

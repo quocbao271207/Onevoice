@@ -121,10 +121,37 @@ def test_disabled_flash_cache_is_neither_loaded_nor_queried(tmp_path, monkeypatc
     path = write_config(tmp_path / "cache-disabled.yaml", config)
     pipeline = MediVoicePipeline(config_path=str(path))
 
-    monkeypatch.setattr(pipeline.audio_frontend, "load", lambda: None)
-    monkeypatch.setattr(pipeline.asr_engine, "load", lambda: None)
-    monkeypatch.setattr(pipeline.mt_engine, "load", lambda: None)
-    monkeypatch.setattr(pipeline.tts_engine, "load", lambda: None)
+    def load_audio_frontend():
+        pipeline.audio_frontend._is_loaded = True
+        pipeline.audio_frontend.vad._is_loaded = True
+        pipeline.audio_frontend.vad.model = object()
+
+    def load_asr():
+        pipeline.asr_engine.models = {"vi": object(), "en": object()}
+        pipeline.asr_engine.processors = {"vi": object(), "en": object()}
+        pipeline.asr_engine.loaded_model_paths = {
+            "vi": "vi-model",
+            "en": "en-model",
+        }
+        pipeline.asr_engine._is_loaded = True
+
+    def load_mt():
+        pipeline.mt_engine.model = object()
+        pipeline.mt_engine.tokenizer = object()
+        pipeline.mt_engine.loaded_model_path = "mt-model"
+        pipeline.mt_engine._is_loaded = True
+
+    def load_tts():
+        pipeline.tts_engine._voices = {
+            "vi": object(),
+            "en": object(),
+        }
+        pipeline.tts_engine._is_loaded = True
+
+    monkeypatch.setattr(pipeline.audio_frontend, "load", load_audio_frontend)
+    monkeypatch.setattr(pipeline.asr_engine, "load", load_asr)
+    monkeypatch.setattr(pipeline.mt_engine, "load", load_mt)
+    monkeypatch.setattr(pipeline.tts_engine, "load", load_tts)
 
     def unexpected_cache_call(*_args, **_kwargs):
         raise AssertionError("Disabled cache must not be loaded or queried")

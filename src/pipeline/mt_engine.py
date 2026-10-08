@@ -259,8 +259,22 @@ class MTEngine:
         self._is_loaded = False
         self.loaded_model_path: Optional[str] = None
 
+    @property
+    def is_ready(self) -> bool:
+        return (
+            self._is_loaded
+            and self.model is not None
+            and self.tokenizer is not None
+            and isinstance(self.loaded_model_path, str)
+            and bool(self.loaded_model_path)
+        )
+
     def load(self):
         """Load the translation model."""
+        if self.is_ready:
+            logger.info("MT engine already ready; skipping reload")
+            return
+        self._is_loaded = False
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 

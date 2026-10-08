@@ -131,13 +131,28 @@ class TTSEngine:
         self._voices: dict[str, object] = {}
         self._is_loaded = False
 
+    @property
+    def is_ready(self) -> bool:
+        required = set(self.model_paths)
+        return (
+            self._is_loaded
+            and set(self._voices) == required
+            and all(self._voices[language] is not None for language in required)
+        )
+
     def load(self) -> None:
         """Fail immediately if Piper or either checked-in model artifact is absent."""
+        if self.is_ready:
+            logger.info("TTS engine already ready; skipping reload")
+            return
+        self._is_loaded = False
+        self._voices = {}
         try:
             from piper.voice import PiperVoice
         except ImportError as exc:
             raise RuntimeError("Install piper-tts from requirements-local.txt") from exc
 
+        staged_voices: dict[str, object] = {}
         for language, model_path in self.model_paths.items():
             config_path = Path(f"{model_path}.json")
             missing = [str(path) for path in (model_path, config_path) if not path.is_file()]
@@ -146,8 +161,12 @@ class TTSEngine:
                     f"Missing Piper {language} artifact(s): {missing}. "
                     "Run scripts/download_tts_models.py first."
                 )
-            self._voices[language] = PiperVoice.load(model_path, config_path=config_path)
+            staged_voices[language] = PiperVoice.load(
+                model_path,
+                config_path=config_path,
+            )
 
+        self._voices = staged_voices
         self._is_loaded = True
         logger.info("Loaded Piper voices: %s", {key: str(value) for key, value in self.model_paths.items()})
 

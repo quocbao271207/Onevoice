@@ -125,6 +125,26 @@ class ASREngine:
         self.loaded_model_paths: Dict[str, str] = {}
         self._is_loaded = False
 
+    @property
+    def is_ready(self) -> bool:
+        required = set(self.languages)
+        return (
+            self._is_loaded
+            and required.issubset(self.models)
+            and required.issubset(self.processors)
+            and required.issubset(self.loaded_model_paths)
+            and all(self.models[language] is not None for language in required)
+            and all(
+                self.processors[language] is not None
+                for language in required
+            )
+            and all(
+                isinstance(self.loaded_model_paths[language], str)
+                and bool(self.loaded_model_paths[language])
+                for language in required
+            )
+        )
+
     @staticmethod
     def _to_whisper_rate(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
         """Whisper feature extractors require mono 16 kHz input."""
@@ -160,6 +180,10 @@ class ASREngine:
 
     def load(self):
         """Load ASR models for both languages."""
+        if self.is_ready:
+            logger.info("ASR engines already ready; skipping reload")
+            return
+        self._is_loaded = False
         import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 

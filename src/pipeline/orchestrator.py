@@ -496,6 +496,10 @@ class MediVoicePipeline:
         Load all pipeline components.
         This should be called once during initialization.
         """
+        if self.get_status()["ready"]:
+            logger.info("Pipeline already ready; skipping reload")
+            return
+        self._is_loaded = False
         logger.info("=" * 60)
         logger.info("MediVoice Edge — Loading Pipeline Components")
         logger.info("=" * 60)
@@ -521,6 +525,18 @@ class MediVoicePipeline:
         else:
             logger.info("[5/5] Flash Cache disabled by configuration")
 
+        component_status = self._component_readiness()
+        failed_components = [
+            name
+            for name, ready in component_status.items()
+            if not ready
+            and not (name == "flash_cache" and not self.flash_cache_enabled)
+        ]
+        if failed_components:
+            raise RuntimeError(
+                "Pipeline component readiness check failed: "
+                + ", ".join(failed_components)
+            )
         self._is_loaded = True
         load_time = time.perf_counter() - start
 
@@ -529,6 +545,35 @@ class MediVoicePipeline:
         logger.info(f"Pipeline ready in {load_time:.1f}s")
         logger.info(f"Flash Cache: {cache_stats['total_phrases']} phrases loaded")
         logger.info("=" * 60)
+
+    def _component_readiness(self) -> dict[str, bool]:
+        return {
+            "audio_frontend": self.audio_frontend.is_ready is True,
+            "asr": self.asr_engine.is_ready is True,
+            "mt": self.mt_engine.is_ready is True,
+            "tts": self.tts_engine.is_ready is True,
+            "flash_cache": self.flash_cache.is_ready is True,
+        }
+
+    def get_status(self) -> dict:
+        """Return verified startup readiness for every pipeline component."""
+        components = self._component_readiness()
+        required_ready = (
+            components["audio_frontend"]
+            and components["asr"]
+            and components["mt"]
+            and components["tts"]
+            and (
+                components["flash_cache"]
+                or not self.flash_cache_enabled
+            )
+        )
+        return {
+            "ready": self._is_loaded is True and required_ready,
+            "loaded": self._is_loaded is True,
+            "flash_cache_enabled": self.flash_cache_enabled,
+            "components": components,
+        }
 
     def translate_speech(
         self,

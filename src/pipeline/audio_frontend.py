@@ -356,6 +356,10 @@ class AudioFrontend:
 
     def load(self):
         """Initialize all audio frontend components."""
+        if self.is_ready:
+            logger.info("Audio Frontend already ready; skipping reload")
+            return
+        self._is_loaded = False
         logger.info("Loading Audio Frontend components...")
         self.vad.load()
         self.denoiser.load()
@@ -365,9 +369,17 @@ class AudioFrontend:
             "enabled" if self.denoiser.enabled else "disabled",
         )
 
+    @property
+    def is_ready(self) -> bool:
+        return (
+            self._is_loaded
+            and self.vad.is_ready
+            and self.denoiser.is_ready
+        )
+
     def get_status(self) -> dict:
         return {
-            "ready": self._is_loaded and self.vad.is_ready and self.denoiser.is_ready,
+            "ready": self.is_ready,
             "vad_backend": self.config.vad_backend,
             "vad_loaded": self.vad.is_ready,
             "noise_suppression_enabled": self.denoiser.enabled,
