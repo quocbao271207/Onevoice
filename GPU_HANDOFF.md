@@ -46,7 +46,7 @@ PY
 python scripts/preflight_project.py --gate gpu --output data/reports/preflight_gpu_cloud.json
 ```
 
-GPU preflight so sánh SHA-256 của sáu manifest với `artifact_lock.yaml`, sau đó băm lại toàn bộ 31.929 FLAC theo `audio_inventory.jsonl`. Không bắt đầu billed dry-run nếu một file thiếu, sai size hoặc sai hash.
+GPU preflight strict-parse và stable-hash config/report/manifest/inventory, so sánh SHA-256 của sáu manifest với `artifact_lock.yaml`, sau đó băm hai lượt trên cùng regular no-link file cho toàn bộ 31.929 FLAC theo `audio_inventory.jsonl`. Inventory từ chối path escape, link/junction, ID/path/hash trùng, byte/digest sai và file đổi trong lúc đọc. Không bắt đầu billed dry-run nếu một file thiếu, sai size hoặc sai hash; dự kiến preflight lâu hơn một lượt hash thường.
 
 Record `nvidia-smi`, package versions and the preflight JSON with every run.
 

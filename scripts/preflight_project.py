@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -14,18 +13,36 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
+from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
+from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
 from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 MAX_PROJECT_CONFIG_BYTES = 1_000_000
+MAX_PREFLIGHT_JSON_BYTES = 100_000_000
+MAX_PREFLIGHT_JSONL_BYTES = 250_000_000
+MAX_PREFLIGHT_JSONL_LINE_BYTES = 2_000_000
+MAX_PREFLIGHT_JSONL_ROWS = 100_000
+MAX_PREFLIGHT_HASHED_FILE_BYTES = 16_000_000_000
+MAX_PREFLIGHT_AUDIO_BYTES = 128 * 1024 * 1024
+MAX_PREFLIGHT_REPORT_BYTES = 10_000_000
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+def sha256(
+    path: Path,
+    *,
+    maximum_bytes: int = MAX_PREFLIGHT_HASHED_FILE_BYTES,
+    label: str = "Preflight input",
+) -> str:
+    digest, _ = sha256_stable_regular_file(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    return digest
 
 
 def check(condition: bool, name: str, detail: str) -> dict[str, Any]:
@@ -33,65 +50,139 @@ def check(condition: bool, name: str, detail: str) -> dict[str, Any]:
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_stable_json_mapping(
+        path,
+        maximum_bytes=MAX_PREFLIGHT_JSON_BYTES,
+        label="Preflight JSON input",
+    ).mapping
 
 
 def local_audio_manifest(path: Path) -> tuple[int, int, int]:
-    rows = 0
+    document = read_stable_jsonl_mappings(
+        path,
+        maximum_bytes=MAX_PREFLIGHT_JSONL_BYTES,
+        maximum_line_bytes=MAX_PREFLIGHT_JSONL_LINE_BYTES,
+        maximum_rows=MAX_PREFLIGHT_JSONL_ROWS,
+        label="Preflight local-audio manifest",
+    )
     missing = 0
     ids: set[str] = set()
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            rows += 1
-            record_id = str(row.get("id") or "")
-            if record_id:
-                ids.add(record_id)
-            audio_path = Path(row.get("audio_path") or "")
-            if not audio_path.is_absolute():
-                audio_path = ROOT / audio_path
-            if not audio_path.is_file():
-                missing += 1
-    return rows, len(ids), missing
+    audio_root = ROOT / "data" / "processed" / "audio_16k"
+    for row in document.rows:
+        record_id = row.get("id")
+        if isinstance(record_id, str) and record_id:
+            ids.add(record_id)
+        relative = row.get("audio_path")
+        if not isinstance(relative, str) or not relative:
+            missing += 1
+            continue
+        audio_path = Path(relative)
+        if audio_path.is_absolute():
+            missing += 1
+            continue
+        try:
+            resolve_regular_file_under(
+                audio_path,
+                project_root=ROOT,
+                allowed_root=audio_root,
+                label="Preflight manifest audio",
+                maximum_bytes=MAX_PREFLIGHT_AUDIO_BYTES,
+            )
+        except (FileNotFoundError, ValueError):
+            missing += 1
+    return len(document.rows), len(ids), missing
 
 
 def verify_audio_inventory(path: Path) -> tuple[bool, str]:
     if not path.is_file():
         return False, "missing"
-    entries: list[tuple[Path, str, str]] = []
+    try:
+        document = read_stable_jsonl_mappings(
+            path,
+            maximum_bytes=MAX_PREFLIGHT_JSONL_BYTES,
+            maximum_line_bytes=MAX_PREFLIGHT_JSONL_LINE_BYTES,
+            maximum_rows=MAX_PREFLIGHT_JSONL_ROWS,
+            label="Preflight audio inventory",
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        return False, f"invalid_inventory={exc}"
+
+    entries: list[tuple[Path, str, int, str]] = []
+    seen_ids: set[str] = set()
+    seen_paths: set[str] = set()
     seen_hashes: set[str] = set()
     total_bytes = 0
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            audio_path = Path(row["audio_path"])
-            if audio_path.is_absolute():
-                return False, f"line={line_number} absolute_path"
-            resolved = ROOT / audio_path
-            if not resolved.is_file():
-                return False, f"line={line_number} missing={audio_path.as_posix()}"
-            size = resolved.stat().st_size
-            if size != int(row["bytes"]):
-                return False, f"line={line_number} size_mismatch={audio_path.as_posix()}"
-            expected_hash = str(row["sha256"])
-            if expected_hash in seen_hashes:
-                return False, f"line={line_number} duplicate_audio_hash={expected_hash}"
-            seen_hashes.add(expected_hash)
-            entries.append((resolved, expected_hash, audio_path.as_posix()))
-            total_bytes += size
+    audio_root = ROOT / "data" / "processed" / "audio_16k"
+    for line_number, row in enumerate(document.rows, 1):
+        relative = row.get("audio_path")
+        record_id = row.get("id")
+        expected_size = row.get("bytes")
+        expected_hash = row.get("sha256")
+        if not isinstance(relative, str) or not relative:
+            return False, f"line={line_number} invalid_audio_path"
+        audio_path = Path(relative)
+        if audio_path.is_absolute():
+            return False, f"line={line_number} absolute_path"
+        if not isinstance(record_id, str) or not record_id:
+            return False, f"line={line_number} invalid_id"
+        if record_id in seen_ids:
+            return False, f"line={line_number} duplicate_id={record_id}"
+        seen_ids.add(record_id)
+        portable_path = audio_path.as_posix()
+        if portable_path in seen_paths:
+            return False, f"line={line_number} duplicate_audio_path={portable_path}"
+        seen_paths.add(portable_path)
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or not 0 < expected_size <= MAX_PREFLIGHT_AUDIO_BYTES
+        ):
+            return False, f"line={line_number} invalid_bytes"
+        if (
+            not isinstance(expected_hash, str)
+            or len(expected_hash) != 64
+            or any(character not in "0123456789abcdef" for character in expected_hash)
+        ):
+            return False, f"line={line_number} invalid_sha256"
+        if expected_hash in seen_hashes:
+            return False, f"line={line_number} duplicate_audio_hash={expected_hash}"
+        seen_hashes.add(expected_hash)
+        try:
+            resolved = resolve_regular_file_under(
+                audio_path,
+                project_root=ROOT,
+                allowed_root=audio_root,
+                label="Preflight inventory audio",
+                maximum_bytes=MAX_PREFLIGHT_AUDIO_BYTES,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return False, f"line={line_number} invalid_audio={exc}"
+        entries.append((resolved, expected_hash, expected_size, portable_path))
+        total_bytes += expected_size
 
-    def hash_entry(entry: tuple[Path, str, str]) -> tuple[str, str, str]:
-        resolved, expected, relative = entry
-        return sha256(resolved), expected, relative
+    def hash_entry(
+        entry: tuple[Path, str, int, str],
+    ) -> tuple[str | None, int | None, str, str | None]:
+        resolved, expected, expected_size, relative = entry
+        try:
+            actual, actual_size = sha256_stable_regular_file(
+                resolved,
+                maximum_bytes=MAX_PREFLIGHT_AUDIO_BYTES,
+                label="Preflight inventory audio",
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            return None, None, relative, str(exc)
+        mismatch = None
+        if actual_size != expected_size:
+            mismatch = "size_mismatch"
+        elif actual != expected:
+            mismatch = "hash_mismatch"
+        return actual, actual_size, relative, mismatch
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for actual, expected, relative in pool.map(hash_entry, entries):
-            if actual != expected:
-                return False, f"hash_mismatch={relative}"
+        for _actual, _size, relative, error in pool.map(hash_entry, entries):
+            if error:
+                return False, f"{error}={relative}"
     return bool(entries), f"files={len(entries)} bytes={total_bytes}"
 
 
@@ -117,7 +208,7 @@ def main() -> int:
         if not audit_path.exists():
             checks.append(check(False, f"audit:{name}", "missing"))
             continue
-        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit = load_json(audit_path)
         passed = audit.get("full_audit") and audit.get("status") in {"pass", "reviewed"}
         checks.append(check(passed, f"audit:{name}", f"status={audit.get('status')} full={audit.get('full_audit')}"))
 
@@ -367,9 +458,13 @@ def main() -> int:
         "ready": all(item["passed"] for item in checks),
         "checks": checks,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    write_durable_json(
+        args.output,
+        report,
+        maximum_bytes=MAX_PREFLIGHT_REPORT_BYTES,
+        label="Project preflight report",
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
     return 0 if report["ready"] else 2
 
 
