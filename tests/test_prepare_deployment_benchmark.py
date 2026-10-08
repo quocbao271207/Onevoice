@@ -512,6 +512,21 @@ def test_finalize_rechecks_blind_report_provenance(tmp_path: Path):
         finalize_report(selection, comparison, draft, config, project_root)
 
 
+def test_finalize_rejects_symlinked_board_identity(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    draft = build_template(selection, comparison, config, project_root)
+    identity = write_identity_evidence(project_root)
+    link = identity.with_name("qcs6490-identity-link.json")
+    try:
+        link.symlink_to(identity.name)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+    draft["device"]["identity_evidence_path"] = str(link.relative_to(project_root))
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        finalize_report(selection, comparison, draft, config, project_root)
+
+
 def test_template_recomputes_blind_quality_instead_of_trusting_pass_flags(
     tmp_path: Path,
 ):
@@ -646,25 +661,27 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
             "identity_evidence_path": str(identity.relative_to(project_root)),
         }
     )
-    outside = tmp_path / "outside-model.bin"
-    outside.write_bytes(b"not-qcs-artifact")
+    models = project_root / "models"
+    models.mkdir()
     for index, winner in enumerate(draft["winners"]):
+        artifact = models / f"invalid-board-{index}.bin"
+        artifact.write_bytes(b"not-qcs-artifact")
         parity = write_parity_evidence(
             project_root,
-            outside,
+            artifact,
             winner,
             index=index,
         )
         measurement = write_measurement_evidence(
             project_root,
             identity,
-            outside,
+            artifact,
             winner,
             index=index,
         )
         winner.update(
             {
-                "artifact_path": str(outside),
+                "artifact_path": str(artifact.relative_to(project_root)),
                 "parity_evidence_path": str(parity.relative_to(project_root)),
                 "measurement_evidence_path": str(
                     measurement.relative_to(project_root)
@@ -673,6 +690,21 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
         )
 
     with pytest.raises(ValueError, match="identity_evidence:board_model_not_qcs6490"):
+        finalize_report(selection, comparison, draft, config, project_root)
+
+
+def test_finalize_rejects_artifact_outside_models(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    draft = build_template(selection, comparison, config, project_root)
+    identity = write_identity_evidence(project_root)
+    draft["device"]["identity_evidence_path"] = str(
+        identity.relative_to(project_root)
+    )
+    outside = tmp_path / "outside-model.bin"
+    outside.write_bytes(b"compiled")
+    draft["winners"][0]["artifact_path"] = str(outside)
+
+    with pytest.raises(ValueError, match="Deployment artifact must remain under"):
         finalize_report(selection, comparison, draft, config, project_root)
 
 

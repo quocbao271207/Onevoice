@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -56,6 +57,7 @@ CRITICAL_EXIT_WAITING_FOR_BLIND = 3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
 MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES = 1_000_000
+MAX_IDENTITY_EVIDENCE_BYTES = 1_000_000
 QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION = 0.02
 QUANTIZATION_PARITY_MIN_SAMPLES = 32
 QUANTIZATION_PARITY_BOOTSTRAP_REPEATS = 1_000
@@ -84,6 +86,57 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+
+
+def resolve_regular_file_under(
+    value: Any,
+    *,
+    project_root: Path,
+    allowed_root: Path,
+    label: str,
+    maximum_bytes: int | None = None,
+) -> Path:
+    """Resolve one regular file without permitting link traversal or path escape."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} path is missing")
+    project_boundary = Path(os.path.abspath(project_root))
+    root = Path(os.path.abspath(allowed_root))
+    path = Path(raw)
+    if not path.is_absolute():
+        path = project_boundary / path
+    path = Path(os.path.abspath(path))
+    try:
+        root.relative_to(project_boundary)
+        relative = path.relative_to(root)
+        root_relative = root.relative_to(project_boundary)
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain under {root}") from exc
+    current = project_boundary
+    for part in (*root_relative.parts, *relative.parts):
+        current /= part
+        if _is_link_or_junction(current):
+            raise ValueError(f"{label} cannot traverse a symlink or junction: {current}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
+    resolved_root = root.resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    if resolved_root not in resolved.parents:
+        raise ValueError(f"{label} must remain under {resolved_root}")
+    if maximum_bytes is not None and path.stat().st_size > maximum_bytes:
+        raise ValueError(f"{label} exceeds {maximum_bytes} bytes")
+    return resolved
 
 
 LOADED_RUNNER_SHA256 = sha256(Path(__file__).resolve())
@@ -1414,53 +1467,65 @@ def validate_deployment_report(
         if not identity_value:
             failures.append("device.identity_evidence_path:missing")
         else:
-            identity_path = Path(identity_value)
-            if not identity_path.is_absolute():
-                identity_path = project_root / identity_path
-            identity_path = identity_path.resolve()
             identity_root = (
                 project_root / "data" / "reports" / "model_bakeoff" / "board-evidence"
-            ).resolve()
-            if identity_root not in identity_path.parents:
-                failures.append("device.identity_evidence_path:outside_board_evidence")
-            elif not identity_path.is_file():
+            )
+            try:
+                identity_path = resolve_regular_file_under(
+                    identity_value,
+                    project_root=project_root,
+                    allowed_root=identity_root,
+                    label="QCS6490 identity evidence",
+                    maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
+                )
+            except FileNotFoundError:
                 failures.append("device.identity_evidence_path:missing_file")
-            else:
-                if not SHA256_RE.fullmatch(identity_sha):
-                    failures.append("device.identity_evidence_sha256:invalid")
-                elif sha256(identity_path) != identity_sha:
-                    failures.append("device.identity_evidence_sha256:mismatch")
-                try:
-                    identity = json.loads(identity_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                    failures.append("device.identity_evidence:invalid_json")
+                identity_path = None
+            except ValueError:
+                failures.append("device.identity_evidence_path:unsafe")
+                identity_path = None
+            if identity_path is not None:
+                if identity_path.stat().st_size < 2:
+                    failures.append("device.identity_evidence:invalid_size")
                 else:
-                    for failure in qcs6490_identity_failures(identity):
-                        failures.append(f"device.identity_evidence:{failure}")
-                    evidence_board = str(identity.get("board_model") or "").strip()
-                    if evidence_board and board != evidence_board:
-                        failures.append("device.board:identity_mismatch")
-                    evidence_architecture = str(
-                        identity.get("architecture") or ""
-                    ).strip()
-                    if evidence_architecture and str(
-                        device.get("architecture") or ""
-                    ).strip() != evidence_architecture:
-                        failures.append("device.architecture:identity_mismatch")
+                    if not SHA256_RE.fullmatch(identity_sha):
+                        failures.append("device.identity_evidence_sha256:invalid")
+                    elif sha256(identity_path) != identity_sha:
+                        failures.append("device.identity_evidence_sha256:mismatch")
                     try:
-                        captured_time = datetime.fromisoformat(
-                            str(identity.get("captured_at") or "").replace("Z", "+00:00")
-                        )
-                        if captured_time.tzinfo is None:
+                        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        failures.append("device.identity_evidence:invalid_json")
+                    else:
+                        for failure in qcs6490_identity_failures(identity):
+                            failures.append(f"device.identity_evidence:{failure}")
+                        evidence_board = str(identity.get("board_model") or "").strip()
+                        if evidence_board and board != evidence_board:
+                            failures.append("device.board:identity_mismatch")
+                        evidence_architecture = str(
+                            identity.get("architecture") or ""
+                        ).strip()
+                        if evidence_architecture and str(
+                            device.get("architecture") or ""
+                        ).strip() != evidence_architecture:
+                            failures.append("device.architecture:identity_mismatch")
+                        try:
+                            captured_time = datetime.fromisoformat(
+                                str(identity.get("captured_at") or "").replace(
+                                    "Z", "+00:00"
+                                )
+                            )
+                            if captured_time.tzinfo is None:
+                                captured_time = None
+                        except ValueError:
                             captured_time = None
-                    except ValueError:
-                        captured_time = None
-                    if (
-                        measured_time is not None
-                        and captured_time is not None
-                        and abs((measured_time - captured_time).total_seconds()) > 86_400
-                    ):
-                        failures.append("device.identity_evidence:not_same_session")
+                        if (
+                            measured_time is not None
+                            and captured_time is not None
+                            and abs((measured_time - captured_time).total_seconds())
+                            > 86_400
+                        ):
+                            failures.append("device.identity_evidence:not_same_session")
 
     expected_by_key = {
         (item["task"], item.get("direction")): item for item in expected_winners
@@ -1502,21 +1567,30 @@ def validate_deployment_report(
         if not parity_value:
             failures.append(f"{label}:parity_evidence_path_missing")
         else:
-            parity_path = Path(parity_value)
-            if not parity_path.is_absolute():
-                parity_path = project_root / parity_path
-            parity_path = parity_path.resolve()
             parity_root = (
                 project_root
                 / "data/reports/model_bakeoff/board-evidence/parity"
-            ).resolve()
-            if parity_root not in parity_path.parents:
-                failures.append(f"{label}:parity_evidence_path_outside_board_evidence")
-            elif parity_path.is_symlink() or not parity_path.is_file():
+            )
+            try:
+                parity_path = resolve_regular_file_under(
+                    parity_value,
+                    project_root=project_root,
+                    allowed_root=parity_root,
+                    label="Quantization parity evidence",
+                    maximum_bytes=MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
+                )
+            except FileNotFoundError:
                 failures.append(f"{label}:parity_evidence_missing")
-            elif parity_path.stat().st_size > MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES:
-                failures.append(f"{label}:parity_evidence_too_large")
-            else:
+                parity_path = None
+            except ValueError as exc:
+                suffix = "too_large" if "exceeds" in str(exc) else "path_unsafe"
+                failures.append(f"{label}:parity_evidence_{suffix}")
+                parity_path = None
+            if parity_path is not None:
+                if parity_path.stat().st_size < 2:
+                    failures.append(f"{label}:parity_evidence_invalid_size")
+                    parity_path = None
+            if parity_path is not None:
                 if not SHA256_RE.fullmatch(parity_sha):
                     failures.append(f"{label}:parity_evidence_sha256_invalid")
                 elif sha256(parity_path) != parity_sha:
@@ -1572,21 +1646,30 @@ def validate_deployment_report(
         if not measurement_value:
             failures.append(f"{label}:measurement_evidence_path_missing")
         else:
-            measurement_path = Path(measurement_value)
-            if not measurement_path.is_absolute():
-                measurement_path = project_root / measurement_path
-            measurement_path = measurement_path.resolve()
             measurement_root = (
                 project_root
                 / "data/reports/model_bakeoff/board-evidence/measurements"
-            ).resolve()
-            if measurement_root not in measurement_path.parents:
-                failures.append(f"{label}:measurement_evidence_path_outside_board_evidence")
-            elif measurement_path.is_symlink() or not measurement_path.is_file():
+            )
+            try:
+                measurement_path = resolve_regular_file_under(
+                    measurement_value,
+                    project_root=project_root,
+                    allowed_root=measurement_root,
+                    label="Physical measurement evidence",
+                    maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+                )
+            except FileNotFoundError:
                 failures.append(f"{label}:measurement_evidence_missing")
-            elif measurement_path.stat().st_size > MAX_DEPLOYMENT_MEASUREMENT_BYTES:
-                failures.append(f"{label}:measurement_evidence_too_large")
-            else:
+                measurement_path = None
+            except ValueError as exc:
+                suffix = "too_large" if "exceeds" in str(exc) else "path_unsafe"
+                failures.append(f"{label}:measurement_evidence_{suffix}")
+                measurement_path = None
+            if measurement_path is not None:
+                if measurement_path.stat().st_size < 2:
+                    failures.append(f"{label}:measurement_evidence_invalid_size")
+                    measurement_path = None
+            if measurement_path is not None:
                 if not SHA256_RE.fullmatch(measurement_sha):
                     failures.append(f"{label}:measurement_evidence_sha256_invalid")
                 elif sha256(measurement_path) != measurement_sha:
@@ -1772,16 +1855,20 @@ def validate_deployment_report(
         if not artifact_value:
             failures.append(f"{label}:artifact_path_missing")
             continue
-        artifact_path = Path(artifact_value)
-        if not artifact_path.is_absolute():
-            artifact_path = project_root / artifact_path
-        artifact_path = artifact_path.resolve()
-        models_root = (project_root / "models").resolve()
-        if models_root not in artifact_path.parents:
-            failures.append(f"{label}:artifact_outside_models")
-        elif not artifact_path.is_file():
+        try:
+            artifact_path = resolve_regular_file_under(
+                artifact_value,
+                project_root=project_root,
+                allowed_root=project_root / "models",
+                label="Compiled deployment artifact",
+            )
+        except FileNotFoundError:
             failures.append(f"{label}:artifact_missing")
-        else:
+            artifact_path = None
+        except ValueError:
+            failures.append(f"{label}:artifact_path_unsafe")
+            artifact_path = None
+        if artifact_path is not None:
             if SHA256_RE.fullmatch(artifact_sha) and sha256(artifact_path) != artifact_sha:
                 failures.append(f"{label}:artifact_checksum_mismatch")
             if "model_bytes" in numeric and artifact_path.stat().st_size != int(
@@ -3084,6 +3171,10 @@ def main() -> int:
         / "data/reports/model_bakeoff"
         / f"selection_comparison-{selection_identity_sha256(comparison)[:16]}.json"
     )
+    if selection_snapshot_path.is_symlink():
+        raise ValueError("Immutable selection snapshot cannot be a symlink")
+    if selection_snapshot_path.exists() and not selection_snapshot_path.is_file():
+        raise ValueError("Immutable selection snapshot must be a regular file")
     if selection_snapshot_path.is_file():
         selection_snapshot = json.loads(
             selection_snapshot_path.read_text(encoding="utf-8")

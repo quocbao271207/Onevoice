@@ -24,6 +24,7 @@ from scripts.run_model_bakeoff import (
     license_gate,
     multi_metric_stronger,
     report_score,
+    resolve_regular_file_under,
     run_stage,
     select_finalists,
     select_semifinalists,
@@ -1726,6 +1727,51 @@ def test_legacy_rescore_is_explicitly_not_vinai_evidence():
     report = json.loads(path.read_text(encoding="utf-8"))
     assert report["model"] == "facebook/nllb-200-distilled-600M"
     assert report["evidence_status"] == "invalid_for_model_comparison"
+
+
+def test_regular_deployment_file_resolution_enforces_lexical_boundary(tmp_path: Path):
+    project_root = tmp_path / "project"
+    allowed_root = project_root / "models"
+    allowed_root.mkdir(parents=True)
+    artifact = allowed_root / "winner.bin"
+    artifact.write_bytes(b"compiled")
+    outside = project_root / "outside.bin"
+    outside.write_bytes(b"outside")
+
+    assert resolve_regular_file_under(
+        artifact.relative_to(project_root),
+        project_root=project_root,
+        allowed_root=allowed_root,
+        label="Deployment artifact",
+    ) == artifact.resolve()
+    with pytest.raises(ValueError, match="must remain under"):
+        resolve_regular_file_under(
+            outside,
+            project_root=project_root,
+            allowed_root=allowed_root,
+            label="Deployment artifact",
+        )
+
+
+def test_regular_deployment_file_resolution_rejects_symlink(tmp_path: Path):
+    project_root = tmp_path / "project"
+    allowed_root = project_root / "models"
+    allowed_root.mkdir(parents=True)
+    artifact = allowed_root / "winner.bin"
+    artifact.write_bytes(b"compiled")
+    link = allowed_root / "winner-link.bin"
+    try:
+        link.symlink_to(artifact.name)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        resolve_regular_file_under(
+            link,
+            project_root=project_root,
+            allowed_root=allowed_root,
+            label="Deployment artifact",
+        )
 
 
 def test_deployment_expectations_bind_exact_adapter_tree(tmp_path: Path):

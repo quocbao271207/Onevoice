@@ -25,13 +25,13 @@ sys.path.insert(0, str(ROOT))
 from scripts.capture_qcs6490_identity import capture_identity
 from scripts.run_model_bakeoff import (
     MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+    MAX_IDENTITY_EVIDENCE_BYTES,
     SHA256_RE,
     qcs6490_identity_failures,
     sha256,
 )
 
 
-MAX_IDENTITY_EVIDENCE_BYTES = 1_000_000
 MIN_MEASUREMENT_RUNS = 30
 RAW_FIELDS = {
     "version",

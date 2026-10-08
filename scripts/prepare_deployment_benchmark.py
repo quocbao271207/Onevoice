@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.run_model_bakeoff import (  # noqa: E402
     MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+    MAX_IDENTITY_EVIDENCE_BYTES,
     MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
     QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
     QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION,
@@ -35,6 +36,7 @@ from scripts.run_model_bakeoff import (  # noqa: E402
     load_config,
     percentile_linear,
     quantization_parity_evidence_failures,
+    resolve_regular_file_under,
     sha256,
     validate_deployment_report,
 )
@@ -148,13 +150,12 @@ def _winner_key(record: dict[str, Any]) -> tuple[str, str | None]:
 
 
 def _resolve_artifact(path_value: Any, project_root: Path) -> Path:
-    value = str(path_value or "").strip()
-    if not value:
-        raise ValueError("Deployment artifact path is missing")
-    path = Path(value)
-    if not path.is_absolute():
-        path = project_root / path
-    return path.resolve()
+    return resolve_regular_file_under(
+        path_value,
+        project_root=project_root,
+        allowed_root=project_root / "models",
+        label="Deployment artifact",
+    )
 
 
 def _load_measurement_evidence(
@@ -168,20 +169,19 @@ def _load_measurement_evidence(
     value = str(record.get("measurement_evidence_path") or "").strip()
     if not value:
         raise ValueError("Physical measurement evidence path is missing")
-    path = Path(value)
-    if not path.is_absolute():
-        path = project_root / path
-    path = path.resolve()
     evidence_root = (
         project_root
         / "data/reports/model_bakeoff/board-evidence/measurements"
-    ).resolve()
-    if evidence_root not in path.parents:
-        raise ValueError("Physical measurement evidence must be under board-evidence/measurements")
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"Physical measurement evidence is missing: {path}")
-    if path.stat().st_size > MAX_DEPLOYMENT_MEASUREMENT_BYTES:
-        raise ValueError("Physical measurement evidence is too large")
+    )
+    path = resolve_regular_file_under(
+        value,
+        project_root=project_root,
+        allowed_root=evidence_root,
+        label="Physical measurement evidence",
+        maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+    )
+    if path.stat().st_size < 2:
+        raise ValueError("Physical measurement evidence is empty")
     try:
         evidence = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -222,19 +222,18 @@ def _load_parity_evidence(
     value = str(record.get("parity_evidence_path") or "").strip()
     if not value:
         raise ValueError("Quantization parity evidence path is missing")
-    path = Path(value)
-    if not path.is_absolute():
-        path = project_root / path
-    path = path.resolve()
     evidence_root = (
         project_root / "data/reports/model_bakeoff/board-evidence/parity"
-    ).resolve()
-    if evidence_root not in path.parents:
-        raise ValueError("Quantization parity evidence must be under board-evidence/parity")
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"Quantization parity evidence is missing: {path}")
-    if path.stat().st_size > MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES:
-        raise ValueError("Quantization parity evidence is too large")
+    )
+    path = resolve_regular_file_under(
+        value,
+        project_root=project_root,
+        allowed_root=evidence_root,
+        label="Quantization parity evidence",
+        maximum_bytes=MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
+    )
+    if path.stat().st_size < 2:
+        raise ValueError("Quantization parity evidence is empty")
     try:
         evidence = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -319,14 +318,18 @@ def finalize_report(
     identity_value = str(device.get("identity_evidence_path") or "").strip()
     if not identity_value:
         raise ValueError("QCS6490 identity evidence path is missing")
-    identity_path = _resolve_artifact(identity_value, project_root)
     identity_root = (
         project_root / "data" / "reports" / "model_bakeoff" / "board-evidence"
-    ).resolve()
-    if identity_root not in identity_path.parents:
-        raise ValueError("QCS6490 identity evidence must be under board-evidence")
-    if not identity_path.is_file():
-        raise FileNotFoundError(f"QCS6490 identity evidence is missing: {identity_path}")
+    )
+    identity_path = resolve_regular_file_under(
+        identity_value,
+        project_root=project_root,
+        allowed_root=identity_root,
+        label="QCS6490 identity evidence",
+        maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
+    )
+    if identity_path.stat().st_size < 2:
+        raise ValueError("QCS6490 identity evidence is empty")
     try:
         identity = json.loads(identity_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -344,8 +347,6 @@ def finalize_report(
         if record.get("adapter_manifest_sha256") != expected_record["adapter_manifest_sha256"]:
             raise ValueError(f"Deployment adapter binding changed: {key}")
         artifact = _resolve_artifact(record.get("artifact_path"), project_root)
-        if not artifact.is_file():
-            raise FileNotFoundError(f"Deployment artifact is missing: {artifact}")
         parity_path, parity = _load_parity_evidence(
             record,
             expected_record,
