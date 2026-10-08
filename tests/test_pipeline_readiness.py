@@ -42,6 +42,7 @@ def fake_pipeline(*, tts_ready=True, cache_enabled=True):
 
 def test_pipeline_load_fails_closed_when_stage_does_not_become_ready():
     pipeline = fake_pipeline(tts_ready=False)
+    pipeline.allow_text_only_tts_fallback = False
 
     with pytest.raises(RuntimeError, match="tts"):
         pipeline.load()
@@ -50,6 +51,17 @@ def test_pipeline_load_fails_closed_when_stage_does_not_become_ready():
     assert status["ready"] is False
     assert status["loaded"] is False
     assert status["components"]["tts"] is False
+
+
+def test_unloaded_pipeline_does_not_claim_text_only_operation():
+    pipeline = fake_pipeline(tts_ready=False)
+
+    status = pipeline.get_status()
+
+    assert status["ready"] is False
+    assert status["loaded"] is False
+    assert status["operational_mode"] == "unavailable"
+    assert status["degradation_code"] is None
 
 
 def test_pipeline_load_is_idempotent_after_verified_readiness():
@@ -73,6 +85,7 @@ def test_pipeline_load_is_idempotent_after_verified_readiness():
 
 def test_runtime_entrypoints_recheck_component_readiness(monkeypatch):
     pipeline = fake_pipeline(tts_ready=False)
+    pipeline.allow_text_only_tts_fallback = False
     pipeline._is_loaded = True
     pipeline.audio_frontend.is_ready = True
     pipeline.asr_engine.is_ready = True
@@ -247,6 +260,41 @@ def test_disabled_cache_is_not_required_for_pipeline_readiness():
     assert status["text_only_tts_fallback_enabled"] is True
     assert status["components"]["flash_cache"] is False
     assert pipeline.flash_cache.load_count == 0
+
+
+def test_tts_startup_failure_enters_explicit_text_only_mode(monkeypatch, caplog):
+    pipeline = fake_pipeline(tts_ready=False)
+
+    def fail_tts_load():
+        raise FileNotFoundError("PATIENT_SECRET_TTS_PATH")
+
+    monkeypatch.setattr(pipeline.tts_engine, "load", fail_tts_load)
+
+    pipeline.load()
+
+    status = pipeline.get_status()
+    assert status["ready"] is True
+    assert status["loaded"] is True
+    assert status["operational_mode"] == "text_only"
+    assert status["degradation_code"] == "tts_artifact_unavailable"
+    assert status["components"]["tts"] is False
+    assert "PATIENT_SECRET_TTS_PATH" not in caplog.text
+    assert "degradation_code=tts_artifact_unavailable" in caplog.text
+
+
+def test_tts_startup_failure_propagates_when_fallback_is_disabled(monkeypatch):
+    pipeline = fake_pipeline(tts_ready=False)
+    pipeline.allow_text_only_tts_fallback = False
+
+    def fail_tts_load():
+        raise RuntimeError("TTS startup failed")
+
+    monkeypatch.setattr(pipeline.tts_engine, "load", fail_tts_load)
+
+    with pytest.raises(RuntimeError, match="TTS startup failed"):
+        pipeline.load()
+
+    assert pipeline.get_status()["loaded"] is False
 
 
 def test_engine_readiness_requires_complete_runtime_objects():

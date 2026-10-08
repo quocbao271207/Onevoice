@@ -204,6 +204,8 @@ def test_confirmed_clinical_action_is_synthesized_only_after_explicit_consent(
     monkeypatch,
 ):
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline.tts_engine._is_loaded = True
+    pipeline.tts_engine._voices = {"vi": object(), "en": object()}
     audio = np.array([0.0, 0.25], dtype=np.float32)
     synthesized = TTSResult(
         audio=audio,
@@ -485,3 +487,62 @@ def test_pipeline_propagates_tts_failure_when_fallback_is_disabled(
         )
 
     assert pipeline.get_performance_stats()["total_translations"] == 0
+
+
+def test_pipeline_uses_startup_text_only_mode_without_tts_dispatch(
+    monkeypatch,
+    mark_pipeline_ready,
+):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    mark_pipeline_ready(pipeline)
+    pipeline.tts_engine._is_loaded = False
+    pipeline.tts_engine._voices = {}
+    pipeline._tts_startup_degradation_code = "tts_artifact_unavailable"
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        lambda audio, _sample_rate: audio,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="Check the pulse",
+            language="en",
+            confidence=1.0,
+            latency_ms=1.0,
+        ),
+    )
+    monkeypatch.setattr(pipeline.flash_cache, "lookup", lambda *_args: None)
+    monkeypatch.setattr(
+        pipeline.mt_engine,
+        "translate",
+        lambda text, source_lang, target_lang: MTResult(
+            source_text=text,
+            translated_text="Kiểm tra mạch",
+            source_lang=source_lang,
+            target_lang=target_lang,
+            latency_ms=1.0,
+            first_token_ms=None,
+            tokens_generated=3,
+            from_cache=False,
+        ),
+    )
+
+    def unexpected_synthesis(*_args, **_kwargs):
+        raise AssertionError("Unready TTS must not be dispatched")
+
+    monkeypatch.setattr(pipeline.tts_engine, "synthesize", unexpected_synthesis)
+
+    result = pipeline.translate_speech(
+        np.zeros(1600, dtype=np.float32),
+        source_lang="en",
+        target_lang="vi",
+    )
+
+    assert result.safety_passed
+    assert result.translated_text == "Kiểm tra mạch"
+    assert result.output_audio is None
+    assert result.degraded_mode == "text_only"
+    assert result.degradation_code == "tts_artifact_unavailable"
+    assert pipeline.get_performance_stats()["text_only_tts_fallbacks"] == 1

@@ -345,6 +345,7 @@ class MediVoicePipeline:
         self._total_translations = 0
         self._cache_hits = 0
         self._text_only_tts_fallbacks = 0
+        self._tts_startup_degradation_code: Optional[str] = None
         self._latency_history = deque(
             maxlen=MAX_LATENCY_HISTORY_SAMPLES
         )
@@ -575,7 +576,18 @@ class MediVoicePipeline:
         self.mt_engine.load()
 
         logger.info("[4/5] Loading TTS Engine...")
-        self.tts_engine.load()
+        self._tts_startup_degradation_code = None
+        try:
+            self.tts_engine.load()
+        except (OSError, RuntimeError, ValueError) as exc:
+            if not self.allow_text_only_tts_fallback:
+                raise
+            self._tts_startup_degradation_code = tts_degradation_code(exc)
+            logger.error(
+                "TTS startup unavailable; pipeline will operate text-only "
+                "degradation_code=%s",
+                self._tts_startup_degradation_code,
+            )
 
         if self.flash_cache_enabled:
             logger.info("[5/5] Loading Flash Cache (Emergency Phrases)...")
@@ -619,16 +631,29 @@ class MediVoicePipeline:
             for name, ready in components.items()
             if not ready
             and not (name == "flash_cache" and not self.flash_cache_enabled)
+            and not (name == "tts" and self.allow_text_only_tts_fallback)
         ]
 
     def get_status(self) -> dict:
         """Return verified startup readiness for every pipeline component."""
         components = self._component_readiness()
+        if self._is_loaded is True and components["tts"]:
+            operational_mode = "full"
+            degradation_code = None
+        elif self._is_loaded is True and self.allow_text_only_tts_fallback:
+            operational_mode = "text_only"
+            degradation_code = (
+                self._tts_startup_degradation_code
+                or "tts_runtime_error"
+            )
+        else:
+            operational_mode = "unavailable"
+            degradation_code = None
         required_ready = (
             components["audio_frontend"]
             and components["asr"]
             and components["mt"]
-            and components["tts"]
+            and (components["tts"] or self.allow_text_only_tts_fallback)
             and (
                 components["flash_cache"]
                 or not self.flash_cache_enabled
@@ -639,6 +664,8 @@ class MediVoicePipeline:
             "loaded": self._is_loaded is True,
             "flash_cache_enabled": self.flash_cache_enabled,
             "text_only_tts_fallback_enabled": self.allow_text_only_tts_fallback,
+            "operational_mode": operational_mode,
+            "degradation_code": degradation_code,
             "components": components,
         }
 
@@ -878,33 +905,47 @@ class MediVoicePipeline:
         if requires_confirmation:
             logger.warning("Cached clinical action requires confirmation; automatic TTS is suppressed.")
         if not skip_tts and safety.safe and not requires_confirmation:
-            stage_start = time.perf_counter()
-            try:
-                tts_result = self.tts_engine.synthesize(
-                    translated_text,
-                    language=target_lang,
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                latency_breakdown["tts_ms"] = (
-                    time.perf_counter() - stage_start
-                ) * 1000
+            if self.tts_engine.is_ready is not True:
                 if not self.allow_text_only_tts_fallback:
-                    raise
+                    raise RuntimeError("TTS engine is not ready")
                 degraded_mode = "text_only"
-                degradation_code = tts_degradation_code(exc)
+                degradation_code = (
+                    self._tts_startup_degradation_code
+                    or "tts_runtime_error"
+                )
                 logger.error(
-                    "TTS unavailable; preserving safety-passed text-only result "
+                    "TTS not ready; preserving safety-passed text-only result "
                     "degradation_code=%s",
                     degradation_code,
                 )
             else:
-                latency_breakdown["tts_ms"] = (
-                    time.perf_counter() - stage_start
-                ) * 1000
-                output_audio = tts_result.audio
-                output_sample_rate = tts_result.sample_rate
-                tts_latency = tts_result.latency_ms
-                tts_rtf = tts_result.rtf
+                stage_start = time.perf_counter()
+                try:
+                    tts_result = self.tts_engine.synthesize(
+                        translated_text,
+                        language=target_lang,
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    latency_breakdown["tts_ms"] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000
+                    if not self.allow_text_only_tts_fallback:
+                        raise
+                    degraded_mode = "text_only"
+                    degradation_code = tts_degradation_code(exc)
+                    logger.error(
+                        "TTS unavailable; preserving safety-passed text-only result "
+                        "degradation_code=%s",
+                        degradation_code,
+                    )
+                else:
+                    latency_breakdown["tts_ms"] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000
+                    output_audio = tts_result.audio
+                    output_sample_rate = tts_result.sample_rate
+                    tts_latency = tts_result.latency_ms
+                    tts_rtf = tts_result.rtf
 
         # ===== FINAL: Compute totals =====
         total_latency = (time.perf_counter() - pipeline_start) * 1000
@@ -1030,6 +1071,8 @@ class MediVoicePipeline:
         if confirmed is not True:
             raise RuntimeError("Refusing playback: explicit confirmation is required")
         self._validate_playback_result(result, confirmation_required=True)
+        if self.tts_engine.is_ready is not True:
+            raise RuntimeError("Refusing playback: TTS engine is not ready")
         if result.output_audio is not None:
             raise RuntimeError(
                 "Refusing playback: confirmation-gated result already contains audio"
