@@ -412,21 +412,18 @@ def test_adapter_tree_manifest_uses_portable_paths(tmp_path: Path):
     ]
 
 
-def test_adapter_tree_manifest_rejects_symlink_entries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-):
+def test_adapter_tree_manifest_rejects_symlink_entries(tmp_path: Path):
     adapter = tmp_path / "adapter"
     adapter.mkdir()
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"target")
     link = adapter / "linked.bin"
-    link.write_bytes(b"target")
-    original_is_symlink = Path.is_symlink
-    monkeypatch.setattr(
-        Path,
-        "is_symlink",
-        lambda path: path == link or original_is_symlink(path),
-    )
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
 
-    with pytest.raises(ValueError, match="cannot contain symlinks"):
+    with pytest.raises(ValueError, match="symlinks or junctions"):
         tree_manifest(adapter)
 
 

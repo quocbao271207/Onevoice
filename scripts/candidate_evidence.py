@@ -12,6 +12,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
+from src.pipeline.adapter_evidence import stable_adapter_tree_manifest  # noqa: E402
 from src.pipeline.durable_file import (  # noqa: E402
     publish_durable_file_exclusive,
     write_durable_bytes_exclusive,
@@ -57,28 +58,15 @@ def adapter_identity(adapter: Path | None) -> dict[str, Any] | None:
     """Return the exact path/size/content identity embedded in prediction provenance."""
     if adapter is None:
         return None
-    root = adapter.resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Missing adapter directory: {root}")
-    files: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"Adapter checkpoint cannot contain symlinks: {path}")
-        if path.is_file():
-            files.append(
-                {
-                    "path": path.relative_to(root).as_posix(),
-                    "bytes": path.stat().st_size,
-                    "sha256": sha256(path),
-                }
-            )
-    if not files:
-        raise ValueError(f"Adapter checkpoint is empty: {root}")
+    manifest = stable_adapter_tree_manifest(
+        adapter,
+        label="Adapter checkpoint",
+    )
     return {
-        "path": str(root),
-        "file_count": len(files),
-        "bytes": sum(int(item["bytes"]) for item in files),
-        "manifest_sha256": canonical_sha256(files),
+        "path": manifest["root"],
+        "file_count": manifest["file_count"],
+        "bytes": manifest["bytes"],
+        "manifest_sha256": manifest["manifest_sha256"],
     }
 
 

@@ -51,6 +51,7 @@ from scripts.create_verified_backup import (  # noqa: E402
     verify as verify_backup,
 )
 from src.data.quality import fingerprint_text  # noqa: E402
+from src.pipeline.adapter_evidence import stable_adapter_tree_manifest  # noqa: E402
 from src.pipeline.evidence_paths import (  # noqa: E402
     resolve_regular_directory_under,
     resolve_regular_file_under,
@@ -1323,30 +1324,16 @@ def candidate_a_resume_output(
 
 
 def tree_manifest(path: Path) -> dict[str, Any]:
-    if path.is_symlink():
-        raise ValueError(f"Candidate adapter root cannot be a symlink: {path}")
-    if not path.is_dir():
-        raise FileNotFoundError(path)
-    files = []
-    for item in sorted(
-        path.rglob("*"), key=lambda value: value.relative_to(path).as_posix()
-    ):
-        if item.is_symlink():
-            raise ValueError(f"Candidate adapter cannot contain symlinks: {item}")
-        if item.is_file():
-            files.append(
-                {
-                    "path": item.relative_to(path).as_posix(),
-                    "bytes": item.stat().st_size,
-                    "sha256": sha256(item),
-                }
-            )
-    if not files:
-        raise ValueError(f"Cannot freeze empty candidate directory: {path}")
-    manifest_digest = hashlib.sha256(
-        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    return {"root": str(path.resolve()), "files": files, "manifest_sha256": manifest_digest}
+    manifest = stable_adapter_tree_manifest(
+        path,
+        label="Candidate adapter",
+        required_relative_paths=(),
+    )
+    return {
+        "root": manifest["root"],
+        "files": manifest["files"],
+        "manifest_sha256": manifest["manifest_sha256"],
+    }
 
 
 def deployment_expectations(
