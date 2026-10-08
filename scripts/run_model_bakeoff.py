@@ -62,7 +62,10 @@ from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity_sha256,
     selection_policy_record,
 )
-from src.utils.bounded_file import read_stable_regular_file  # noqa: E402
+from src.utils.bounded_file import (  # noqa: E402
+    read_stable_regular_file,
+    sha256_stable_regular_file,
+)
 
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
@@ -70,6 +73,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
 GIT_CHECK_TIMEOUT_SECONDS = 30.0
 MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
+MAX_DEPLOYMENT_ARTIFACT_BYTES = 16_000_000_000
 MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES = 1_000_000
 MAX_IDENTITY_EVIDENCE_BYTES = 1_000_000
 MAX_BAKEOFF_CONFIG_BYTES = 1_000_000
@@ -2180,6 +2184,7 @@ def validate_deployment_report(
                 project_root=project_root,
                 allowed_root=project_root / "models",
                 label="Compiled deployment artifact",
+                maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
             )
         except FileNotFoundError:
             failures.append(f"{label}:artifact_missing")
@@ -2188,12 +2193,21 @@ def validate_deployment_report(
             failures.append(f"{label}:artifact_path_unsafe")
             artifact_path = None
         if artifact_path is not None:
-            if SHA256_RE.fullmatch(artifact_sha) and sha256(artifact_path) != artifact_sha:
-                failures.append(f"{label}:artifact_checksum_mismatch")
-            if "model_bytes" in numeric and artifact_path.stat().st_size != int(
-                numeric["model_bytes"]
-            ):
-                failures.append(f"{label}:model_bytes_mismatch")
+            try:
+                observed_sha, observed_bytes = sha256_stable_regular_file(
+                    artifact_path,
+                    maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+                    label="Compiled deployment artifact",
+                )
+            except (FileNotFoundError, RuntimeError, ValueError):
+                failures.append(f"{label}:artifact_unstable")
+            else:
+                if SHA256_RE.fullmatch(artifact_sha) and observed_sha != artifact_sha:
+                    failures.append(f"{label}:artifact_checksum_mismatch")
+                if "model_bytes" in numeric and observed_bytes != int(
+                    numeric["model_bytes"]
+                ):
+                    failures.append(f"{label}:model_bytes_mismatch")
     return not failures, failures
 
 

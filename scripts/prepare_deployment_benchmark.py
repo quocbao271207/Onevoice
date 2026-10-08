@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
 from copy import deepcopy
 from datetime import datetime
@@ -25,6 +24,9 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.run_model_bakeoff import (  # noqa: E402
     MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+    MAX_DEPLOYMENT_ARTIFACT_BYTES,
+    MAX_BAKEOFF_REPORT_BYTES,
+    MAX_BAKEOFF_STATE_BYTES,
     MAX_IDENTITY_EVIDENCE_BYTES,
     MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
     QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
@@ -36,6 +38,7 @@ from scripts.run_model_bakeoff import (  # noqa: E402
     load_config,
     percentile_linear,
     quantization_parity_evidence_failures,
+    read_json_mapping,
     sha256,
     validate_deployment_report,
 )
@@ -43,6 +46,8 @@ from scripts.run_blind_candidate_suite import (  # noqa: E402
     verify_completed_blind_selection,
 )
 from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 DEFAULT_CONFIG = ROOT / "configs/model_bakeoff.yaml"
@@ -52,18 +57,17 @@ DEFAULT_OUTPUT = ROOT / "data/reports/model_bakeoff/deployment_selected_winners.
 
 def atomic_json_exclusive(path: Path, payload: dict[str, Any]) -> None:
     """Create immutable evidence without overwriting an existing draft/report."""
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite deployment evidence: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
     try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_durable_json_exclusive(
+            path,
+            payload,
+            maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+            label="Deployment evidence",
+        )
+    except FileExistsError:
+        raise FileExistsError(
+            f"Refusing to overwrite deployment evidence: {path}"
+        ) from None
 
 
 def selected_winner_specs(comparison: dict[str, Any]) -> list[tuple[str, str | None, dict[str, Any]]]:
@@ -155,7 +159,28 @@ def _resolve_artifact(path_value: Any, project_root: Path) -> Path:
         project_root=project_root,
         allowed_root=project_root / "models",
         label="Deployment artifact",
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
     )
+
+
+def _load_stable_json_evidence(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> tuple[dict[str, Any], str, int]:
+    digest, size = sha256_stable_regular_file(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    payload = read_json_mapping(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+        expected_sha256=digest,
+    )
+    return payload, digest, size
 
 
 def _load_measurement_evidence(
@@ -163,9 +188,10 @@ def _load_measurement_evidence(
     expected_record: dict[str, Any],
     *,
     identity_sha256: str,
-    artifact: Path,
+    artifact_sha256: str,
+    artifact_bytes: int,
     project_root: Path,
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], str]:
     value = str(record.get("measurement_evidence_path") or "").strip()
     if not value:
         raise ValueError("Physical measurement evidence path is missing")
@@ -180,14 +206,11 @@ def _load_measurement_evidence(
         label="Physical measurement evidence",
         maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
     )
-    if path.stat().st_size < 2:
-        raise ValueError("Physical measurement evidence is empty")
-    try:
-        evidence = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Physical measurement evidence is not valid JSON") from exc
-    if not isinstance(evidence, dict):
-        raise ValueError("Physical measurement evidence payload is invalid")
+    evidence, evidence_sha256, _ = _load_stable_json_evidence(
+        path,
+        maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+        label="Physical measurement evidence",
+    )
     if evidence.get("version") != 1:
         raise ValueError("Physical measurement evidence version is invalid")
     if evidence.get("capture_source") != "physical_qcs6490":
@@ -197,10 +220,9 @@ def _load_measurement_evidence(
             raise ValueError(f"Physical measurement evidence {field} binding changed")
     if evidence.get("identity_evidence_sha256") != identity_sha256:
         raise ValueError("Physical measurement evidence identity binding changed")
-    artifact_sha = sha256(artifact)
-    if evidence.get("artifact_sha256") != artifact_sha:
+    if evidence.get("artifact_sha256") != artifact_sha256:
         raise ValueError("Physical measurement evidence artifact checksum changed")
-    if evidence.get("artifact_bytes") != artifact.stat().st_size:
+    if evidence.get("artifact_bytes") != artifact_bytes:
         raise ValueError("Physical measurement evidence artifact size changed")
     captured_at = str(evidence.get("captured_at") or "")
     try:
@@ -209,16 +231,17 @@ def _load_measurement_evidence(
             raise ValueError("timezone required")
     except ValueError as exc:
         raise ValueError("Physical measurement evidence timestamp is invalid") from exc
-    return path, evidence
+    return path, evidence, evidence_sha256
 
 
 def _load_parity_evidence(
     record: dict[str, Any],
     expected_record: dict[str, Any],
     *,
-    artifact: Path,
+    artifact_sha256: str,
+    artifact_bytes: int,
     project_root: Path,
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], str]:
     value = str(record.get("parity_evidence_path") or "").strip()
     if not value:
         raise ValueError("Quantization parity evidence path is missing")
@@ -232,21 +255,20 @@ def _load_parity_evidence(
         label="Quantization parity evidence",
         maximum_bytes=MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
     )
-    if path.stat().st_size < 2:
-        raise ValueError("Quantization parity evidence is empty")
-    try:
-        evidence = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("Quantization parity evidence is not valid JSON") from exc
+    evidence, evidence_sha256, _ = _load_stable_json_evidence(
+        path,
+        maximum_bytes=MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
+        label="Quantization parity evidence",
+    )
     failures = quantization_parity_evidence_failures(
         evidence,
         expected=expected_record,
-        artifact_sha256=sha256(artifact),
-        artifact_bytes=artifact.stat().st_size,
+        artifact_sha256=artifact_sha256,
+        artifact_bytes=artifact_bytes,
     )
     if failures:
         raise ValueError("Quantization parity evidence failed: " + ", ".join(failures))
-    return path, evidence
+    return path, evidence, evidence_sha256
 
 
 def _parse_samples(
@@ -328,15 +350,12 @@ def finalize_report(
         label="QCS6490 identity evidence",
         maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
     )
-    if identity_path.stat().st_size < 2:
-        raise ValueError("QCS6490 identity evidence is empty")
-    try:
-        identity = json.loads(identity_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("QCS6490 identity evidence is not valid JSON") from exc
-    if not isinstance(identity, dict):
-        raise ValueError("QCS6490 identity evidence payload is invalid")
-    device["identity_evidence_sha256"] = sha256(identity_path)
+    identity, identity_sha256, _ = _load_stable_json_evidence(
+        identity_path,
+        maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
+        label="QCS6490 identity evidence",
+    )
+    device["identity_evidence_sha256"] = identity_sha256
     device["board"] = str(identity.get("board_model") or "").strip()
     device["architecture"] = str(identity.get("architecture") or "").strip()
     final_records = {_winner_key(item): item for item in final["winners"]}
@@ -347,17 +366,24 @@ def finalize_report(
         if record.get("adapter_manifest_sha256") != expected_record["adapter_manifest_sha256"]:
             raise ValueError(f"Deployment adapter binding changed: {key}")
         artifact = _resolve_artifact(record.get("artifact_path"), project_root)
-        parity_path, parity = _load_parity_evidence(
+        artifact_sha256, artifact_bytes = sha256_stable_regular_file(
+            artifact,
+            maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+            label="Deployment artifact",
+        )
+        parity_path, parity, parity_sha256 = _load_parity_evidence(
             record,
             expected_record,
-            artifact=artifact,
+            artifact_sha256=artifact_sha256,
+            artifact_bytes=artifact_bytes,
             project_root=project_root,
         )
-        measurement_path, measurement = _load_measurement_evidence(
+        measurement_path, measurement, measurement_sha256 = _load_measurement_evidence(
             record,
             expected_record,
             identity_sha256=device["identity_evidence_sha256"],
-            artifact=artifact,
+            artifact_sha256=artifact_sha256,
+            artifact_bytes=artifact_bytes,
             project_root=project_root,
         )
         for field in (
@@ -388,7 +414,7 @@ def finalize_report(
         record.update(
             {
                 "parity_evidence_path": str(parity_path),
-                "parity_evidence_sha256": sha256(parity_path),
+                "parity_evidence_sha256": parity_sha256,
                 "parity_evaluated_at": parity["evaluated_at"],
                 "parity_manifest_sha256": parity["manifest_sha256"],
                 "parity_reference_predictions_sha256": parity[
@@ -409,7 +435,7 @@ def finalize_report(
                 "parity_metrics": deepcopy(parity["metrics"]),
                 "parity_safety_slices": deepcopy(parity["safety_slices"]),
                 "measurement_evidence_path": str(measurement_path),
-                "measurement_evidence_sha256": sha256(measurement_path),
+                "measurement_evidence_sha256": measurement_sha256,
                 "measurement_captured_at": measurement["captured_at"],
                 "measurement_runs": len(parsed_samples),
                 "latency_samples_ms": parsed_samples,
@@ -420,8 +446,8 @@ def finalize_report(
                 "power_p95_mw": percentile_linear(power_samples, 0.95),
                 "temperature_samples_c": temperature_samples,
                 "temperature_peak_c": max(temperature_samples),
-                "artifact_sha256": sha256(artifact),
-                "model_bytes": artifact.stat().st_size,
+                "artifact_sha256": artifact_sha256,
+                "model_bytes": artifact_bytes,
             }
         )
 
@@ -465,7 +491,11 @@ def main() -> int:
 
     if not args.selection_comparison.is_file():
         raise FileNotFoundError(args.selection_comparison)
-    comparison = json.loads(args.selection_comparison.read_text(encoding="utf-8"))
+    comparison = read_json_mapping(
+        args.selection_comparison,
+        maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+        label="Selection comparison",
+    )
     config = load_config(args.config)
     if args.action == "template":
         template = build_template(args.selection_comparison, comparison, config)
@@ -475,7 +505,11 @@ def main() -> int:
 
     if not args.draft.is_file():
         raise FileNotFoundError(args.draft)
-    draft = json.loads(args.draft.read_text(encoding="utf-8"))
+    draft = read_json_mapping(
+        args.draft,
+        maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+        label="Deployment draft",
+    )
     report = finalize_report(args.selection_comparison, comparison, draft, config)
     atomic_json_exclusive(args.output, report)
     print(json.dumps(report, ensure_ascii=False, indent=2))

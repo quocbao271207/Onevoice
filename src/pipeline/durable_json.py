@@ -111,3 +111,89 @@ def write_durable_json(
             except OSError:
                 pass
         temporary.unlink(missing_ok=True)
+
+
+def write_durable_json_exclusive(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> None:
+    """Durably create one strict, bounded JSON mapping without overwriting."""
+    if (
+        isinstance(maximum_bytes, bool)
+        or not isinstance(maximum_bytes, int)
+        or maximum_bytes < 1
+    ):
+        raise ValueError("maximum_bytes must be a positive integer")
+    if not isinstance(label, str) or not label:
+        raise ValueError("label must be a non-empty string")
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} payload must be a mapping")
+    try:
+        encoded = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} payload is not serializable") from None
+    if len(encoded) > maximum_bytes:
+        raise ValueError(f"{label} payload exceeds {maximum_bytes} bytes")
+
+    destination = _checked_destination(path, label=label)
+    if destination.exists():
+        raise FileExistsError(f"{label} already exists: {destination}")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    published = False
+    try:
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(temporary, 0o600)
+        staged = read_stable_regular_file(
+            temporary,
+            maximum_bytes=maximum_bytes,
+            label=f"Staged {label}",
+        )
+        if staged != encoded:
+            raise RuntimeError(f"Staged {label} does not match its payload")
+        destination = _checked_destination(destination, label=label)
+        if destination.exists():
+            raise FileExistsError(f"{label} already exists: {destination}")
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            raise FileExistsError(f"{label} already exists: {destination}") from None
+        published = True
+        _sync_directory(destination.parent)
+        persisted = read_stable_regular_file(
+            destination,
+            maximum_bytes=maximum_bytes,
+            label=f"Persisted {label}",
+        )
+        if persisted != encoded:
+            raise RuntimeError(f"Persisted {label} does not match its payload")
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        temporary.unlink(missing_ok=True)
+        if published:
+            _sync_directory(destination.parent)

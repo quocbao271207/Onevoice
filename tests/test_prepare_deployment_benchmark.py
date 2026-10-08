@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.prepare_deployment_benchmark as deployment
 from scripts.prepare_deployment_benchmark import (
     atomic_json_exclusive,
     build_template,
@@ -789,6 +790,55 @@ def test_evidence_writer_refuses_to_overwrite(tmp_path: Path):
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         atomic_json_exclusive(path, {"status": "second"})
     assert json.loads(path.read_text(encoding="utf-8"))["status"] == "first"
+
+
+def test_evidence_writer_rejects_non_finite_json(tmp_path: Path):
+    path = tmp_path / "evidence.json"
+
+    with pytest.raises(ValueError, match="not serializable"):
+        atomic_json_exclusive(path, {"latency_ms": float("nan")})
+
+    assert not path.exists()
+
+
+def test_finalize_rejects_duplicate_identity_fields(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    draft = build_template(selection, comparison, config, project_root)
+    identity = write_identity_evidence(project_root)
+    identity.write_text(
+        '{"version":1,"board_model":"Qualcomm QCS6490",'
+        '"board_model":"Arduino Uno"}',
+        encoding="utf-8",
+    )
+    draft["device"]["identity_evidence_path"] = str(
+        identity.relative_to(project_root)
+    )
+
+    with pytest.raises(ValueError, match="not valid strict JSON"):
+        finalize_report(selection, comparison, draft, config, project_root)
+
+
+def test_finalize_caps_compiled_artifact_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    draft = build_template(selection, comparison, config, project_root)
+    identity = write_identity_evidence(project_root)
+    draft["device"]["identity_evidence_path"] = str(
+        identity.relative_to(project_root)
+    )
+    models = project_root / "models"
+    models.mkdir()
+    artifact = models / "oversized.bin"
+    artifact.write_bytes(b"12345")
+    draft["winners"][0]["artifact_path"] = str(
+        artifact.relative_to(project_root)
+    )
+    monkeypatch.setattr(deployment, "MAX_DEPLOYMENT_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(ValueError, match="exceeds 4 bytes"):
+        finalize_report(selection, comparison, draft, config, project_root)
 
 
 def test_selection_requires_exact_three_winner_slots(tmp_path: Path):

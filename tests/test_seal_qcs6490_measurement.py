@@ -111,7 +111,7 @@ def test_sealer_binds_live_board_raw_capture_and_artifact(tmp_path: Path):
         / "data/reports/model_bakeoff/board-evidence/measurements/mt-winner.json"
     )
     write_exclusive(output, evidence)
-    loaded_path, loaded = _load_measurement_evidence(
+    loaded_path, loaded, loaded_sha256 = _load_measurement_evidence(
         {"measurement_evidence_path": str(output.relative_to(project_root))},
         {
             "task": "mt",
@@ -120,11 +120,13 @@ def test_sealer_binds_live_board_raw_capture_and_artifact(tmp_path: Path):
             "adapter_manifest_sha256": "a" * 64,
         },
         identity_sha256=sha256(identity),
-        artifact=artifact,
+        artifact_sha256=sha256(artifact),
+        artifact_bytes=artifact.stat().st_size,
         project_root=project_root,
     )
     assert loaded_path == output.resolve()
     assert loaded == evidence
+    assert loaded_sha256 == sha256(output)
 
 
 def test_sealer_rejects_live_board_identity_mismatch(tmp_path: Path):
