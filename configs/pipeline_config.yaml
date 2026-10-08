@@ -26,6 +26,8 @@ audio:
   silence_duration_ms: 800  # Silence before end-of-speech detection
 
 asr:
+  max_input_duration_seconds: 30.0 # Fail closed above Whisper's single-window limit
+  max_new_tokens: 225              # Must terminate with EOS before this cap
   vi:
     model_name: "phowhisper-small-medical"
     model_path: "models/asr/phowhisper-small-medical"

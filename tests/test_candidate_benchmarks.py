@@ -31,6 +31,8 @@ from scripts.run_baseline_benchmarks import (
     prepare_runtime,
     resolve_device,
     source_balanced_sample,
+    validate_asr_batch_audio_duration,
+    validate_asr_batch_generation_completed,
     validate_bakeoff_runner_generation,
     validate_mt_batch_source_lengths,
     validate_mt_batch_generation_completed,
@@ -139,6 +141,40 @@ def test_asr_features_follow_wrapped_whisper_encoder_dtype():
 
     assert prepared.dtype == torch.bfloat16
     assert prepared.device.type == "cpu"
+
+
+def test_asr_benchmark_rejects_audio_beyond_whisper_window():
+    arrays = [
+        torch.zeros(16000).numpy(),
+        torch.zeros(16001).numpy(),
+    ]
+    rows = [{"id": "within-limit"}, {"id": "too-long"}]
+
+    with pytest.raises(ValueError, match="too-long.*1.000s.*limit is 1.000s"):
+        validate_asr_batch_audio_duration(
+            arrays,
+            rows,
+            sample_rate=16000,
+            max_duration_seconds=1.0,
+        )
+
+
+def test_asr_benchmark_rejects_generation_without_eos():
+    generated = torch.tensor(
+        [
+            [2, 10, 1, 0],
+            [2, 11, 12, 0],
+        ]
+    )
+    rows = [{"id": "complete"}, {"id": "incomplete"}]
+
+    with pytest.raises(RuntimeError, match="incomplete.*did not produce EOS"):
+        validate_asr_batch_generation_completed(
+            generated,
+            rows,
+            eos_token_id=1,
+            pad_token_id=0,
+        )
 
 
 def test_source_balanced_sample_can_take_full_manifest():
@@ -286,7 +322,13 @@ def test_prediction_checkpoint_verifies_exact_inputs_and_payload(tmp_path: Path)
     }
     args.task = "asr"
     assert "mt_inference_contract" not in prediction_checkpoint_specification(args)
+    assert prediction_checkpoint_specification(args)["asr_inference_contract"] == {
+        "max_input_duration_seconds": 30.0,
+        "max_new_tokens": 225,
+        "require_eos": True,
+    }
     args.task = "mt"
+    assert "asr_inference_contract" not in prediction_checkpoint_specification(args)
 
     provenance = write_prediction_checkpoint(
         path,
@@ -317,6 +359,30 @@ def test_prediction_checkpoint_rejects_legacy_generation_contract(tmp_path: Path
     provenance_path = prediction_provenance_path(path)
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     provenance["specification"].pop("mt_inference_contract")
+    provenance["specification_sha256"] = benchmark.canonical_sha256(
+        provenance["specification"]
+    )
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="specification mismatch"):
+        load_verified_prediction_checkpoint(path, specification)
+
+
+def test_asr_prediction_checkpoint_rejects_legacy_generation_contract(tmp_path: Path):
+    args = checkpoint_args(tmp_path)
+    args.task = "asr"
+    path = tmp_path / "legacy_asr_predictions.jsonl"
+    specification = prediction_checkpoint_specification(args)
+    write_prediction_checkpoint(
+        path,
+        [{"id": "clip", "hypothesis": "Không dùng aspirin."}],
+        specification,
+        {"num_beams": 1},
+        {"resolved_device": "cpu"},
+    )
+    provenance_path = prediction_provenance_path(path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["specification"].pop("asr_inference_contract")
     provenance["specification_sha256"] = benchmark.canonical_sha256(
         provenance["specification"]
     )

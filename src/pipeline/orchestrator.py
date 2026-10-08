@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .audio_frontend import AudioFrontend, AudioConfig
-from .asr_engine import ASREngine, ASRResult
+from .asr_engine import ASREngine, ASRResult, validate_asr_audio_window
 from .mt_engine import MTEngine, MTResult, validate_mt_source_text
 from .tts_engine import TTSEngine, TTSResult, validate_tts_audio
 from .flash_cache import CachedPhrase, FlashCache
@@ -107,6 +107,11 @@ class MediVoicePipeline:
             vi_model_path=asr_cfg.get("vi", {}).get("model_path", "models/asr/phowhisper-small-medical"),
             en_model_path=asr_cfg.get("en", {}).get("model_path", "models/asr/distil-whisper-en"),
             allow_base_fallback=allow_base_fallback,
+            max_input_duration_seconds=asr_cfg.get(
+                "max_input_duration_seconds",
+                30.0,
+            ),
+            max_new_tokens=asr_cfg.get("max_new_tokens", 225),
         )
 
         mt_cfg = self.config.get("mt", {})
@@ -269,6 +274,12 @@ class MediVoicePipeline:
 
         if source_lang is not None:
             self._resolve_target_language(source_lang, target_lang)
+
+        audio = validate_asr_audio_window(
+            audio,
+            sample_rate,
+            self.asr_engine.max_input_duration_seconds,
+        )
 
         pipeline_start = time.perf_counter()
         latency_breakdown = {}

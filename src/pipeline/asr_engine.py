@@ -13,13 +13,16 @@ QNN deployment remain separate, measured milestones.
 """
 
 import logging
+import math
 import time
 import numpy as np
 from math import gcd
-from typing import Optional, Dict, Tuple
+from numbers import Integral, Real
+from typing import Optional, Dict
 from dataclasses import dataclass
 
 from .audio_frontend import validate_audio_input
+from .generation_guard import require_completed_generation
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,26 @@ BASE_MODEL_REVISIONS = {
     "vinai/PhoWhisper-small": "a86b604c346caf7148c37512eafe783a16420adb",
     "distil-whisper/distil-small.en": "9e4a67ca4569c30be43a3fe7fba1621e504f0093",
 }
+SUPPORTED_ASR_LANGUAGES = {"vi", "en"}
+WHISPER_MAX_INPUT_DURATION_SECONDS = 30.0
+DEFAULT_ASR_MAX_NEW_TOKENS = 225
+
+
+def validate_asr_audio_window(
+    audio: np.ndarray,
+    sample_rate: int,
+    max_duration_seconds: float,
+) -> np.ndarray:
+    """Validate audio and reject input beyond one Whisper feature window."""
+    value = validate_audio_input(audio, sample_rate)
+    duration_seconds = len(value) / sample_rate
+    if duration_seconds > max_duration_seconds:
+        raise ValueError(
+            f"ASR audio has {len(value)} samples ({duration_seconds:.3f}s); "
+            f"limit is {max_duration_seconds:.3f}s. "
+            "Refusing silent Whisper truncation."
+        )
+    return value
 
 
 @dataclass
@@ -55,13 +78,48 @@ class ASREngine:
         use_onnx: bool = False,
         languages: tuple[str, ...] = ("vi", "en"),
         allow_base_fallback: bool = False,
+        max_input_duration_seconds: float = WHISPER_MAX_INPUT_DURATION_SECONDS,
+        max_new_tokens: int = DEFAULT_ASR_MAX_NEW_TOKENS,
     ):
+        if (
+            isinstance(max_input_duration_seconds, bool)
+            or not isinstance(max_input_duration_seconds, Real)
+            or not math.isfinite(float(max_input_duration_seconds))
+            or not (
+                0.0
+                < float(max_input_duration_seconds)
+                <= WHISPER_MAX_INPUT_DURATION_SECONDS
+            )
+        ):
+            raise ValueError(
+                "max_input_duration_seconds must be finite and in "
+                f"(0, {WHISPER_MAX_INPUT_DURATION_SECONDS}]"
+            )
+        if (
+            isinstance(max_new_tokens, bool)
+            or not isinstance(max_new_tokens, Integral)
+            or int(max_new_tokens) <= 0
+        ):
+            raise ValueError("max_new_tokens must be a positive integer")
+        if (
+            not isinstance(languages, (tuple, list))
+            or not languages
+            or any(
+                not isinstance(language, str)
+                or language not in SUPPORTED_ASR_LANGUAGES
+                for language in languages
+            )
+            or len(set(languages)) != len(languages)
+        ):
+            raise ValueError("languages must be unique values from {'vi', 'en'}")
         self.vi_model_path = vi_model_path
         self.en_model_path = en_model_path
         self.device = device
         self.use_onnx = use_onnx
-        self.languages = languages
+        self.languages = tuple(languages)
         self.allow_base_fallback = allow_base_fallback
+        self.max_input_duration_seconds = float(max_input_duration_seconds)
+        self.max_new_tokens = int(max_new_tokens)
         self.models: Dict[str, object] = {}
         self.processors: Dict[str, object] = {}
         self.loaded_model_paths: Dict[str, str] = {}
@@ -77,6 +135,28 @@ class ASREngine:
 
         common = gcd(int(sample_rate), 16000)
         return resample_poly(value, 16000 // common, int(sample_rate) // common).astype(np.float32), 16000
+
+    def _validated_whisper_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> tuple[np.ndarray, int]:
+        value = validate_asr_audio_window(
+            audio,
+            sample_rate,
+            self.max_input_duration_seconds,
+        )
+        if sample_rate == 16000:
+            return value, sample_rate
+        from scipy.signal import resample_poly
+
+        common = gcd(int(sample_rate), 16000)
+        resampled = resample_poly(
+            value,
+            16000 // common,
+            int(sample_rate) // common,
+        ).astype(np.float32)
+        return resampled, 16000
 
     def load(self):
         """Load ASR models for both languages."""
@@ -136,7 +216,7 @@ class ASREngine:
         Detect whether the audio contains Vietnamese or English speech.
 
         Uses Whisper's built-in language detection capability.
-        Falls back to 'vi' if detection is uncertain.
+        Fails closed if detection cannot be completed reliably.
 
         Args:
             audio: Audio signal (float32, normalized)
@@ -145,12 +225,12 @@ class ASREngine:
         Returns:
             Language code: "vi" or "en"
         """
+        audio, sample_rate = self._validated_whisper_audio(audio, sample_rate)
         if not self._is_loaded:
-            return "vi"  # Default to Vietnamese
+            raise RuntimeError("ASR engine not loaded. Call load() first.")
 
         try:
             import torch
-            audio, sample_rate = self._to_whisper_rate(audio, sample_rate)
             # Language detection requires a multilingual Whisper checkpoint;
             # the English-only Distil-Whisper model cannot provide VI logits.
             processor = self.processors.get("vi", list(self.processors.values())[0])
@@ -182,18 +262,28 @@ class ASREngine:
             vi_token = tokenizer.convert_tokens_to_ids("<|vi|>")
             en_token = tokenizer.convert_tokens_to_ids("<|en|>")
 
-            if vi_token is not None and en_token is not None:
-                vi_prob = logits[vi_token].item()
-                en_prob = logits[en_token].item()
-                detected = "vi" if vi_prob > en_prob else "en"
-                logger.debug(
-                    f"Language detection: VI={vi_prob:.3f}, EN={en_prob:.3f} → {detected}"
+            if vi_token is None or en_token is None or vi_token == en_token:
+                raise RuntimeError(
+                    "Whisper tokenizer lacks distinct VI/EN language tokens"
                 )
-                return detected
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-
-        return "vi"  # Default to Vietnamese in medical context
+            vi_logit = float(logits[vi_token].item())
+            en_logit = float(logits[en_token].item())
+            if not math.isfinite(vi_logit) or not math.isfinite(en_logit):
+                raise RuntimeError("Whisper returned non-finite language logits")
+            if vi_logit == en_logit:
+                raise RuntimeError("Whisper language detection is ambiguous")
+            detected = "vi" if vi_logit > en_logit else "en"
+            logger.debug(
+                "Language detection: VI=%.3f, EN=%.3f → %s",
+                vi_logit,
+                en_logit,
+                detected,
+            )
+            return detected
+        except Exception as exc:
+            raise RuntimeError(
+                "Language detection failed; refusing implicit fallback"
+            ) from exc
 
     def transcribe(
         self,
@@ -217,11 +307,17 @@ class ASREngine:
 
         start_time = time.perf_counter()
 
+        audio, sample_rate = self._validated_whisper_audio(audio, sample_rate)
+
         # Step 1: Detect language if not specified
         if language is None:
             language = self.detect_language(audio, sample_rate)
-
-        audio, sample_rate = self._to_whisper_rate(audio, sample_rate)
+        if (
+            language not in self.languages
+            or language not in self.models
+            or language not in self.processors
+        ):
+            raise ValueError(f"Unsupported ASR language: {language}")
 
         # Step 2: Select appropriate model
         model = self.models[language]
@@ -240,7 +336,7 @@ class ASREngine:
         # Step 4: Generate transcription
         with torch.no_grad():
             generate_kwargs = {
-                "max_new_tokens": 225,
+                "max_new_tokens": self.max_new_tokens,
                 "num_beams": 1,           # Greedy for speed
                 "do_sample": False,
                 "return_dict_in_generate": True,
@@ -260,6 +356,12 @@ class ASREngine:
             outputs = model.generate(input_features, **generate_kwargs)
 
         # Step 5: Decode tokens to text
+        require_completed_generation(
+            outputs.sequences[0],
+            processor.tokenizer.eos_token_id,
+            pad_token_id=processor.tokenizer.pad_token_id,
+            context="ASR generation",
+        )
         transcription = processor.batch_decode(
             outputs.sequences, skip_special_tokens=True
         )[0].strip()

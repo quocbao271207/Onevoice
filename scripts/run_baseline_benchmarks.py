@@ -27,7 +27,12 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.candidate_evidence import adapter_identity, canonical_sha256, sha256  # noqa: E402
 from scripts.evaluate_benchmarks import score_asr, score_mt  # noqa: E402
-from src.pipeline.mt_engine import require_completed_mt_generation  # noqa: E402
+from src.pipeline.asr_engine import (  # noqa: E402
+    DEFAULT_ASR_MAX_NEW_TOKENS,
+    WHISPER_MAX_INPUT_DURATION_SECONDS,
+)
+from src.pipeline.audio_frontend import validate_audio_input  # noqa: E402
+from src.pipeline.generation_guard import require_completed_generation  # noqa: E402
 from src.training.mt_model_adapter import (  # noqa: E402
     SUPPORTED_MT_FAMILIES,
     configure_tokenizer,
@@ -101,6 +106,45 @@ def encode_mt_source_batch(tokenizer: Any, texts: list[str]) -> dict[str, Any]:
     )
 
 
+def validate_asr_batch_audio_duration(
+    arrays: list[np.ndarray],
+    rows: list[dict[str, Any]],
+    *,
+    sample_rate: int = 16000,
+    max_duration_seconds: float = WHISPER_MAX_INPUT_DURATION_SECONDS,
+) -> None:
+    """Reject audio that Whisper would silently crop to one feature window."""
+    if len(arrays) != len(rows):
+        raise RuntimeError("ASR audio batch size does not match source rows")
+    for audio, row in zip(arrays, rows):
+        duration_seconds = len(audio) / sample_rate
+        if duration_seconds > max_duration_seconds:
+            raise ValueError(
+                f"ASR benchmark source {row.get('id', '<missing-id>')} has "
+                f"{len(audio)} samples ({duration_seconds:.3f}s); limit is "
+                f"{max_duration_seconds:.3f}s. Refusing silent Whisper truncation."
+            )
+
+
+def validate_asr_batch_generation_completed(
+    generated: Any,
+    rows: list[dict[str, Any]],
+    *,
+    eos_token_id: Any,
+    pad_token_id: Any = None,
+) -> None:
+    """Reject an ASR batch if any transcript stopped before generated EOS."""
+    if len(generated) != len(rows):
+        raise RuntimeError("ASR generated batch size does not match source rows")
+    for row, generated_tokens in zip(rows, generated):
+        require_completed_generation(
+            generated_tokens,
+            eos_token_id,
+            pad_token_id=pad_token_id,
+            context=f"ASR benchmark source {row.get('id', '<missing-id>')}",
+        )
+
+
 def validate_mt_batch_generation_completed(
     generated: Any,
     rows: list[dict[str, Any]],
@@ -112,7 +156,7 @@ def validate_mt_batch_generation_completed(
     if len(generated) != len(rows):
         raise RuntimeError("MT generated batch size does not match source rows")
     for row, generated_tokens in zip(rows, generated):
-        require_completed_mt_generation(
+        require_completed_generation(
             generated_tokens,
             eos_token_id,
             pad_token_id=pad_token_id,
@@ -238,6 +282,19 @@ def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, A
                 }
             }
             if args.task == "mt"
+            else {}
+        ),
+        **(
+            {
+                "asr_inference_contract": {
+                    "max_input_duration_seconds": (
+                        WHISPER_MAX_INPUT_DURATION_SECONDS
+                    ),
+                    "max_new_tokens": DEFAULT_ASR_MAX_NEW_TOKENS,
+                    "require_eos": True,
+                }
+            }
+            if args.task == "asr"
             else {}
         ),
         "bakeoff_runner_sha256": getattr(args, "bakeoff_runner_sha256", None),
@@ -448,9 +505,8 @@ def run_asr(
                 audio, rate = sf.read(audio_path, dtype="float32", always_2d=False)
                 if rate != 16000:
                     raise ValueError(f"Expected 16 kHz QC audio, got {rate}: {audio_path}")
-                if audio.ndim > 1:
-                    audio = audio.mean(axis=1)
-                arrays.append(np.asarray(audio, dtype=np.float32))
+                arrays.append(validate_audio_input(audio, rate))
+            validate_asr_batch_audio_duration(arrays, chunk)
             features = processor.feature_extractor(
                 arrays,
                 sampling_rate=16000,
@@ -459,7 +515,7 @@ def run_asr(
             )
             generation_kwargs = {
                 "attention_mask": features.attention_mask.to(device),
-                "max_new_tokens": 225,
+                "max_new_tokens": DEFAULT_ASR_MAX_NEW_TOKENS,
                 "num_beams": args.num_beams,
                 "do_sample": False,
             }
@@ -468,6 +524,12 @@ def run_asr(
             generated = model.generate(
                 prepare_asr_input_features(features.input_features, model, device),
                 **generation_kwargs,
+            )
+            validate_asr_batch_generation_completed(
+                generated,
+                chunk,
+                eos_token_id=processor.tokenizer.eos_token_id,
+                pad_token_id=processor.tokenizer.pad_token_id,
             )
             hypotheses = processor.tokenizer.batch_decode(generated, skip_special_tokens=True)
             for row, hypothesis in zip(chunk, hypotheses):
