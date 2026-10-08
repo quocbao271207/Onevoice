@@ -70,7 +70,7 @@ tts:
 
 flash_cache:
   enabled: true
-  cache_path: "configs/emergency_phrases.json"
+  cache_path: null          # Built-in reviewed phrases; set only to an existing validated JSON list
   fuzzy_matching: false     # Exact intent only; avoid unsafe substring cache hits
   max_response_ms: 50       # Target < 50ms for cached phrases
 

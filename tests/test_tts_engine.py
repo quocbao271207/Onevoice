@@ -147,6 +147,7 @@ def test_pipeline_revalidates_cached_audio_before_return(monkeypatch):
         pipeline.flash_cache,
         "lookup",
         lambda *_args: SimpleNamespace(
+            source_lang="en",
             translated_text="Kiểm tra mạch",
             target_lang="vi",
             audio=np.array([np.nan], dtype=np.float32),

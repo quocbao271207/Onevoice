@@ -30,7 +30,7 @@ from .audio_frontend import AudioFrontend, AudioConfig
 from .asr_engine import ASREngine, ASRResult
 from .mt_engine import MTEngine, MTResult, validate_mt_source_text
 from .tts_engine import TTSEngine, TTSResult, validate_tts_audio
-from .flash_cache import FlashCache
+from .flash_cache import CachedPhrase, FlashCache
 from .safety_guard import validate_translation
 
 logger = logging.getLogger(__name__)
@@ -168,6 +168,22 @@ class MediVoicePipeline:
         if source_lang not in supported or resolved not in supported or source_lang == resolved:
             raise ValueError(f"Unsupported translation direction: {source_lang}_to_{resolved}")
         return resolved
+
+    @staticmethod
+    def _validate_cached_direction(
+        cached: CachedPhrase,
+        source_lang: str,
+        target_lang: str,
+    ) -> None:
+        if (
+            cached.source_lang != source_lang
+            or cached.target_lang != target_lang
+        ):
+            raise RuntimeError(
+                "Flash cache direction mismatch: "
+                f"cached={cached.source_lang}_to_{cached.target_lang}, "
+                f"requested={source_lang}_to_{target_lang}"
+            )
 
     def _translation_safety(
         self,
@@ -310,6 +326,11 @@ class MediVoicePipeline:
         latency_breakdown["cache_lookup_ms"] = (time.perf_counter() - stage_start) * 1000
 
         if cached:
+            self._validate_cached_direction(
+                cached,
+                asr_result.language,
+                target_lang,
+            )
             # Cache HIT — bypass MT engine
             self._cache_hits += 1
             translated_text = cached.translated_text
@@ -480,6 +501,7 @@ class MediVoicePipeline:
         # Check flash cache first
         cached = self.flash_cache.lookup(text, source_lang)
         if cached:
+            self._validate_cached_direction(cached, source_lang, target_lang)
             result = MTResult(
                 source_text=text,
                 translated_text=cached.translated_text,

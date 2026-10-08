@@ -91,6 +91,20 @@ def test_negation_count_detects_dropped_clause():
     assert negation_count("Đừng dùng aspirin.", "vi") == 1
 
 
+def test_vietnamese_final_question_particle_is_not_a_negation():
+    assert negation_count("Bệnh nhân tỉnh không?", "vi") == 0
+    assert negation_count("Bệnh nhân còn thở không", "vi") == 0
+    assert negation_count("Không dùng aspirin.", "vi") == 1
+    assert negation_count("Không.", "vi") == 1
+
+    assert validate_translation(
+        "Is the patient conscious?",
+        "Bệnh nhân có tỉnh không?",
+        "en",
+        "vi",
+    ).safe
+
+
 def test_terminology_allows_reviewed_aliases_but_fails_missing_drug():
     safe = validate_translation(
         "Give epinephrine now.",

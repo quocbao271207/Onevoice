@@ -12,14 +12,29 @@ understanding of real clinical emergency workflows.
 
 import json
 import logging
+import re
 import time
-import hashlib
+import unicodedata
 import numpy as np
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 from dataclasses import dataclass
 from pathlib import Path
 
+from .safety_guard import validate_translation
+
 logger = logging.getLogger(__name__)
+
+SUPPORTED_CACHE_LANGUAGES = {"vi", "en"}
+MAX_CACHE_TEXT_CHARACTERS = 4096
+MAX_CUSTOM_CACHE_ENTRIES = 1000
+MAX_CUSTOM_CACHE_BYTES = 1_000_000
+CUSTOM_CACHE_REQUIRED_FIELDS = {
+    "source",
+    "source_lang",
+    "translation",
+    "target_lang",
+}
+CUSTOM_CACHE_OPTIONAL_FIELDS = {"category", "requires_confirmation"}
 
 
 @dataclass
@@ -158,66 +173,182 @@ class FlashCache:
     Pre-computed cache for emergency medical phrases.
 
     Features:
-    - 100+ standard emergency phrases pre-translated
-    - Fuzzy matching for slight variations in speech
+    - Reviewed standard emergency phrases pre-translated
+    - Exact normalized matching without clinical fuzzy substitution
     - Pre-synthesized audio stored in memory for < 50ms response
-    - Configurable threshold for cache hit detection
+    - Atomic, schema-validated custom phrase loading
 
     Performance Target: < 50ms response time for cached phrases
     """
 
     def __init__(self, cache_path: Optional[str] = None, allow_fuzzy: bool = False):
+        if allow_fuzzy:
+            raise ValueError(
+                "Fuzzy flash-cache matching is disabled for clinical safety"
+            )
         self.cache: Dict[str, CachedPhrase] = {}
         self._cache_path = cache_path
-        self.allow_fuzzy = allow_fuzzy
+        self.allow_fuzzy = False
         self._is_loaded = False
 
     def load(self):
-        """Load emergency phrases into the cache."""
+        """Validate and atomically publish default plus custom phrases."""
         logger.info("Loading Flash Cache with emergency phrases...")
+        staged_cache: Dict[str, CachedPhrase] = {}
 
         # Load default phrases
         for direction, phrases in EMERGENCY_PHRASES.items():
             src_lang, tgt_lang = direction.split("_to_")
             for src_text, tgt_text in phrases.items():
                 key = self._make_key(src_text, src_lang)
-                self.cache[key] = CachedPhrase(
+                phrase = CachedPhrase(
                     source_text=src_text,
                     source_lang=src_lang,
                     translated_text=tgt_text,
                     target_lang=tgt_lang,
                     category="emergency",
-                    requires_confirmation=(src_lang, src_text.casefold()) in CONFIRMATION_REQUIRED,
+                    requires_confirmation=(
+                        src_lang,
+                        src_text.casefold(),
+                    ) in CONFIRMATION_REQUIRED,
                 )
+                self._validate_phrase(phrase, context=f"default phrase {key}")
+                if key in staged_cache:
+                    raise ValueError(f"Duplicate normalized default cache source: {key}")
+                staged_cache[key] = phrase
 
         # Load additional phrases from file
-        if self._cache_path and Path(self._cache_path).exists():
+        custom_count = 0
+        if self._cache_path:
+            cache_path = Path(self._cache_path)
+            if not cache_path.is_file():
+                raise FileNotFoundError(
+                    f"Configured custom flash cache does not exist: {cache_path}"
+                )
+            if cache_path.stat().st_size > MAX_CUSTOM_CACHE_BYTES:
+                raise ValueError(
+                    f"Custom flash cache exceeds {MAX_CUSTOM_CACHE_BYTES} bytes: "
+                    f"{cache_path}"
+                )
             try:
-                with open(self._cache_path, 'r', encoding='utf-8') as f:
+                with cache_path.open(encoding="utf-8") as f:
                     custom_phrases = json.load(f)
-                for item in custom_phrases:
-                    key = self._make_key(item["source"], item["source_lang"])
-                    self.cache[key] = CachedPhrase(
-                        source_text=item["source"],
-                        source_lang=item["source_lang"],
-                        translated_text=item["translation"],
-                        target_lang=item["target_lang"],
-                        category=item.get("category", "custom"),
-                        requires_confirmation=bool(item.get("requires_confirmation", True)),
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Failed to read custom flash cache: {cache_path}") from exc
+            if not isinstance(custom_phrases, list):
+                raise ValueError("Custom flash cache root must be a list")
+            if len(custom_phrases) > MAX_CUSTOM_CACHE_ENTRIES:
+                raise ValueError(
+                    f"Custom flash cache exceeds {MAX_CUSTOM_CACHE_ENTRIES} entries"
+                )
+            for index, item in enumerate(custom_phrases):
+                phrase = self._parse_custom_phrase(item, index)
+                key = self._make_key(phrase.source_text, phrase.source_lang)
+                if key in staged_cache:
+                    raise ValueError(
+                        f"Custom flash cache has duplicate normalized source: {key}"
                     )
-                logger.info(f"Loaded {len(custom_phrases)} custom phrases from {self._cache_path}")
-            except Exception as e:
-                logger.warning(f"Failed to load custom cache: {e}")
+                staged_cache[key] = phrase
+            custom_count = len(custom_phrases)
 
+        self.cache = staged_cache
         self._is_loaded = True
-        logger.info(f"Flash Cache loaded: {len(self.cache)} phrases ready for instant response")
+        if custom_count:
+            logger.info(
+                "Loaded %d custom phrases from %s",
+                custom_count,
+                self._cache_path,
+            )
+        logger.info(
+            "Flash Cache loaded: %d phrases ready for instant response",
+            len(self.cache),
+        )
+
+    @staticmethod
+    def _validate_text(value: object, *, name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+        if not value.strip():
+            raise ValueError(f"{name} must not be blank")
+        if len(value) > MAX_CACHE_TEXT_CHARACTERS:
+            raise ValueError(
+                f"{name} exceeds {MAX_CACHE_TEXT_CHARACTERS} characters"
+            )
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError(f"{name} must not contain control characters")
+        return value
+
+    @classmethod
+    def _validate_phrase(cls, phrase: CachedPhrase, *, context: str) -> None:
+        cls._validate_text(phrase.source_text, name=f"{context} source")
+        cls._validate_text(phrase.translated_text, name=f"{context} translation")
+        if (
+            not isinstance(phrase.source_lang, str)
+            or not isinstance(phrase.target_lang, str)
+            or phrase.source_lang not in SUPPORTED_CACHE_LANGUAGES
+            or phrase.target_lang not in SUPPORTED_CACHE_LANGUAGES
+            or phrase.source_lang == phrase.target_lang
+        ):
+            raise ValueError(
+                f"{context} must use the opposite bilingual direction"
+            )
+        safety = validate_translation(
+            phrase.source_text,
+            phrase.translated_text,
+            phrase.source_lang,
+            phrase.target_lang,
+        )
+        if not safety.safe:
+            raise ValueError(
+                f"{context} failed safety validation: {safety.issues}"
+            )
+
+    @classmethod
+    def _parse_custom_phrase(cls, item: object, index: int) -> CachedPhrase:
+        context = f"custom phrase {index}"
+        if not isinstance(item, dict):
+            raise ValueError(f"{context} must be an object")
+        fields = set(item)
+        missing = CUSTOM_CACHE_REQUIRED_FIELDS - fields
+        if missing:
+            raise ValueError(f"{context} missing fields: {sorted(missing)}")
+        unknown = fields - CUSTOM_CACHE_REQUIRED_FIELDS - CUSTOM_CACHE_OPTIONAL_FIELDS
+        if unknown:
+            raise ValueError(f"{context} has unknown fields: {sorted(unknown)}")
+        if item.get("requires_confirmation", True) is not True:
+            raise ValueError(f"{context} must set requires_confirmation=true")
+        category = cls._validate_text(
+            item.get("category", "custom"),
+            name=f"{context} category",
+        )
+        if len(category) > 64:
+            raise ValueError(f"{context} category exceeds 64 characters")
+        source_text = cls._validate_text(
+            item["source"],
+            name=f"{context} source",
+        )
+        phrase = CachedPhrase(
+            source_text=source_text,
+            source_lang=item["source_lang"],
+            translated_text=cls._validate_text(
+                item["translation"],
+                name=f"{context} translation",
+            ),
+            target_lang=item["target_lang"],
+            category=category,
+            requires_confirmation=True,
+        )
+        cls._validate_phrase(phrase, context=context)
+        return phrase
 
     def _make_key(self, text: str, language: str) -> str:
         """Create a normalized cache key from text."""
-        normalized = text.lower().strip()
-        # Remove common punctuation that doesn't affect meaning
-        for char in ".,!?;:":
-            normalized = normalized.replace(char, "")
+        self._validate_text(text, name="cache lookup text")
+        if not isinstance(language, str) or language not in SUPPORTED_CACHE_LANGUAGES:
+            raise ValueError(f"Unsupported cache language: {language}")
+        normalized = unicodedata.normalize("NFKC", text).casefold().strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = re.sub(r"[.,!?;:]+$", "", normalized).rstrip()
         return f"{language}:{normalized}"
 
     def lookup(self, text: str, source_lang: str) -> Optional[CachedPhrase]:
@@ -247,27 +378,6 @@ class FlashCache:
                 f"\"{self.cache[key].translated_text}\" ({latency_us:.0f}μs)"
             )
             return self.cache[key]
-
-        if not self.allow_fuzzy:
-            return None
-
-        # Optional fuzzy matching is disabled in the safety-first default.
-        text_normalized = text.lower().strip()
-        for cached_key, cached_phrase in self.cache.items():
-            cached_lang, cached_text = cached_key.split(":", 1)
-            if cached_lang != source_lang:
-                continue
-            if cached_text in text_normalized or text_normalized in cached_text:
-                # Check similarity threshold (at least 80% overlap)
-                shorter = min(len(cached_text), len(text_normalized))
-                longer = max(len(cached_text), len(text_normalized))
-                if shorter / longer >= 0.8:
-                    latency_us = (time.perf_counter() - start_time) * 1_000_000
-                    logger.info(
-                        f"Flash Cache HIT (fuzzy): \"{text}\" → "
-                        f"\"{cached_phrase.translated_text}\" ({latency_us:.0f}μs)"
-                    )
-                    return cached_phrase
 
         return None
 

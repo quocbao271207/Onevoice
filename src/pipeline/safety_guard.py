@@ -172,13 +172,19 @@ def has_negation(text: str, language: str) -> bool:
     return negation_count(text, language) > 0
 
 
+def _is_vietnamese_final_question_particle(text: str, match: re.Match[str]) -> bool:
+    """Distinguish final polar-question ``không`` from predicate negation."""
+    if match.group(0).casefold() != "không":
+        return False
+    if re.search(r"\w", text[match.end() :], flags=re.UNICODE):
+        return False
+    clause_prefix = re.split(r"[.;!?]+", text[: match.start()])[-1]
+    return bool(re.search(r"\w", clause_prefix, flags=re.UNICODE))
+
+
 def negation_count(text: str, language: str) -> int:
     """Count explicit and implicit negations so one dropped clause cannot hide another."""
-    if language == "vi":
-        return len(VI_NEGATION_RE.findall(text or "")) + len(VI_IMPLICIT_NEGATION_RE.findall(text or ""))
-    if language == "en":
-        return len(EN_NEGATION_RE.findall(text or "")) + len(EN_IMPLICIT_NEGATION_RE.findall(text or ""))
-    raise ValueError(f"Unsupported language for negation check: {language}")
+    return len(_negation_spans(text, language))
 
 
 def _phrase_spans(text: str, phrase: str) -> list[tuple[int, int]]:
@@ -243,8 +249,18 @@ def _quantity_bindings(
 
 
 def _negation_spans(text: str, language: str) -> list[tuple[int, int]]:
+    value = text or ""
     if language == "vi":
-        patterns = (VI_NEGATION_RE, VI_IMPLICIT_NEGATION_RE)
+        explicit_spans = {
+            (match.start(), match.end())
+            for match in VI_NEGATION_RE.finditer(value)
+            if not _is_vietnamese_final_question_particle(value, match)
+        }
+        implicit_spans = {
+            (match.start(), match.end())
+            for match in VI_IMPLICIT_NEGATION_RE.finditer(value)
+        }
+        return sorted(explicit_spans | implicit_spans)
     elif language == "en":
         patterns = (EN_NEGATION_RE, EN_IMPLICIT_NEGATION_RE)
     else:
@@ -252,7 +268,7 @@ def _negation_spans(text: str, language: str) -> list[tuple[int, int]]:
     spans = {
         (match.start(), match.end())
         for pattern in patterns
-        for match in pattern.finditer(text or "")
+        for match in pattern.finditer(value)
     }
     return sorted(spans)
 
