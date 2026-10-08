@@ -142,6 +142,25 @@ def test_blind_jsonl_is_bounded_and_object_only(
         read_jsonl(manifest)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"id":"first","id":"second"}\n',
+        '{"id":"sample","score":NaN}\n',
+        '{"id":"sample","score":Infinity}\n',
+    ],
+)
+def test_blind_jsonl_rejects_ambiguous_or_nonfinite_json(
+    tmp_path: Path,
+    payload: str,
+):
+    manifest = tmp_path / "blind.jsonl"
+    manifest.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not valid strict JSON"):
+        read_jsonl(manifest)
+
+
 def test_blind_lock_rejects_legacy_schema(tmp_path: Path):
     mt = tmp_path / "mt.jsonl"
     asr = tmp_path / "asr.jsonl"
@@ -154,6 +173,29 @@ def test_blind_lock_rejects_legacy_schema(tmp_path: Path):
     lock.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="schema version 2"):
+        verify_lock(lock)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda text: text.replace('"version": 2', '"version": 2, "version": 2'),
+        lambda text: text.replace('"version": 2', '"version": NaN'),
+    ],
+)
+def test_blind_lock_rejects_ambiguous_or_nonfinite_json(
+    tmp_path: Path,
+    mutate,
+):
+    mt = tmp_path / "mt.jsonl"
+    asr = tmp_path / "asr.jsonl"
+    mt.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr.write_text('{"id":"asr"}\n', encoding="utf-8")
+    lock = tmp_path / "lock.json"
+    write_lock(lock, mt, asr)
+    lock.write_text(mutate(lock.read_text(encoding="utf-8")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not valid strict JSON"):
         verify_lock(lock)
 
 
@@ -296,6 +338,24 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
     assert selected["sha256"] == sha256(comparison)
     assert selected["adapter_manifest"]["manifest_sha256"] == manifest["manifest_sha256"]
     valid_comparison = comparison.read_text(encoding="utf-8")
+    comparison.write_text(
+        valid_comparison.replace(
+            '"status": "selection_complete"',
+            '"status": "selection_complete", "status": "selection_complete"',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="not valid strict JSON"):
+        verify_selection_winner(
+            comparison,
+            "mt",
+            "en_to_vi",
+            candidate_id,
+            adapter,
+            config,
+            "research",
+        )
+    comparison.write_text(valid_comparison, encoding="utf-8")
     vinai_id = "mt_vinai_en2vi_v2"
     vinai = json.loads(valid_comparison)
     vinai["results"]["mt"]["winners"]["en_to_vi"]["candidate_id"] = vinai_id
@@ -391,11 +451,15 @@ def test_blind_report_provenance_rejects_tampering(tmp_path: Path):
     provenance.write_text(
         json.dumps(
             {
+                "version": 1,
+                "created_at": "2026-10-09T00:00:00+00:00",
                 "specification_sha256": "a" * 64,
                 "blind_manifest_sha256": "b" * 64,
                 "selection_sha256": "c" * 64,
+                "report": str(report),
                 "report_sha256": sha256(report),
                 "report_bytes": report.stat().st_size,
+                "resource_run": {"return_code": 0},
             }
         ),
         encoding="utf-8",
@@ -405,10 +469,47 @@ def test_blind_report_provenance_rejects_tampering(tmp_path: Path):
         report, provenance, "a" * 64, "b" * 64, "c" * 64
     )["report_sha256"] == sha256(report)
 
+    valid_provenance = json.loads(provenance.read_text(encoding="utf-8"))
+    failed_run = dict(valid_provenance)
+    failed_run["resource_run"] = {"return_code": 1}
+    provenance.write_text(json.dumps(failed_run), encoding="utf-8")
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        verify_report_provenance(
+            report, provenance, "a" * 64, "b" * 64, "c" * 64
+        )
+
+    provenance.write_text(json.dumps(valid_provenance), encoding="utf-8")
     report.write_text('{"wer":0.9}', encoding="utf-8")
     with pytest.raises(ValueError, match="provenance mismatch"):
         verify_report_provenance(
             report, provenance, "a" * 64, "b" * 64, "c" * 64
+        )
+
+
+def test_blind_report_provenance_rejects_ambiguous_json(tmp_path: Path):
+    report = tmp_path / "blind.json"
+    report.write_text('{"wer":0.1}', encoding="utf-8")
+    provenance = tmp_path / "blind_provenance.json"
+    digest = sha256(report)
+    provenance.write_text(
+        "{"
+        f'"specification_sha256":"{"a" * 64}",'
+        f'"blind_manifest_sha256":"{"b" * 64}",'
+        f'"selection_sha256":"{"c" * 64}",'
+        f'"report_sha256":"{digest}",'
+        f'"report_sha256":"{digest}",'
+        f'"report_bytes":{report.stat().st_size}'
+        "}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="not valid strict JSON"):
+        verify_report_provenance(
+            report,
+            provenance,
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
         )
 
 
@@ -564,11 +665,15 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
     provenance.write_text(
         json.dumps(
             {
+                "version": 1,
+                "created_at": "2026-10-09T00:00:00+00:00",
                 "specification_sha256": specification_sha,
                 "blind_manifest_sha256": sha256(mt_manifest),
                 "selection_sha256": sha256(comparison),
+                "report": str(report),
                 "report_sha256": sha256(report),
                 "report_bytes": report.stat().st_size,
+                "resource_run": {"return_code": 0},
             }
         ),
         encoding="utf-8",

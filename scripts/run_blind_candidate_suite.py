@@ -35,6 +35,7 @@ from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity,
     selection_policy_record,
 )
+from src.utils.bounded_file import read_stable_regular_file  # noqa: E402
 
 
 MAX_BLIND_REPORT_BYTES = 50_000_000
@@ -58,6 +59,19 @@ BLIND_LOCK_ALLOWED_FIELDS = frozenset(
     }
 )
 BLIND_LOCK_REQUIRED_FIELDS = BLIND_LOCK_ALLOWED_FIELDS - {"policy", "locked_at"}
+BLIND_PROVENANCE_FIELDS = frozenset(
+    {
+        "version",
+        "created_at",
+        "specification_sha256",
+        "blind_manifest_sha256",
+        "selection_sha256",
+        "report",
+        "report_bytes",
+        "report_sha256",
+        "resource_run",
+    }
+)
 
 
 def utc_now() -> str:
@@ -85,6 +99,35 @@ def sha256(path: Path) -> str:
         while chunk := handle.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON document contains a duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("JSON document contains a non-finite number")
+
+
+def _parse_json_mapping(payload: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError(f"{label} is not valid strict JSON") from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return parsed
 
 
 def adapter_tree_manifest(adapter: Path) -> dict[str, Any]:
@@ -117,31 +160,44 @@ def adapter_tree_manifest(adapter: Path) -> dict[str, Any]:
     }
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    path = resolve_regular_file(
+def _read_jsonl_document(path: Path) -> tuple[Path, bytes, list[dict[str, Any]]]:
+    resolved = resolve_regular_file(
         path,
         label="Blind JSONL manifest",
         maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
     )
+    payload = read_stable_regular_file(
+        resolved,
+        maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
+        label="Blind JSONL manifest",
+    )
     rows: list[dict[str, Any]] = []
-    try:
-        with path.open(encoding="utf-8", errors="strict") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                if len(line.encode("utf-8")) > MAX_BLIND_MANIFEST_LINE_BYTES:
-                    raise ValueError(
-                        f"Blind JSONL line {line_number} exceeds "
-                        f"{MAX_BLIND_MANIFEST_LINE_BYTES} bytes"
-                    )
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError(
-                        f"Blind JSONL line {line_number} must be an object"
-                    )
-                rows.append(row)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Blind JSONL manifest is invalid: {path}") from exc
+    for line_number, line in enumerate(payload.splitlines(), start=1):
+        if not line.strip():
+            continue
+        if len(line) > MAX_BLIND_MANIFEST_LINE_BYTES:
+            raise ValueError(
+                f"Blind JSONL line {line_number} exceeds "
+                f"{MAX_BLIND_MANIFEST_LINE_BYTES} bytes"
+            )
+        try:
+            row = json.loads(
+                line.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise ValueError(
+                f"Blind JSONL line {line_number} is not valid strict JSON"
+            ) from None
+        if not isinstance(row, dict):
+            raise ValueError(f"Blind JSONL line {line_number} must be an object")
+        rows.append(row)
+    return resolved, payload, rows
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    _, _, rows = _read_jsonl_document(path)
     return rows
 
 
@@ -635,10 +691,21 @@ def load_locked_accuracy_config(
             label="Accuracy policy",
             maximum_bytes=MAX_ACCURACY_CONFIG_BYTES,
         )
-    actual = sha256(path)
+    payload = read_stable_regular_file(
+        path,
+        maximum_bytes=MAX_ACCURACY_CONFIG_BYTES,
+        label="Accuracy policy",
+    )
+    actual = hashlib.sha256(payload).hexdigest()
     if actual != record["sha256"]:
         raise ValueError(f"Accuracy policy checksum mismatch: {actual}")
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        loaded = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError):
+        raise ValueError("Accuracy policy is not valid UTF-8 YAML") from None
+    if not isinstance(loaded, dict):
+        raise ValueError("Accuracy policy root must be a mapping")
+    return loaded
 
 
 def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str, Any]) -> None:
@@ -678,12 +745,7 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         raise ValueError("Blind v2 is already locked and cannot be replaced")
     manifests = {}
     for task, path in (("mt", mt_path), ("asr", asr_path)):
-        resolved = resolve_regular_file(
-            path,
-            label=f"Blind {task} manifest",
-            maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
-        )
-        rows = read_jsonl(resolved)
+        resolved, manifest_payload, rows = _read_jsonl_document(path)
         if not rows:
             raise ValueError(f"Blind {task} manifest is empty")
         validate_identifiers(task, rows)
@@ -700,7 +762,7 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         manifests[task] = {
             "path": str(resolved),
             "rows": len(rows),
-            "sha256": sha256(resolved),
+            "sha256": hashlib.sha256(manifest_payload).hexdigest(),
             "coverage": coverage,
         }
     locked = {
@@ -852,9 +914,12 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
             maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
         )
         digest = str(record.get("sha256") or "")
-        if not SHA256_RE.fullmatch(digest) or sha256(path) != digest:
+        _, manifest_payload, rows = _read_jsonl_document(path)
+        if (
+            not SHA256_RE.fullmatch(digest)
+            or hashlib.sha256(manifest_payload).hexdigest() != digest
+        ):
             raise ValueError(f"Blind {task} checksum mismatch")
-        rows = read_jsonl(path)
         coverage = validate_minimum_coverage(
             task,
             rows,
@@ -872,8 +937,16 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
             label="Blind selection comparison",
             maximum_bytes=MAX_BLIND_REPORT_BYTES,
         )
+        _, selection_payload = _load_bounded_json_document(
+            path,
+            label="Blind selection comparison",
+            maximum_bytes=MAX_BLIND_REPORT_BYTES,
+        )
         digest = str(selection.get("sha256") or "")
-        if not SHA256_RE.fullmatch(digest) or sha256(path) != digest:
+        if (
+            not SHA256_RE.fullmatch(digest)
+            or hashlib.sha256(selection_payload).hexdigest() != digest
+        ):
             raise ValueError("Blind selection comparison checksum mismatch")
     _validate_opened_slots(lock)
     return lock
@@ -895,10 +968,16 @@ def verify_selection_winner(
     config: dict[str, Any],
     scope: str,
 ) -> dict[str, Any]:
-    comparison_path = comparison_path.resolve()
-    if not comparison_path.is_file():
-        raise FileNotFoundError(comparison_path)
-    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    comparison_path = resolve_regular_file(
+        comparison_path,
+        label="Blind selection comparison",
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
+    comparison, comparison_payload = _load_bounded_json_document(
+        comparison_path,
+        label="Blind selection comparison",
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
     if comparison.get("status") != "selection_complete":
         raise ValueError("Blind evaluation requires a finalized selection comparison")
     if comparison.get("selection_policy") != selection_policy_record(config):
@@ -940,7 +1019,7 @@ def verify_selection_winner(
         raise ValueError(f"Blind adapter checksum does not match selected winner for {task}/{key}")
     return {
         "path": str(comparison_path),
-        "sha256": sha256(comparison_path),
+        "sha256": hashlib.sha256(comparison_payload).hexdigest(),
         "winner": winner,
         "adapter_manifest": manifest,
     }
@@ -953,34 +1032,71 @@ def verify_report_provenance(
     manifest_sha256: str,
     selection_sha256: str,
 ) -> dict[str, Any]:
-    if not report_path.is_file() or not provenance_path.is_file():
-        raise FileNotFoundError(f"Blind report provenance is incomplete: {report_path}")
-    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    report_path = resolve_regular_file(
+        report_path,
+        label="Blind report",
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
+    provenance_path = resolve_regular_file(
+        provenance_path,
+        label="Blind report provenance",
+        maximum_bytes=MAX_BLIND_PROVENANCE_BYTES,
+    )
+    provenance, _ = _load_bounded_json_document(
+        provenance_path,
+        label="Blind report provenance",
+        maximum_bytes=MAX_BLIND_PROVENANCE_BYTES,
+    )
+    report_payload = read_stable_regular_file(
+        report_path,
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+        label="Blind report",
+    )
     expected = {
         "specification_sha256": specification_sha256,
         "blind_manifest_sha256": manifest_sha256,
         "selection_sha256": selection_sha256,
-        "report_sha256": sha256(report_path),
-        "report_bytes": report_path.stat().st_size,
+        "report_sha256": hashlib.sha256(report_payload).hexdigest(),
+        "report_bytes": len(report_payload),
     }
-    if any(provenance.get(key) != value for key, value in expected.items()):
+    resource_run = provenance.get("resource_run")
+    recorded_report = Path(str(provenance.get("report") or ""))
+    if (
+        set(provenance) != BLIND_PROVENANCE_FIELDS
+        or isinstance(provenance.get("version"), bool)
+        or provenance.get("version") != 1
+        or Path(os.path.abspath(recorded_report)) != report_path
+        or not isinstance(resource_run, dict)
+        or isinstance(resource_run.get("return_code"), bool)
+        or resource_run.get("return_code") != 0
+        or any(provenance.get(key) != value for key, value in expected.items())
+    ):
         raise ValueError(f"Blind report provenance mismatch: {report_path}")
+    _aware_timestamp(provenance.get("created_at"), label="Blind provenance")
     return provenance
 
 
+def _load_bounded_json_document(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> tuple[dict[str, Any], bytes]:
+    payload = read_stable_regular_file(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    return _parse_json_mapping(payload, label=label), payload
+
+
 def _load_bounded_json(path: Path, *, label: str, maximum_bytes: int) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
-    size = path.stat().st_size
-    if size < 2 or size > maximum_bytes:
-        raise ValueError(f"{label} size is outside the valid range")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8", errors="strict"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"{label} must be a JSON object")
-    return payload
+    parsed, _ = _load_bounded_json_document(
+        path,
+        label=label,
+        maximum_bytes=maximum_bytes,
+    )
+    return parsed
 
 
 def _aware_timestamp(value: Any, *, label: str) -> None:
@@ -1064,16 +1180,17 @@ def verify_completed_blind_selection(
         project_root,
         label="Selection snapshot",
     )
-    if snapshot_path.is_symlink() or not snapshot_path.is_file():
-        raise FileNotFoundError(f"Selection snapshot is missing: {snapshot_path}")
-    snapshot_sha256 = str(snapshot_record.get("sha256") or "")
-    if not SHA256_RE.fullmatch(snapshot_sha256) or sha256(snapshot_path) != snapshot_sha256:
-        raise ValueError("Selection snapshot checksum mismatch")
-    snapshot = _load_bounded_json(
+    snapshot, snapshot_payload = _load_bounded_json_document(
         snapshot_path,
         label="Selection snapshot",
         maximum_bytes=MAX_BLIND_REPORT_BYTES,
     )
+    snapshot_sha256 = str(snapshot_record.get("sha256") or "")
+    if (
+        not SHA256_RE.fullmatch(snapshot_sha256)
+        or hashlib.sha256(snapshot_payload).hexdigest() != snapshot_sha256
+    ):
+        raise ValueError("Selection snapshot checksum mismatch")
     if snapshot.get("status") != "selection_complete":
         raise ValueError("Selection snapshot status is invalid")
     if selection_identity(snapshot) != selection_identity(comparison):
@@ -1141,17 +1258,6 @@ def verify_completed_blind_selection(
         "blind_manifest_sha256",
         "direction",
         "scope",
-    }
-    provenance_fields = {
-        "version",
-        "created_at",
-        "specification_sha256",
-        "blind_manifest_sha256",
-        "selection_sha256",
-        "report",
-        "report_bytes",
-        "report_sha256",
-        "resource_run",
     }
     accuracy_config = load_locked_accuracy_config(config, project_root)
     required_slices = (
@@ -1221,14 +1327,15 @@ def verify_completed_blind_selection(
             project_root,
             label="Blind report",
         )
-        report_payload = _load_bounded_json(
+        report_payload, report_document = _load_bounded_json_document(
             report_path,
             label="Blind report",
             maximum_bytes=MAX_BLIND_REPORT_BYTES,
         )
         if (
-            result.get("report_bytes") != report_path.stat().st_size
-            or result.get("report_sha256") != sha256(report_path)
+            result.get("report_bytes") != len(report_document)
+            or result.get("report_sha256")
+            != hashlib.sha256(report_document).hexdigest()
         ):
             raise ValueError(f"Blind report checksum mismatch: {candidate_id}")
         manifest_record = lock["manifests"][task]
@@ -1276,7 +1383,7 @@ def verify_completed_blind_selection(
         )
         resource_run = provenance.get("resource_run")
         if (
-            set(provenance) != provenance_fields
+            set(provenance) != BLIND_PROVENANCE_FIELDS
             or isinstance(provenance.get("version"), bool)
             or provenance.get("version") != 1
             or provenance.get("specification_sha256")
@@ -1305,9 +1412,16 @@ def verify_completed_blind_selection(
             raise ValueError(f"Blind lock result mismatch: {candidate_id}")
     if observed != set(expected_by_binding):
         raise ValueError("Blind completion winner set is incomplete")
+    persisted_lock, persisted_lock_payload = _load_bounded_json_document(
+        lock_path,
+        label="Blind v2 lock",
+        maximum_bytes=MAX_BLIND_LOCK_BYTES,
+    )
+    if persisted_lock != lock:
+        raise RuntimeError("Blind v2 lock changed while validating completion")
     return {
         "selection_snapshot_sha256": snapshot_sha256,
-        "blind_lock_sha256": sha256(lock_path),
+        "blind_lock_sha256": hashlib.sha256(persisted_lock_payload).hexdigest(),
         "winner_count": len(observed),
     }
 
@@ -1464,6 +1578,11 @@ def _evaluate_slot(
             )
         if not report_path.is_file():
             raise FileNotFoundError(f"Blind benchmark did not create report: {report_path}")
+        completed_report = read_stable_regular_file(
+            report_path,
+            maximum_bytes=MAX_BLIND_REPORT_BYTES,
+            label="Blind report",
+        )
         atomic_json(
             provenance_path,
             {
@@ -1473,8 +1592,8 @@ def _evaluate_slot(
                 "blind_manifest_sha256": specification["blind_manifest_sha256"],
                 "selection_sha256": selection["sha256"],
                 "report": str(report_path),
-                "report_bytes": report_path.stat().st_size,
-                "report_sha256": sha256(report_path),
+                "report_bytes": len(completed_report),
+                "report_sha256": hashlib.sha256(completed_report).hexdigest(),
                 "resource_run": monitored,
             },
             maximum_bytes=MAX_BLIND_PROVENANCE_BYTES,
@@ -1490,7 +1609,17 @@ def _evaluate_slot(
         "adapter_manifest_sha256"
     ]:
         raise ValueError("Blind adapter changed during evaluation")
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report, report_payload = _load_bounded_json_document(
+        report_path,
+        label="Blind report",
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
+    if (
+        len(report_payload) != provenance.get("report_bytes")
+        or hashlib.sha256(report_payload).hexdigest()
+        != provenance.get("report_sha256")
+    ):
+        raise RuntimeError("Blind report changed after provenance verification")
     required = config["promotion_gate"]["critical_slices"] + config["promotion_gate"]["policy_slices"]
     failed = clinical_failures(report, required)
     manifest_record = lock["manifests"][args.task]
@@ -1585,7 +1714,9 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/reports/model_bakeoff/blind_v2")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    from scripts.run_model_bakeoff import load_config as load_bakeoff_config
+
+    config = load_bakeoff_config(args.config)
     if args.action == "lock":
         if not args.mt_manifest or not args.asr_manifest:
             parser.error("--action lock requires --mt-manifest and --asr-manifest")
