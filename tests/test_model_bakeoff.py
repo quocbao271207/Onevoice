@@ -1881,6 +1881,7 @@ def test_final_backup_is_release_bound_and_reusable(
         return {
             "schema_version": bakeoff.BACKUP_SCHEMA_VERSION,
             "verification": "pass",
+            "secret_scan": "pass",
             "git_head": "a" * 40,
             "release_evidence": release_evidence,
         }
@@ -1890,6 +1891,7 @@ def test_final_backup_is_release_bound_and_reusable(
         return {
             "schema_version": bakeoff.BACKUP_SCHEMA_VERSION,
             "verification": "pass",
+            "secret_scan": "pass",
             "git_head": "a" * 40,
             "release_evidence": release,
         }
@@ -1913,6 +1915,43 @@ def test_final_backup_is_release_bound_and_reusable(
     assert first == second
     assert calls == {"create": 1, "verify": 1}
     assert first["release_evidence"] == release
+
+
+def test_final_backup_requires_secret_scan_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    comparison = tmp_path / "comparison.json"
+    comparison.write_text("{}", encoding="utf-8")
+    release = {
+        "comparison_path": "data/reports/model_bakeoff/comparison.json",
+        "comparison_bytes": 2,
+        "comparison_sha256": "b" * 64,
+        "decision": "reject",
+        "promotion_allowed": False,
+        "scope": "research",
+    }
+    monkeypatch.setattr(bakeoff, "build_release_evidence", lambda *args, **kwargs: release)
+    monkeypatch.setattr(bakeoff, "verified_release_git_head", lambda: "a" * 40)
+
+    def create(output: Path, *, release_evidence: dict) -> dict:
+        output.mkdir(parents=True)
+        return {
+            "schema_version": bakeoff.BACKUP_SCHEMA_VERSION,
+            "verification": "pass",
+            "git_head": "a" * 40,
+            "release_evidence": release_evidence,
+        }
+
+    monkeypatch.setattr(bakeoff, "create_backup", create)
+
+    with pytest.raises(ValueError, match="does not match"):
+        ensure_verified_final_backup(
+            comparison,
+            decision="reject",
+            scope="research",
+            backup_root=tmp_path / "backups",
+        )
 
 
 def test_terminal_state_remains_incomplete_when_backup_fails(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -221,6 +222,39 @@ def test_backup_rejects_manifest_tampering(tmp_path: Path, monkeypatch: pytest.M
 
     with pytest.raises(RuntimeError, match=backup.MANIFEST_CHECKSUM_NAME):
         backup.verify(output)
+
+
+def test_backup_create_and_verify_reject_release_secrets_without_echoing_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "project"
+    reports = write_sources(root)
+    secret = b"gh" + b"p_" + b"A" * 40
+    (reports / "runtime.log").write_bytes(b"token=" + secret)
+    monkeypatch.setattr(backup, "ROOT", root)
+
+    with pytest.raises(ValueError, match=r"github_token.*runtime\.log") as caught:
+        backup.create_backup(tmp_path / "rejected-backup")
+    assert secret.decode("ascii") not in str(caught.value)
+    assert not (tmp_path / "rejected-backup").exists()
+
+    verify_root = tmp_path / "verify-project"
+    monkeypatch.setattr(backup, "ROOT", verify_root)
+    output = tmp_path / "tampered-backup"
+    archives = write_bundle(verify_root, output)
+    member = archives[2]["members"][0]
+    member_name = str(member["path"])
+    payload = b"Authorization: Bearer " + b"eyJ" + b"B" * 12 + b"." + b"C" * 12 + b"." + b"D" * 12
+    rewrite_tar(output / "reports.tar", member_name, payload)
+    member["bytes"] = len(payload)
+    member["sha256"] = hashlib.sha256(payload).hexdigest()
+    archives[2]["source_bytes"] = len(payload)
+    refresh_archive_envelope(archives[2], output / "reports.tar")
+    write_metadata(output, archives)
+
+    with pytest.raises(ValueError, match=r"bearer_jwt.*metrics\.json") as caught:
+        backup.verify(output)
+    assert payload.decode("ascii") not in str(caught.value)
 
 
 def test_backup_rejects_noncanonical_manifest_schema(

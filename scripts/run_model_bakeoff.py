@@ -208,6 +208,7 @@ def ensure_verified_final_backup(
     if (
         verified.get("schema_version") != BACKUP_SCHEMA_VERSION
         or verified.get("verification") != "pass"
+        or verified.get("secret_scan") != "pass"
         or verified.get("git_head") != git_head
         or verified.get("release_evidence") != release_evidence
     ):
@@ -219,6 +220,7 @@ def ensure_verified_final_backup(
         "path": str(output_dir),
         "schema_version": BACKUP_SCHEMA_VERSION,
         "verification": "pass",
+        "secret_scan": "pass",
         "manifest": {
             "path": str(manifest_path),
             "bytes": manifest_path.stat().st_size,

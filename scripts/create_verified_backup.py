@@ -15,6 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterable
 
+try:
+    from scripts.release_secret_scan import ReleaseSecretScanner, scan_release_file
+except ModuleNotFoundError:  # Direct execution from the scripts directory.
+    from release_secret_scan import ReleaseSecretScanner, scan_release_file
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 2
@@ -394,8 +399,13 @@ def _verify_tar(
             extracted = tar.extractfile(member)
             if extracted is None:
                 raise RuntimeError(f"Cannot read tar member in {path}: {member.name}")
+            digest = hashlib.sha256()
+            scanner = ReleaseSecretScanner(member.name)
             with extracted:
-                actual_digest = _sha256_stream(extracted)
+                while chunk := extracted.read(8 * 1024 * 1024):
+                    digest.update(chunk)
+                    scanner.feed(chunk)
+            actual_digest = digest.hexdigest()
             if actual_digest != expected["sha256"]:
                 raise RuntimeError(f"Member checksum mismatch in {path}: {member.name}")
 
@@ -419,6 +429,8 @@ def archive(source: Path, destination: Path, excluded: Iterable[Path] = ()) -> d
     if not files:
         raise ValueError(f"Refusing to create an empty backup archive for {source}")
     records = _source_records(files)
+    for path, record in zip(files, records, strict=True):
+        scan_release_file(path, str(record["path"]))
     source_bytes = sum(int(item["bytes"]) for item in records)
     source_name = _absolute(source).relative_to(_absolute(ROOT)).as_posix()
     temporary = _prepare_destination(destination)
@@ -664,6 +676,7 @@ def verify(output_dir: Path) -> dict[str, object]:
         )
     verified = dict(manifest)
     verified["verification"] = "pass"
+    verified["secret_scan"] = "pass"
     return verified
 
 
@@ -683,6 +696,7 @@ def _summary(output_dir: Path, manifest: dict[str, object]) -> dict[str, object]
         "output_dir": str(output_dir),
         "schema_version": manifest["schema_version"],
         "verification": manifest.get("verification"),
+        "secret_scan": manifest.get("secret_scan"),
         "archives": [
             {
                 key: item[key]
