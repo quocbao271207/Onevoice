@@ -29,7 +29,7 @@ from pathlib import Path
 from .audio_frontend import AudioFrontend, AudioConfig
 from .asr_engine import ASREngine, ASRResult
 from .mt_engine import MTEngine, MTResult, validate_mt_source_text
-from .tts_engine import TTSEngine, TTSResult
+from .tts_engine import TTSEngine, TTSResult, validate_tts_audio
 from .flash_cache import FlashCache
 from .safety_guard import validate_translation
 
@@ -121,9 +121,19 @@ class MediVoicePipeline:
             allow_base_fallback=allow_base_fallback,
         )
 
+        tts_cfg = self.config.get("tts", {})
         self.tts_engine = TTSEngine(
-            vi_model_path=self.config.get("tts", {}).get("vi", {}).get("model_path", "models/tts/vi_VN-vivos-x_low.onnx"),
-            en_model_path=self.config.get("tts", {}).get("en", {}).get("model_path", "models/tts/en_US-lessac-medium.onnx"),
+            vi_model_path=tts_cfg.get("vi", {}).get(
+                "model_path",
+                "models/tts/vi_VN-vivos-x_low.onnx",
+            ),
+            en_model_path=tts_cfg.get("en", {}).get(
+                "model_path",
+                "models/tts/en_US-lessac-medium.onnx",
+            ),
+            output_sample_rate=tts_cfg.get("output_sample_rate"),
+            max_text_characters=tts_cfg.get("max_text_characters", 4096),
+            max_duration_seconds=tts_cfg.get("max_duration_seconds", 120.0),
         )
 
         flash_cfg = self.config.get("flash_cache", {})
@@ -323,7 +333,10 @@ class MediVoicePipeline:
                     logger.warning("Cached clinical action requires confirmation; automatic TTS is suppressed.")
                     cached_audio = None
                 else:
-                    cached_audio = cached.audio
+                    cached_audio = validate_tts_audio(
+                        cached.audio,
+                        cached.audio_sample_rate,
+                    )
                 total_latency = (time.perf_counter() - pipeline_start) * 1000
                 self._total_translations += 1
                 return PipelineResult(
@@ -364,6 +377,7 @@ class MediVoicePipeline:
 
         # ===== STAGE 4: TTS (Text → Speech) =====
         output_audio = None
+        output_sample_rate = self.tts_engine.output_sample_rate
         tts_latency = 0.0
         tts_rtf = 0.0
 
@@ -386,6 +400,7 @@ class MediVoicePipeline:
             )
             latency_breakdown["tts_ms"] = (time.perf_counter() - stage_start) * 1000
             output_audio = tts_result.audio
+            output_sample_rate = tts_result.sample_rate
             tts_latency = tts_result.latency_ms
             tts_rtf = tts_result.rtf
 
@@ -407,7 +422,7 @@ class MediVoicePipeline:
             mt_latency_ms=mt_latency,
             from_cache=from_cache,
             output_audio=output_audio,
-            output_sample_rate=self.tts_engine.output_sample_rate,
+            output_sample_rate=output_sample_rate,
             tts_latency_ms=tts_latency,
             tts_rtf=tts_rtf,
             total_latency_ms=total_latency,
