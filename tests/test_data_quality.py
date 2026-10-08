@@ -192,6 +192,47 @@ def test_text_only_pipeline_exposes_swapped_drug_dose_safety_failure(monkeypatch
     )
 
 
+def test_mt_engine_direct_api_exposes_clinical_safety_failure():
+    class FakeInputs(dict):
+        def to(self, _device):
+            return self
+
+    class FakeTokenizer:
+        src_lang = None
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __call__(self, *_args, **_kwargs):
+            return FakeInputs()
+
+        def convert_tokens_to_ids(self, _value):
+            return 2
+
+        def decode(self, _tokens, **_kwargs):
+            return "Dùng aspirin 10 mg và warfarin 5 mg."
+
+    class FakeModel:
+        def generate(self, **_kwargs):
+            return [[2, 3, 1]]
+
+    engine = MTEngine(device="cpu")
+    engine.tokenizer = FakeTokenizer()
+    engine.model = FakeModel()
+    engine._is_loaded = True
+
+    result = engine.translate(
+        "Give aspirin 5 mg and warfarin 10 mg.",
+        "en",
+        "vi",
+    )
+
+    assert not result.safety_passed
+    assert any(
+        issue.startswith("quantity_binding_mismatch")
+        for issue in result.safety_issues
+    )
+
+
 def test_text_only_cache_hit_preserves_confirmation_and_safety_metadata():
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
     pipeline._is_loaded = True

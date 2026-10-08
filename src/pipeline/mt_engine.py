@@ -18,6 +18,8 @@ from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .safety_guard import validate_translation
+
 logger = logging.getLogger(__name__)
 
 
@@ -269,6 +271,19 @@ class MTEngine:
         # Post-process with medical lexicon
         translated_text = self.lexicon.post_process(translated_text, direction)
 
+        terminology = (
+            self.lexicon.vi_to_en
+            if source_lang == "vi"
+            else self.lexicon.en_to_vi
+        )
+        safety = validate_translation(
+            text,
+            translated_text,
+            source_lang,
+            target_lang,
+            terminology,
+        )
+
         latency_ms = (time.perf_counter() - start_time) * 1000
 
         result = MTResult(
@@ -280,6 +295,8 @@ class MTEngine:
             first_token_ms=None,
             tokens_generated=len(generated_tokens),
             from_cache=False,
+            safety_passed=safety.safe,
+            safety_issues=safety.issues,
         )
 
         logger.info(
