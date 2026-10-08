@@ -743,6 +743,7 @@ def test_runtime_base_fallback_is_explicitly_pre_gpu_only():
 
     pipeline = yaml.safe_load(open("configs/pipeline_config.yaml", encoding="utf-8"))
     assert pipeline["runtime"]["allow_base_model_fallback"] is True
+    assert pipeline["runtime"]["allow_text_only_tts_fallback"] is True
     assert ASREngine().allow_base_fallback is False
 
 

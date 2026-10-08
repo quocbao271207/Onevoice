@@ -95,6 +95,9 @@ def print_speech_result(result) -> None:
     )
     print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
     print_confirmation_warning(result)
+    if getattr(result, "degraded_mode", None) == "text_only":
+        code = getattr(result, "degradation_code", None) or "tts_unavailable"
+        print(f"  🔇 Text-only fallback active ({code}); no audio was produced")
     print(f"{'─'*60}\n")
 
 

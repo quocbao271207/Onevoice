@@ -82,7 +82,10 @@ REQUIRED_PIPELINE_CONFIG_SECTIONS = ALLOWED_PIPELINE_CONFIG_SECTIONS - {
 }
 PIPELINE_CONFIG_KEYS = {
     "pipeline": {"mode", "streaming", "language_pairs"},
-    "runtime": {"allow_base_model_fallback"},
+    "runtime": {
+        "allow_base_model_fallback",
+        "allow_text_only_tts_fallback",
+    },
     "audio": {
         "sample_rate",
         "bit_depth",
@@ -222,6 +225,19 @@ class PipelineResult:
     safety_passed: bool = True
     safety_issues: list[str] = field(default_factory=list)
     requires_confirmation: bool = False
+    degraded_mode: Optional[str] = None
+    degradation_code: Optional[str] = None
+
+
+def tts_degradation_code(error: Exception) -> str:
+    """Return a stable public code without exposing backend error details."""
+    if isinstance(error, FileNotFoundError):
+        return "tts_artifact_unavailable"
+    if isinstance(error, OSError):
+        return "tts_device_io_error"
+    if isinstance(error, ValueError):
+        return "tts_output_validation_error"
+    return "tts_runtime_error"
 
 
 class MediVoicePipeline:
@@ -276,6 +292,10 @@ class MediVoicePipeline:
 
         runtime_cfg = self.config.get("runtime", {})
         allow_base_fallback = runtime_cfg.get("allow_base_model_fallback", False)
+        self.allow_text_only_tts_fallback = runtime_cfg.get(
+            "allow_text_only_tts_fallback",
+            False,
+        )
 
         self.asr_engine = ASREngine(
             vi_model_path=asr_cfg.get("vi", {}).get("model_path", "models/asr/phowhisper-small-medical"),
@@ -324,6 +344,7 @@ class MediVoicePipeline:
         # Performance tracking
         self._total_translations = 0
         self._cache_hits = 0
+        self._text_only_tts_fallbacks = 0
         self._latency_history = deque(
             maxlen=MAX_LATENCY_HISTORY_SAMPLES
         )
@@ -422,6 +443,7 @@ class MediVoicePipeline:
         flash_cfg = cls._require_mapping(config, "flash_cache")
         boolean_fields = (
             (runtime_cfg, "allow_base_model_fallback", "runtime"),
+            (runtime_cfg, "allow_text_only_tts_fallback", "runtime"),
             (
                 cls._require_mapping(config, "audio"),
                 "noise_suppression_enabled",
@@ -616,6 +638,7 @@ class MediVoicePipeline:
             "ready": self._is_loaded is True and required_ready,
             "loaded": self._is_loaded is True,
             "flash_cache_enabled": self.flash_cache_enabled,
+            "text_only_tts_fallback_enabled": self.allow_text_only_tts_fallback,
             "components": components,
         }
 
@@ -837,6 +860,8 @@ class MediVoicePipeline:
         output_sample_rate = self.tts_engine.output_sample_rate
         tts_latency = 0.0
         tts_rtf = 0.0
+        degraded_mode = None
+        degradation_code = None
 
         safety = self._translation_safety(
             asr_result.text,
@@ -854,15 +879,32 @@ class MediVoicePipeline:
             logger.warning("Cached clinical action requires confirmation; automatic TTS is suppressed.")
         if not skip_tts and safety.safe and not requires_confirmation:
             stage_start = time.perf_counter()
-            tts_result = self.tts_engine.synthesize(
-                translated_text,
-                language=target_lang,
-            )
-            latency_breakdown["tts_ms"] = (time.perf_counter() - stage_start) * 1000
-            output_audio = tts_result.audio
-            output_sample_rate = tts_result.sample_rate
-            tts_latency = tts_result.latency_ms
-            tts_rtf = tts_result.rtf
+            try:
+                tts_result = self.tts_engine.synthesize(
+                    translated_text,
+                    language=target_lang,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                latency_breakdown["tts_ms"] = (
+                    time.perf_counter() - stage_start
+                ) * 1000
+                if not self.allow_text_only_tts_fallback:
+                    raise
+                degraded_mode = "text_only"
+                degradation_code = tts_degradation_code(exc)
+                logger.error(
+                    "TTS unavailable; preserving safety-passed text-only result "
+                    "degradation_code=%s",
+                    degradation_code,
+                )
+            else:
+                latency_breakdown["tts_ms"] = (
+                    time.perf_counter() - stage_start
+                ) * 1000
+                output_audio = tts_result.audio
+                output_sample_rate = tts_result.sample_rate
+                tts_latency = tts_result.latency_ms
+                tts_rtf = tts_result.rtf
 
         # ===== FINAL: Compute totals =====
         total_latency = (time.perf_counter() - pipeline_start) * 1000
@@ -872,6 +914,8 @@ class MediVoicePipeline:
             total_latency,
             cache_hit=from_cache,
         )
+        if degraded_mode == "text_only":
+            self._text_only_tts_fallbacks += 1
 
         result = PipelineResult(
             source_audio_duration_s=source_audio_duration,
@@ -893,13 +937,16 @@ class MediVoicePipeline:
             safety_passed=safety.safe,
             safety_issues=safety.issues,
             requires_confirmation=requires_confirmation,
+            degraded_mode=degraded_mode,
+            degradation_code=degradation_code,
         )
 
         # Log performance summary
         logger.info(
             "Translation complete route=%s source_lang=%s target_lang=%s "
             "source_chars=%d output_chars=%d safety_passed=%s "
-            "requires_confirmation=%s total_latency_ms=%.0f rtf=%.2f "
+            "requires_confirmation=%s degraded_mode=%s degradation_code=%s "
+            "total_latency_ms=%.0f rtf=%.2f "
             "frontend_ms=%.0f asr_ms=%.0f mt_ms=%.0f tts_ms=%.0f",
             "cache" if from_cache else "model",
             asr_result.language,
@@ -908,6 +955,8 @@ class MediVoicePipeline:
             len(translated_text),
             safety.safe,
             requires_confirmation,
+            degraded_mode,
+            degradation_code,
             total_latency,
             overall_rtf,
             latency_breakdown.get("audio_frontend_ms", 0),
@@ -1081,6 +1130,11 @@ class MediVoicePipeline:
             "total_translations": self._total_translations,
             "cache_hits": self._cache_hits,
             "cache_hit_rate": self._cache_hits / max(1, self._total_translations),
+            "text_only_tts_fallbacks": self._text_only_tts_fallbacks,
+            "text_only_tts_fallback_rate": (
+                self._text_only_tts_fallbacks
+                / max(1, self._total_translations)
+            ),
             "latency_window_samples": latency_samples,
             "latency_window_capacity": MAX_LATENCY_HISTORY_SAMPLES,
             "latency_samples_dropped": max(

@@ -16,6 +16,9 @@ runtime:
   # Needed only before the first fine-tuned checkpoints exist. Set false after
   # GPU outputs are synced so a missing checkpoint can never masquerade as it.
   allow_base_model_fallback: true
+  # ASR/MT remain mandatory. If TTS synthesis alone fails after a safe
+  # translation, preserve the text result and expose a structured degradation.
+  allow_text_only_tts_fallback: true
 
 audio:
   sample_rate: 16000        # 16 kHz

@@ -506,7 +506,7 @@ Latency phải tách:
 
 > **Trạng thái:** prototype hiện là cascaded batch-like pipeline; chưa được phép gọi là streaming production.
 
-> **Safety hardening:** flash cache mặc định chỉ nhận exact normalized phrase, không substring/fuzzy. Câu cache chứa hành động điều trị/thủ thuật được trả về để hiển thị nhưng đặt `requires_confirmation=true` và không tự phát TTS; custom cache phrase mặc định cũng yêu cầu xác nhận trừ khi được review rõ ràng. File-mode CLI chỉ tổng hợp/phát câu loại này sau khi người vận hành nhập chính xác `PLAY`; audio sink tính lại safety từ source/translation ngay trước dispatch nên sửa text hoặc metadata sau inference bị chặn.
+> **Safety hardening:** flash cache mặc định chỉ nhận exact normalized phrase, không substring/fuzzy. Câu cache chứa hành động điều trị/thủ thuật được trả về để hiển thị nhưng đặt `requires_confirmation=true` và không tự phát TTS; custom cache phrase mặc định cũng yêu cầu xác nhận trừ khi được review rõ ràng. File-mode CLI chỉ tổng hợp/phát câu loại này sau khi người vận hành nhập chính xác `PLAY`; audio sink tính lại safety từ source/translation ngay trước dispatch nên sửa text hoặc metadata sau inference bị chặn. ASR và MT vẫn là stage bắt buộc; riêng lỗi vận hành TTS sau một bản dịch đã pass safety có thể hạ cấp theo cấu hình sang text-only, kèm `degraded_mode`/`degradation_code` ổn định và tuyệt đối không phát audio lỗi.
 
 ## 8. Đưa model lên Qualcomm QCS6490
 

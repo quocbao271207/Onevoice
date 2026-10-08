@@ -140,6 +140,8 @@ def main() -> int:
                 "safety_passed": result.safety_passed,
                 "safety_issues": result.safety_issues,
                 "requires_confirmation": result.requires_confirmation,
+                "degraded_mode": result.degraded_mode,
+                "degradation_code": result.degradation_code,
                 "from_cache": result.from_cache,
                 "output_audio": str(output_path.relative_to(ROOT).as_posix()),
                 "output_audio_exists": output_path.is_file(),

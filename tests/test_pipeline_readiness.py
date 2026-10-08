@@ -244,6 +244,7 @@ def test_disabled_cache_is_not_required_for_pipeline_readiness():
     status = pipeline.get_status()
     assert status["ready"] is True
     assert status["flash_cache_enabled"] is False
+    assert status["text_only_tts_fallback_enabled"] is True
     assert status["components"]["flash_cache"] is False
     assert pipeline.flash_cache.load_count == 0
 

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from src.pipeline.orchestrator import MediVoicePipeline
+from src.pipeline.mt_engine import MTResult
+from src.pipeline.orchestrator import MediVoicePipeline, tts_degradation_code
 from src.pipeline.tts_engine import TTSEngine, TTSResult
 
 
@@ -353,3 +354,134 @@ def test_pipeline_applies_tts_boundary_configuration():
     assert pipeline.tts_engine.requested_sample_rate == 22050
     assert pipeline.tts_engine.max_text_characters == 4096
     assert pipeline.tts_engine.max_duration_seconds == 120.0
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (FileNotFoundError("secret path"), "tts_artifact_unavailable"),
+        (OSError("private device detail"), "tts_device_io_error"),
+        (ValueError("private tensor detail"), "tts_output_validation_error"),
+        (RuntimeError("private backend detail"), "tts_runtime_error"),
+    ],
+)
+def test_tts_degradation_codes_are_stable_and_redacted(error, expected_code):
+    assert tts_degradation_code(error) == expected_code
+    assert str(error) not in tts_degradation_code(error)
+
+
+def test_pipeline_preserves_safe_text_when_configured_tts_fallback_fires(
+    monkeypatch,
+    mark_pipeline_ready,
+    caplog,
+):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    mark_pipeline_ready(pipeline)
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        lambda audio, _sample_rate: audio,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="Check the pulse",
+            language="en",
+            confidence=1.0,
+            latency_ms=1.0,
+        ),
+    )
+    monkeypatch.setattr(pipeline.flash_cache, "lookup", lambda *_args: None)
+    monkeypatch.setattr(
+        pipeline.mt_engine,
+        "translate",
+        lambda text, source_lang, target_lang: MTResult(
+            source_text=text,
+            translated_text="Kiểm tra mạch",
+            source_lang=source_lang,
+            target_lang=target_lang,
+            latency_ms=1.0,
+            first_token_ms=None,
+            tokens_generated=3,
+            from_cache=False,
+        ),
+    )
+
+    def fail_tts(*_args, **_kwargs):
+        raise RuntimeError("PATIENT_SECRET_BACKEND_DETAIL")
+
+    monkeypatch.setattr(pipeline.tts_engine, "synthesize", fail_tts)
+    caplog.set_level("INFO", logger="src.pipeline.orchestrator")
+
+    result = pipeline.translate_speech(
+        np.zeros(1600, dtype=np.float32),
+        source_lang="en",
+        target_lang="vi",
+    )
+
+    assert result.safety_passed
+    assert result.translated_text == "Kiểm tra mạch"
+    assert result.output_audio is None
+    assert result.degraded_mode == "text_only"
+    assert result.degradation_code == "tts_runtime_error"
+    assert result.latency_breakdown["tts_ms"] >= 0.0
+    stats = pipeline.get_performance_stats()
+    assert stats["total_translations"] == 1
+    assert stats["text_only_tts_fallbacks"] == 1
+    assert stats["text_only_tts_fallback_rate"] == 1.0
+    assert "PATIENT_SECRET_BACKEND_DETAIL" not in caplog.text
+    assert "degradation_code=tts_runtime_error" in caplog.text
+
+
+def test_pipeline_propagates_tts_failure_when_fallback_is_disabled(
+    monkeypatch,
+    mark_pipeline_ready,
+):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline.allow_text_only_tts_fallback = False
+    mark_pipeline_ready(pipeline)
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        lambda audio, _sample_rate: audio,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="Check the pulse",
+            language="en",
+            confidence=1.0,
+            latency_ms=1.0,
+        ),
+    )
+    monkeypatch.setattr(pipeline.flash_cache, "lookup", lambda *_args: None)
+    monkeypatch.setattr(
+        pipeline.mt_engine,
+        "translate",
+        lambda text, source_lang, target_lang: MTResult(
+            source_text=text,
+            translated_text="Kiểm tra mạch",
+            source_lang=source_lang,
+            target_lang=target_lang,
+            latency_ms=1.0,
+            first_token_ms=None,
+            tokens_generated=3,
+            from_cache=False,
+        ),
+    )
+
+    def fail_tts(*_args, **_kwargs):
+        raise RuntimeError("tts failed")
+
+    monkeypatch.setattr(pipeline.tts_engine, "synthesize", fail_tts)
+
+    with pytest.raises(RuntimeError, match="tts failed"):
+        pipeline.translate_speech(
+            np.zeros(1600, dtype=np.float32),
+            source_lang="en",
+            target_lang="vi",
+        )
+
+    assert pipeline.get_performance_stats()["total_translations"] == 0

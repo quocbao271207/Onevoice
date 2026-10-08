@@ -43,6 +43,30 @@ def test_cli_displays_only_safety_passed_translation():
     assert format_translation_for_display(result) == "Bản dịch an toàn"
 
 
+def test_cli_announces_structured_text_only_degradation(capsys):
+    result = SimpleNamespace(
+        asr_language="en",
+        asr_text="Check the pulse",
+        target_language="vi",
+        translated_text="Kiểm tra mạch",
+        safety_passed=True,
+        safety_issues=[],
+        total_latency_ms=25.0,
+        overall_rtf=0.25,
+        asr_confidence=0.5,
+        from_cache=False,
+        requires_confirmation=False,
+        degraded_mode="text_only",
+        degradation_code="tts_device_io_error",
+    )
+
+    print_speech_result(result)
+
+    output = capsys.readouterr().out
+    assert "Text-only fallback active" in output
+    assert "tts_device_io_error" in output
+
+
 def test_interactive_cli_displays_blocked_result_before_clean_shutdown(capsys):
     unsafe_result = SimpleNamespace(
         asr_language="vi",
