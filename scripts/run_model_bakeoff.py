@@ -17,7 +17,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -53,10 +52,10 @@ from scripts.create_verified_backup import (  # noqa: E402
 )
 from src.data.quality import fingerprint_text  # noqa: E402
 from src.pipeline.evidence_paths import (  # noqa: E402
-    is_link_or_junction,
     resolve_regular_directory_under,
     resolve_regular_file_under,
 )
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity,
@@ -747,99 +746,18 @@ def assert_interrupted_stage_is_not_live(previous: dict[str, Any] | None) -> Non
         )
 
 
-def _checked_write_path(path: Path) -> Path:
-    absolute = Path(os.path.abspath(path))
-    for ancestor in reversed((absolute.parent, *absolute.parent.parents)):
-        if is_link_or_junction(ancestor):
-            raise ValueError(
-                f"Bake-off JSON destination cannot traverse a link: {ancestor}"
-            )
-    absolute.parent.mkdir(parents=True, exist_ok=True)
-    for ancestor in reversed((absolute.parent, *absolute.parent.parents)):
-        if is_link_or_junction(ancestor):
-            raise ValueError(
-                f"Bake-off JSON destination cannot traverse a link: {ancestor}"
-            )
-    if is_link_or_junction(absolute):
-        raise ValueError(f"Bake-off JSON destination cannot be a link: {absolute}")
-    if absolute.exists() and not absolute.is_file():
-        raise ValueError(f"Bake-off JSON destination must be a regular file: {absolute}")
-    return absolute
-
-
-def _sync_directory(path: Path) -> None:
-    if os.name != "posix":
-        return
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def atomic_json(
     path: Path,
     payload: dict[str, Any],
     *,
     maximum_bytes: int = MAX_BAKEOFF_STATE_BYTES,
 ) -> None:
-    """Durably replace one bounded JSON mapping through an owned temp file."""
-    try:
-        encoded = (
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        raise ValueError("Bake-off JSON payload is not serializable") from None
-    if len(encoded) > maximum_bytes:
-        raise ValueError(
-            f"Bake-off JSON payload exceeds {maximum_bytes} bytes"
-        )
-    destination = _checked_write_path(path)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".tmp",
-        dir=destination.parent,
+    write_durable_json(
+        path,
+        payload,
+        maximum_bytes=maximum_bytes,
+        label="Bake-off JSON",
     )
-    temporary = Path(temporary_name)
-    try:
-        handle = os.fdopen(descriptor, "wb")
-        descriptor = -1
-        with handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if os.name == "posix":
-            os.chmod(temporary, 0o600)
-        staged = read_stable_regular_file(
-            temporary,
-            maximum_bytes=maximum_bytes,
-            label="Staged bake-off JSON",
-        )
-        if staged != encoded:
-            raise RuntimeError("Staged bake-off JSON does not match its payload")
-        _checked_write_path(destination)
-        os.replace(temporary, destination)
-        _sync_directory(destination.parent)
-        persisted = read_stable_regular_file(
-            destination,
-            maximum_bytes=maximum_bytes,
-            label="Persisted bake-off JSON",
-        )
-        if persisted != encoded:
-            raise RuntimeError("Persisted bake-off JSON does not match its payload")
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        temporary.unlink(missing_ok=True)
 
 
 def invocation_binding(

@@ -197,6 +197,50 @@ def test_blind_slot_mutex_rejects_concurrent_duplicate_open(tmp_path: Path):
                 pytest.fail("duplicate blind slot mutex was acquired")
 
 
+def test_blind_json_writes_are_strict_bounded_and_crash_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    lock_path = tmp_path / "blind.lock.json"
+    blind.atomic_json(
+        lock_path,
+        {"status": "locked_unopened"},
+        maximum_bytes=1_000,
+    )
+    persisted = lock_path.read_bytes()
+    assert persisted.endswith(b"\n")
+    assert json.loads(persisted) == {"status": "locked_unopened"}
+    assert not list(tmp_path.glob(".blind.lock.json.*.tmp"))
+
+    with pytest.raises(ValueError, match="not serializable"):
+        blind.atomic_json(
+            lock_path,
+            {"unsafe": float("nan")},
+            maximum_bytes=1_000,
+        )
+    with pytest.raises(ValueError, match="exceeds 20 bytes"):
+        blind.atomic_json(
+            lock_path,
+            {"payload": "too large"},
+            maximum_bytes=20,
+        )
+    assert lock_path.read_bytes() == persisted
+
+    monkeypatch.setattr(
+        blind.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+    with pytest.raises(OSError, match="write failed"):
+        blind.atomic_json(
+            lock_path,
+            {"status": "opened"},
+            maximum_bytes=1_000,
+        )
+    assert lock_path.read_bytes() == persisted
+    assert not list(tmp_path.glob(".blind.lock.json.*.tmp"))
+
+
 def test_placeholder_blind_lock_cannot_be_opened():
     root = Path(__file__).resolve().parents[1]
     with pytest.raises(ValueError, match="not locked"):

@@ -28,6 +28,7 @@ from src.pipeline.evidence_paths import (  # noqa: E402
     resolve_regular_file,
     resolve_regular_file_under,
 )
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.license_policy import license_decisions  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     configured_selection_hashes,
@@ -144,10 +145,18 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+def atomic_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    maximum_bytes: int = MAX_BLIND_REPORT_BYTES,
+) -> None:
+    write_durable_json(
+        path,
+        payload,
+        maximum_bytes=maximum_bytes,
+        label="Blind JSON",
+    )
 
 
 def _mutex_path(lock_path: Path, scope: str) -> Path:
@@ -702,7 +711,7 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
         "selection": None,
         "opened": {"mt": {"en_to_vi": None, "vi_to_en": None}, "asr": None},
     }
-    atomic_json(lock_path, locked)
+    atomic_json(lock_path, locked, maximum_bytes=MAX_BLIND_LOCK_BYTES)
     return locked
 
 
@@ -1384,7 +1393,7 @@ def _evaluate_slot(
                 if mt_done and lock["opened"]["asr"]
                 else "partially_opened"
             )
-            atomic_json(lock_path, lock)
+            atomic_json(lock_path, lock, maximum_bytes=MAX_BLIND_LOCK_BYTES)
 
     if not report_path.is_file():
         command = [
@@ -1468,6 +1477,7 @@ def _evaluate_slot(
                 "report_sha256": sha256(report_path),
                 "resource_run": monitored,
             },
+            maximum_bytes=MAX_BLIND_PROVENANCE_BYTES,
         )
     provenance = verify_report_provenance(
         report_path,
@@ -1527,7 +1537,11 @@ def _evaluate_slot(
         "quality_failures": quality_failed,
         "promotion_allowed": not failed and not coverage_failed and not quality_failed,
     }
-    atomic_json(output_dir / f"{stem}_gate.json", result)
+    atomic_json(
+        output_dir / f"{stem}_gate.json",
+        result,
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
     with exclusive_mutex(_mutex_path(lock_path, "state")):
         lock = verify_lock(lock_path)
         slot, key = opening_slot(lock, args.task, args.direction)
@@ -1539,7 +1553,7 @@ def _evaluate_slot(
         lock["status"] = (
             "opened" if mt_done and lock["opened"]["asr"] else "partially_opened"
         )
-        atomic_json(lock_path, lock)
+        atomic_json(lock_path, lock, maximum_bytes=MAX_BLIND_LOCK_BYTES)
     return result
 
 
