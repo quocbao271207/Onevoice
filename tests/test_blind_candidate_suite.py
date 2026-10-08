@@ -9,12 +9,14 @@ import pytest
 import yaml
 
 from scripts.run_blind_candidate_suite import (
+    _mutex_path,
     adapter_tree_manifest,
     blind_report_coverage_failures,
     blind_quality_failures,
     coverage_counts,
     ensure_unseen,
     evaluate,
+    exclusive_mutex,
     load_locked_accuracy_config,
     sha256,
     validate_content_integrity,
@@ -66,6 +68,11 @@ def write_lock(path: Path, mt: Path, asr: Path) -> None:
                         "coverage": asr_coverage,
                     },
                 },
+                "selection": None,
+                "opened": {
+                    "mt": {"en_to_vi": None, "vi_to_en": None},
+                    "asr": None,
+                },
             }
         ),
         encoding="utf-8",
@@ -110,6 +117,31 @@ def test_blind_lock_rejects_legacy_schema(tmp_path: Path):
 
     with pytest.raises(ValueError, match="schema version 2"):
         verify_lock(lock)
+
+
+def test_blind_lock_status_must_match_opened_slots(tmp_path: Path):
+    mt = tmp_path / "mt.jsonl"
+    asr = tmp_path / "asr.jsonl"
+    mt.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr.write_text('{"id":"asr"}\n', encoding="utf-8")
+    lock = tmp_path / "lock.json"
+    write_lock(lock, mt, asr)
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    payload["status"] = "partially_opened"
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="status does not match opened slots"):
+        verify_lock(lock)
+
+
+def test_blind_slot_mutex_rejects_concurrent_duplicate_open(tmp_path: Path):
+    lock_path = tmp_path / "blind.lock.json"
+    mutex = _mutex_path(lock_path, "slot-mt-en_to_vi")
+
+    with exclusive_mutex(mutex):
+        with pytest.raises(RuntimeError, match="already active"):
+            with exclusive_mutex(mutex):
+                pytest.fail("duplicate blind slot mutex was acquired")
 
 
 def test_placeholder_blind_lock_cannot_be_opened():

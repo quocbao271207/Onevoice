@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import yaml
 
@@ -77,6 +80,54 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def _mutex_path(lock_path: Path, scope: str) -> Path:
+    normalized_lock = os.path.normcase(str(lock_path.resolve()))
+    identity = hashlib.sha256(
+        f"{normalized_lock}\x00{scope}".encode("utf-8")
+    ).hexdigest()
+    return Path(tempfile.gettempdir()) / "onevoice-blind-locks" / f"{identity}.lock"
+
+
+@contextmanager
+def exclusive_mutex(path: Path) -> Iterator[None]:
+    """Hold one crash-safe, non-blocking host mutex for a blind transaction."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(
+                "Blind evaluation is already active for this scope"
+            ) from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def leakage_values(task: str, rows: list[dict[str, Any]]) -> set[str]:
@@ -558,6 +609,112 @@ def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str,
     return locked
 
 
+def _validate_opened_slots(lock: dict[str, Any]) -> None:
+    opened = lock.get("opened")
+    if (
+        not isinstance(opened, dict)
+        or set(opened) != {"mt", "asr"}
+        or not isinstance(opened.get("mt"), dict)
+        or set(opened["mt"]) != {"en_to_vi", "vi_to_en"}
+    ):
+        raise ValueError("Blind opened-slot structure is invalid")
+    records = [
+        ("mt", "en_to_vi", opened["mt"]["en_to_vi"]),
+        ("mt", "vi_to_en", opened["mt"]["vi_to_en"]),
+        ("asr", None, opened["asr"]),
+    ]
+    opened_count = sum(record is not None for _, _, record in records)
+    expected_status = (
+        "locked_unopened"
+        if opened_count == 0
+        else "opened" if opened_count == len(records) else "partially_opened"
+    )
+    if lock.get("status") != expected_status:
+        raise ValueError("Blind status does not match opened slots")
+    selection = lock.get("selection")
+    if not opened_count and selection is not None:
+        raise ValueError("Blind unopened suite cannot bind a selection")
+    if opened_count and not isinstance(selection, dict):
+        raise ValueError("Blind opened slots lack a bound selection")
+    specification_fields = {
+        "candidate",
+        "model",
+        "revision",
+        "adapter",
+        "adapter_manifest_sha256",
+        "selection_sha256",
+        "blind_manifest_sha256",
+        "direction",
+        "scope",
+    }
+    for task, direction, record in records:
+        if record is None:
+            continue
+        allowed_fields = specification_fields | {
+            "candidate_sha256",
+            "opened_at",
+            "result",
+        }
+        if not isinstance(record, dict) or not set(record).issubset(
+            allowed_fields
+        ):
+            raise ValueError(f"Blind opened slot {task}/{direction or 'vi'} is invalid")
+        if not specification_fields.issubset(record):
+            raise ValueError(f"Blind opened slot {task}/{direction or 'vi'} is incomplete")
+        specification = {field: record[field] for field in specification_fields}
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                specification,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        if record.get("candidate_sha256") != expected_digest:
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} candidate digest mismatch"
+            )
+        if record.get("direction") != direction:
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} direction mismatch"
+            )
+        if record.get("scope") not in {"research", "production"}:
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} scope is invalid"
+            )
+        if record.get("selection_sha256") != selection.get("sha256"):
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} selection mismatch"
+            )
+        if record.get("blind_manifest_sha256") != lock["manifests"][task]["sha256"]:
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} manifest mismatch"
+            )
+        for field in ("candidate_sha256", "adapter_manifest_sha256"):
+            value = str(record.get(field) or "")
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(
+                    f"Blind opened slot {task}/{direction or 'vi'} {field} is invalid"
+                )
+        try:
+            opened_at = datetime.fromisoformat(
+                str(record.get("opened_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} timestamp is invalid"
+            ) from exc
+        if opened_at.tzinfo is None:
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} timestamp is invalid"
+            )
+        if "result" in record and not isinstance(record["result"], dict):
+            raise ValueError(
+                f"Blind opened slot {task}/{direction or 'vi'} result is invalid"
+            )
+
+
 def verify_lock(lock_path: Path) -> dict[str, Any]:
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
     if lock.get("version") != 2:
@@ -582,9 +739,12 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
             raise ValueError(f"Blind {task} coverage record mismatch")
     selection = lock.get("selection")
     if selection:
+        if not isinstance(selection, dict) or set(selection) != {"path", "sha256"}:
+            raise ValueError("Blind selection comparison record is invalid")
         path = Path(selection["path"])
         if not path.is_file() or sha256(path) != selection["sha256"]:
             raise ValueError("Blind selection comparison checksum mismatch")
+    _validate_opened_slots(lock)
     return lock
 
 
@@ -666,10 +826,11 @@ def opening_slot(lock: dict[str, Any], task: str, direction: str | None) -> tupl
     return lock["opened"], "asr"
 
 
-def evaluate(
+def _evaluate_slot(
     args: argparse.Namespace, lock_path: Path, config: dict[str, Any]
 ) -> dict[str, Any]:
     lock = verify_lock(lock_path)
+    _, key = opening_slot(lock, args.task, args.direction)
     candidate = candidate_from_config(config, args.task, args.candidate)
     if args.scope == "production" and not candidate["license"].get("production_eligible"):
         raise ValueError("Candidate license is not approved for production promotion")
@@ -686,10 +847,6 @@ def evaluate(
         "path": selection["path"],
         "sha256": selection["sha256"],
     }
-    existing_selection = lock.get("selection")
-    if existing_selection is not None and existing_selection != selection_record:
-        raise ValueError("Blind suite was already bound to another selection comparison")
-    slot, key = opening_slot(lock, args.task, args.direction)
     specification = {
         "candidate": args.candidate,
         "model": candidate["model"],
@@ -718,14 +875,31 @@ def evaluate(
             selection["sha256"],
         )
 
-    previous = slot.get(key)
-    if previous and previous.get("candidate_sha256") != digest:
-        raise ValueError(f"Blind slot {args.task}/{key} was already opened for another candidate")
-    if previous is None:
-        lock["selection"] = selection_record
-        slot[key] = {**specification, "candidate_sha256": digest, "opened_at": utc_now()}
-        lock["status"] = "partially_opened"
-        atomic_json(lock_path, lock)
+    with exclusive_mutex(_mutex_path(lock_path, "state")):
+        lock = verify_lock(lock_path)
+        existing_selection = lock.get("selection")
+        if existing_selection is not None and existing_selection != selection_record:
+            raise ValueError("Blind suite was already bound to another selection comparison")
+        slot, key = opening_slot(lock, args.task, args.direction)
+        previous = slot.get(key)
+        if previous and previous.get("candidate_sha256") != digest:
+            raise ValueError(
+                f"Blind slot {args.task}/{key} was already opened for another candidate"
+            )
+        if previous is None:
+            lock["selection"] = selection_record
+            slot[key] = {
+                **specification,
+                "candidate_sha256": digest,
+                "opened_at": utc_now(),
+            }
+            mt_done = all(lock["opened"]["mt"].values())
+            lock["status"] = (
+                "opened"
+                if mt_done and lock["opened"]["asr"]
+                else "partially_opened"
+            )
+            atomic_json(lock_path, lock)
 
     if not report_path.is_file():
         command = [
@@ -869,11 +1043,31 @@ def evaluate(
         "promotion_allowed": not failed and not coverage_failed and not quality_failed,
     }
     atomic_json(output_dir / f"{stem}_gate.json", result)
-    slot[key]["result"] = result
-    mt_done = all(lock["opened"]["mt"].values())
-    lock["status"] = "opened" if mt_done and lock["opened"]["asr"] else "partially_opened"
-    atomic_json(lock_path, lock)
+    with exclusive_mutex(_mutex_path(lock_path, "state")):
+        lock = verify_lock(lock_path)
+        slot, key = opening_slot(lock, args.task, args.direction)
+        current = slot.get(key)
+        if not isinstance(current, dict) or current.get("candidate_sha256") != digest:
+            raise ValueError(f"Blind slot {args.task}/{key} changed during evaluation")
+        current["result"] = result
+        mt_done = all(lock["opened"]["mt"].values())
+        lock["status"] = (
+            "opened" if mt_done and lock["opened"]["asr"] else "partially_opened"
+        )
+        atomic_json(lock_path, lock)
     return result
+
+
+def evaluate(
+    args: argparse.Namespace, lock_path: Path, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Evaluate one blind slot while preventing concurrent duplicate opens."""
+    if args.task == "mt" and args.direction not in {"en_to_vi", "vi_to_en"}:
+        raise ValueError("MT blind evaluation requires one explicit direction")
+    key = str(args.direction) if args.task == "mt" else "asr"
+    scope = f"slot-{args.task}-{key}"
+    with exclusive_mutex(_mutex_path(lock_path, scope)):
+        return _evaluate_slot(args, lock_path, config)
 
 
 def main() -> int:
