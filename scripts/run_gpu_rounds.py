@@ -28,6 +28,52 @@ SPAWN_CAPACITY_HISTORY_MARGIN_MIB = 2048.0
 SPAWN_CAPACITY_REQUIRED_CONSECUTIVE_SAMPLES = 2
 
 from scripts.candidate_evidence import archive_evidence, evidence_sidecars  # noqa: E402
+from src.pipeline.durable_file import write_durable_bytes  # noqa: E402
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.evidence_paths import is_link_or_junction  # noqa: E402
+from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
+
+
+MAX_GPU_SUMMARY_BYTES = 10_000_000
+MAX_TRAINING_REPORT_BYTES = 10_000_000
+MAX_ROUND_COMMAND_BYTES = 1_000_000
+
+
+def write_round_summary(path: Path, summary: dict[str, Any]) -> None:
+    write_durable_json(
+        path,
+        summary,
+        maximum_bytes=MAX_GPU_SUMMARY_BYTES,
+        label="GPU training summary",
+    )
+
+
+def write_round_command(path: Path, command: list[str]) -> None:
+    if not command or any(not isinstance(value, str) or not value for value in command):
+        raise ValueError("GPU round command must contain non-empty strings")
+    try:
+        payload = (
+            json.dumps(command, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("GPU round command is not strict JSON") from None
+    write_durable_bytes(
+        path,
+        payload,
+        maximum_bytes=MAX_ROUND_COMMAND_BYTES,
+        label="GPU round command",
+    )
+
+
+def read_training_report(path: Path) -> dict[str, Any]:
+    present = path.exists() or is_link_or_junction(path)
+    if not present:
+        return {}
+    return read_stable_json_mapping(
+        path,
+        maximum_bytes=MAX_TRAINING_REPORT_BYTES,
+        label="GPU training report",
+    ).mapping
 
 
 def validate_resource_limits(limits: dict[str, Any]) -> tuple[float, float]:
@@ -521,12 +567,27 @@ def archive_round(round_dir: Path) -> dict[str, Any]:
 
 
 def metric_from_report(report: dict[str, Any], name: str) -> float | None:
-    if report.get("best_metric") is not None:
-        return float(report["best_metric"])
-    for item in reversed(report.get("log_history", [])):
-        if name in item:
-            return float(item[name])
-    return None
+    candidate: Any = report.get("best_metric")
+    if candidate is None:
+        history = report.get("log_history", [])
+        if not isinstance(history, list):
+            raise ValueError("Training report log_history must be a list")
+        candidate = next(
+            (
+                item[name]
+                for item in reversed(history)
+                if isinstance(item, dict) and name in item
+            ),
+            None,
+        )
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool) or not isinstance(candidate, (int, float)):
+        raise ValueError(f"Training selection metric {name!r} must be numeric")
+    metric = float(candidate)
+    if not math.isfinite(metric):
+        raise ValueError(f"Training selection metric {name!r} must be finite")
+    return metric
 
 
 def configured_rounds(
@@ -816,10 +877,13 @@ def main() -> int:
     summary: dict[str, Any] = {
         "task": args.task,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "running",
         "config": str(args.config.resolve()),
         "limits": limits,
         "rounds": [],
     }
+    summary_path = run_root / "summary.json"
+    write_round_summary(summary_path, summary)
 
     for index, round_config in enumerate(rounds, 1):
         name = str(round_config["name"])
@@ -834,9 +898,7 @@ def main() -> int:
             "output_dir": model_dir,
         }
         command = [args.python, "-m", task["module"], *cli_args(values)]
-        (round_dir / "command.json").write_text(
-            json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        write_round_command(round_dir / "command.json", command)
         if args.dry_run:
             summary["rounds"].append({"name": name, "command": command, "status": "dry_run"})
             continue
@@ -904,7 +966,7 @@ def main() -> int:
                 "log": str(watcher_log_path),
             }
         report_path = model_dir / "training_run.json"
-        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+        report = read_training_report(report_path)
         training_complete = monitor_summary["return_code"] == 0
         watcher_complete = watcher_summary["return_code"] == 0
         result = {
@@ -936,9 +998,7 @@ def main() -> int:
                     ),
                 }
             )
-        (run_root / "summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        write_round_summary(summary_path, summary)
         if not training_complete or not watcher_complete:
             break
         if adaptive_spec and not adaptive_appended and index == initial_round_count:
@@ -959,9 +1019,7 @@ def main() -> int:
                 "resolved_config": adaptive_round,
             }
             summary["pilot_selected_round"] = source_round
-            (run_root / "summary.json").write_text(
-                json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            write_round_summary(summary_path, summary)
 
     if adaptive_spec and args.dry_run:
         summary["adaptive_final"] = {
@@ -985,9 +1043,7 @@ def main() -> int:
         or summary.get("adaptive_final", {}).get("status") == "complete"
     )
     summary["status"] = "complete" if rounds_complete and adaptive_complete else "failed"
-    (run_root / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    write_round_summary(summary_path, summary)
     print(json.dumps({"run_root": str(run_root), **summary}, ensure_ascii=False, indent=2))
     return 0 if summary["status"] == "complete" else 1
 

@@ -25,21 +25,31 @@ from scripts.candidate_evidence import (  # noqa: E402
     archive_evidence,
     evidence_sidecars,
     read_json,
-    sha256,
 )
 from scripts.run_gpu_rounds import (  # noqa: E402
     monitor_process,
     wait_for_gpu_spawn_capacity,
 )
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
 
 
 BASE_MODEL = "vinai/PhoWhisper-small"
 BASE_REVISION = "a86b604c346caf7148c37512eafe783a16420adb"
+MAX_LOCKED_MANIFEST_BYTES = 250_000_000
+MAX_LOCKED_MANIFEST_LINE_BYTES = 2_000_000
+MAX_LOCKED_MANIFEST_ROWS = 100_000
+MAX_CANDIDATE_GATE_BYTES = 10_000_000
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+def read_locked_manifest(path: Path, *, label: str):
+    return read_stable_jsonl_mappings(
+        path,
+        maximum_bytes=MAX_LOCKED_MANIFEST_BYTES,
+        maximum_line_bytes=MAX_LOCKED_MANIFEST_LINE_BYTES,
+        maximum_rows=MAX_LOCKED_MANIFEST_ROWS,
+        label=label,
+    )
 
 
 def validate_locked_inputs(
@@ -47,16 +57,21 @@ def validate_locked_inputs(
 ) -> dict[str, str]:
     """Verify hashes and prove the clinical suite is an exact test-set subset."""
     lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+    test_document = read_locked_manifest(test_path, label="Locked ASR test manifest")
+    safety_document = read_locked_manifest(
+        safety_path,
+        label="Locked ASR safety manifest",
+    )
     configured_safety = (ROOT / config["evaluation"]["locked_asr_safety_suite"]).resolve()
     configured_test = (ROOT / "data/processed/manifests/asr--test-local.jsonl").resolve()
-    if safety_path.resolve() != configured_safety:
+    if safety_document.path != configured_safety:
         raise ValueError(f"Safety suite is not the configured locked artifact: {safety_path}")
-    if test_path.resolve() != configured_test:
+    if test_document.path != configured_test:
         raise ValueError(f"Test manifest is not the configured locked artifact: {test_path}")
 
     hashes = {
-        "test": sha256(test_path),
-        "safety": sha256(safety_path),
+        "test": test_document.sha256,
+        "safety": safety_document.sha256,
     }
     expected = {
         "test": lock["manifests"]["asr_test_local_sha256"],
@@ -66,8 +81,8 @@ def validate_locked_inputs(
         if hashes[name] != expected[name]:
             raise ValueError(f"Locked {name} checksum mismatch: {hashes[name]} != {expected[name]}")
 
-    test_rows = {row["id"]: row for row in read_jsonl(test_path)}
-    safety_rows = read_jsonl(safety_path)
+    test_rows = {row["id"]: row for row in test_document.rows}
+    safety_rows = safety_document.rows
     if len({row["id"] for row in safety_rows}) != len(safety_rows):
         raise ValueError("Locked ASR safety suite contains duplicate IDs")
     observed_categories = set()
@@ -167,6 +182,7 @@ def run_benchmark(
     num_beams: int,
     gpu_memory_fraction: float,
     utilization_limits: dict[str, Any],
+    manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -201,6 +217,8 @@ def run_benchmark(
         str(output_dir),
         "--resume-scoring",
     ]
+    if manifest_sha256 is not None:
+        command.extend(("--manifest-sha256", manifest_sha256))
     log_path = output_dir / f"{name}.log"
     spawn_capacity = None
     if device != "cpu":
@@ -299,6 +317,7 @@ def main() -> int:
             num_beams=args.num_beams,
             gpu_memory_fraction=args.gpu_memory_fraction,
             utilization_limits=utilization_limits,
+            manifest_sha256=locked_hashes["test"],
         )
         resources["clinical"] = run_benchmark(
             adapter=args.adapter,
@@ -311,6 +330,7 @@ def main() -> int:
             num_beams=args.num_beams,
             gpu_memory_fraction=args.gpu_memory_fraction,
             utilization_limits=utilization_limits,
+            manifest_sha256=locked_hashes["safety"],
         )
         checks = candidate_checks(
             config,
@@ -341,8 +361,11 @@ def main() -> int:
             "code-switch transcription-preservation slice must pass."
         ),
     }
-    (output_dir / "candidate_gate.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    write_durable_json(
+        output_dir / "candidate_gate.json",
+        summary,
+        maximum_bytes=MAX_CANDIDATE_GATE_BYTES,
+        label="ASR candidate gate",
     )
     archive_path, archive_sha256 = archive_evidence(output_dir)
     archive_checksum, archive_manifest = evidence_sidecars(archive_path)

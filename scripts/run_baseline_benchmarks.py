@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import time
 from collections import defaultdict
@@ -79,6 +80,7 @@ PROVENANCE_KEYS = {
     "runtime",
 }
 PREDICTION_RECORD_KEYS = {"path", "bytes", "sha256", "rows"}
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def read_jsonl(
@@ -353,6 +355,19 @@ def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, A
         ),
         "bakeoff_runner_sha256": getattr(args, "bakeoff_runner_sha256", None),
     }
+
+
+def validate_manifest_sha256_claim(
+    specification: dict[str, Any],
+    claimed_sha256: str | None,
+) -> None:
+    if claimed_sha256 is None:
+        return
+    if not isinstance(claimed_sha256, str) or not SHA256_RE.fullmatch(claimed_sha256):
+        raise ValueError("--manifest-sha256 must be a lowercase SHA-256 digest")
+    manifest = specification.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("sha256") != claimed_sha256:
+        raise ValueError("Benchmark manifest does not match --manifest-sha256")
 
 
 def write_prediction_checkpoint(
@@ -816,6 +831,10 @@ def main() -> int:
     parser.add_argument("--language", choices=["vi", "en"], default="vi", help="ASR benchmark language.")
     parser.add_argument("--name", help="Artifact stem; defaults to task/language-specific base name.")
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument(
+        "--manifest-sha256",
+        help="Expected locked manifest digest, checked before model loading.",
+    )
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-beams", type=int, help="Beam width; defaults to 1 for ASR and 4 for MT.")
@@ -863,6 +882,10 @@ def main() -> int:
     stem = args.name or (f"asr_{args.language}_base" if args.task == "asr" else "mt_base")
     prediction_path = args.output_dir / f"{stem}_predictions.jsonl"
     checkpoint_specification = prediction_checkpoint_specification(args)
+    validate_manifest_sha256_claim(
+        checkpoint_specification,
+        args.manifest_sha256,
+    )
     checkpoint = (
         load_verified_prediction_checkpoint(prediction_path, checkpoint_specification)
         if args.resume_scoring

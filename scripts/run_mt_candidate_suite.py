@@ -24,29 +24,69 @@ from scripts.candidate_evidence import (  # noqa: E402
     archive_evidence,
     evidence_sidecars,
     read_json,
-    sha256,
 )
 from scripts.run_gpu_rounds import (  # noqa: E402
     monitor_process,
     wait_for_gpu_spawn_capacity,
 )
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
 
 
 BASE_MODEL = "facebook/nllb-200-distilled-600M"
 BASE_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
 DEFAULT_NUM_BEAMS = 1
+MAX_LOCKED_SUITE_BYTES = 250_000_000
+MAX_LOCKED_SUITE_LINE_BYTES = 2_000_000
+MAX_LOCKED_SUITE_ROWS = 100_000
+MAX_CANDIDATE_GATE_BYTES = 10_000_000
 
 
-def validate_locked_suite(config: dict[str, Any], suite_path: Path, lock_path: Path) -> str:
+def _read_locked_manifest(path: Path, *, label: str):
+    return read_stable_jsonl_mappings(
+        path,
+        maximum_bytes=MAX_LOCKED_SUITE_BYTES,
+        maximum_line_bytes=MAX_LOCKED_SUITE_LINE_BYTES,
+        maximum_rows=MAX_LOCKED_SUITE_ROWS,
+        label=label,
+    )
+
+
+def validate_locked_inputs(
+    config: dict[str, Any],
+    test_path: Path,
+    suite_path: Path,
+    lock_path: Path,
+) -> dict[str, str]:
     lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
-    expected = lock["evaluation"]["medical_safety_mt_sha256"]
-    actual = sha256(suite_path)
+    test_document = _read_locked_manifest(
+        test_path,
+        label="Locked MT test manifest",
+    )
+    safety_document = _read_locked_manifest(
+        suite_path,
+        label="Locked MT safety suite",
+    )
     configured = (ROOT / config["evaluation"]["locked_mt_safety_suite"]).resolve()
-    if suite_path.resolve() != configured:
+    configured_test = (ROOT / "data/processed/manifests/mt--test.jsonl").resolve()
+    if safety_document.path != configured:
         raise ValueError(f"Safety suite is not the configured locked artifact: {suite_path}")
-    if actual != expected:
-        raise ValueError(f"Locked safety suite checksum mismatch: {actual} != {expected}")
-    return actual
+    if test_document.path != configured_test:
+        raise ValueError(f"Test manifest is not the configured locked artifact: {test_path}")
+    hashes = {
+        "test": test_document.sha256,
+        "safety": safety_document.sha256,
+    }
+    expected = {
+        "test": lock["manifests"]["mt_test_sha256"],
+        "safety": lock["evaluation"]["medical_safety_mt_sha256"],
+    }
+    for name, digest in hashes.items():
+        if digest != expected[name]:
+            raise ValueError(
+                f"Locked {name} checksum mismatch: {digest} != {expected[name]}"
+            )
+    return hashes
 
 
 def candidate_checks(
@@ -109,6 +149,7 @@ def run_benchmark(
     num_beams: int,
     gpu_memory_fraction: float,
     utilization_limits: dict[str, Any],
+    manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     command = [
         sys.executable,
@@ -141,6 +182,8 @@ def run_benchmark(
         str(output_dir),
         "--resume-scoring",
     ]
+    if manifest_sha256 is not None:
+        command.extend(("--manifest-sha256", manifest_sha256))
     log_path = output_dir / f"{name}.log"
     spawn_capacity = None
     if device != "cpu":
@@ -215,7 +258,12 @@ def main() -> int:
         raise ValueError(
             "Candidate memory fraction must match the centrally configured GPU resource limit"
         )
-    suite_sha256 = validate_locked_suite(config, args.safety_manifest, args.artifact_lock)
+    locked_hashes = validate_locked_inputs(
+        config,
+        args.test_manifest,
+        args.safety_manifest,
+        args.artifact_lock,
+    )
 
     status = "error"
     error: str | None = None
@@ -233,6 +281,7 @@ def main() -> int:
             num_beams=args.num_beams,
             gpu_memory_fraction=args.gpu_memory_fraction,
             utilization_limits=utilization_limits,
+            manifest_sha256=locked_hashes["test"],
         )
         resources["clinical"] = run_benchmark(
             adapter=args.adapter,
@@ -245,6 +294,7 @@ def main() -> int:
             num_beams=args.num_beams,
             gpu_memory_fraction=args.gpu_memory_fraction,
             utilization_limits=utilization_limits,
+            manifest_sha256=locked_hashes["safety"],
         )
         checks = candidate_checks(
             config,
@@ -264,7 +314,8 @@ def main() -> int:
         "base_model_revision": BASE_REVISION,
         "test_manifest": str(args.test_manifest.resolve()),
         "locked_safety_manifest": str(args.safety_manifest.resolve()),
-        "locked_safety_sha256": suite_sha256,
+        "locked_safety_sha256": locked_hashes["safety"],
+        "locked_hashes": locked_hashes,
         "checks": checks,
         "resource_limits": utilization_limits,
         "resource_runs": resources,
@@ -274,8 +325,11 @@ def main() -> int:
             "drug-name, dose, number, unit, negation, terminology, and code-switch slice must pass."
         ),
     }
-    (output_dir / "candidate_gate.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    write_durable_json(
+        output_dir / "candidate_gate.json",
+        summary,
+        maximum_bytes=MAX_CANDIDATE_GATE_BYTES,
+        label="MT candidate gate",
     )
     archive_path, archive_sha256 = archive_evidence(output_dir)
     archive_checksum, archive_manifest = evidence_sidecars(archive_path)

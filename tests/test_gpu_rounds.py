@@ -22,17 +22,61 @@ from scripts.run_gpu_rounds import (
     exact_process_memory_attribution,
     gpu_spawn_capacity,
     historical_peak_process_memory,
+    metric_from_report,
     process_pid_aliases,
+    read_training_report,
     resolve_adaptive_final,
     select_completed_round,
     utilization_throttle_reason,
     validate_resource_limits,
     wait_for_gpu_spawn_capacity,
+    write_round_command,
+    write_round_summary,
 )
 from scripts.candidate_evidence import verify_evidence_archive
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_gpu_summary_and_command_writers_are_strict_and_crash_durable(
+    tmp_path: Path,
+):
+    summary_path = tmp_path / "summary.json"
+    command_path = tmp_path / "command.json"
+    write_round_summary(summary_path, {"status": "running", "rounds": []})
+    write_round_command(command_path, ["python", "-m", "trainer"])
+    persisted_summary = summary_path.read_bytes()
+    persisted_command = command_path.read_bytes()
+
+    with pytest.raises(ValueError, match="not serializable"):
+        write_round_summary(summary_path, {"metric": math.nan})
+    with pytest.raises(ValueError, match="non-empty strings"):
+        write_round_command(command_path, ["python", ""])
+
+    assert summary_path.read_bytes() == persisted_summary
+    assert command_path.read_bytes() == persisted_command
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_training_report_reader_and_metric_fail_closed(tmp_path: Path):
+    report = tmp_path / "training_run.json"
+    report.write_text(
+        '{"best_metric":0.5,"best_metric":0.4}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        read_training_report(report)
+
+    assert read_training_report(tmp_path / "absent.json") == {}
+    with pytest.raises(ValueError, match="finite"):
+        metric_from_report({"best_metric": math.nan}, "eval_loss")
+    with pytest.raises(ValueError, match="must be a list"):
+        metric_from_report({"log_history": {}}, "eval_loss")
+    assert metric_from_report(
+        {"log_history": [{"step": 1}, {"eval_loss": 0.25}]},
+        "eval_loss",
+    ) == 0.25
 
 
 def test_gpu_round_policy_keeps_uniform_headroom_below_75_percent():

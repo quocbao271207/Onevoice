@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
 import scripts.candidate_evidence as candidate_evidence
 import scripts.run_asr_candidate_suite as asr_suite
@@ -35,12 +37,15 @@ from scripts.run_baseline_benchmarks import (
     validate_asr_batch_audio_duration,
     validate_asr_batch_generation_completed,
     validate_bakeoff_runner_generation,
+    validate_manifest_sha256_claim,
     validate_mt_batch_source_lengths,
     validate_mt_batch_generation_completed,
     write_prediction_checkpoint,
     write_predictions_checkpoint,
 )
 from scripts.run_asr_candidate_suite import candidate_checks as asr_candidate_checks
+from scripts.run_asr_candidate_suite import validate_locked_inputs as validate_asr_locked_inputs
+from scripts.run_mt_candidate_suite import validate_locked_inputs as validate_mt_locked_inputs
 from scripts.run_mt_candidate_suite import candidate_checks as mt_candidate_checks
 
 
@@ -59,8 +64,9 @@ def test_candidate_gpu_benchmark_waits_for_spawn_capacity(
         }
 
     class Process:
-        def __init__(self, *_args, **_kwargs):
+        def __init__(self, command, *_args, **_kwargs):
             assert events == ["capacity"]
+            assert command[-2:] == ["--manifest-sha256", "a" * 64]
             events.append("spawn")
 
     def monitor(_process, _path: Path, _limits: dict) -> dict:
@@ -84,10 +90,95 @@ def test_candidate_gpu_benchmark_waits_for_spawn_capacity(
         num_beams=1,
         gpu_memory_fraction=0.35,
         utilization_limits={"sentinel": True},
+        manifest_sha256="a" * 64,
     )
 
     assert events == ["capacity", "spawn", "monitor"]
     assert summary["spawn_capacity"]["approval"]["allowed"] is True
+
+
+def test_asr_locked_input_validation_rejects_duplicate_json_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    test_path = tmp_path / "data" / "processed" / "manifests" / "asr--test-local.jsonl"
+    safety_path = tmp_path / "data" / "eval" / "safety.jsonl"
+    test_path.parent.mkdir(parents=True)
+    safety_path.parent.mkdir(parents=True)
+    test_payload = b'{"id":"one","text":"x","audio_path":"x.wav","language":"vi"}\n'
+    safety_payload = (
+        b'{"id":"one","id":"two","text":"x","audio_path":"x.wav",'
+        b'"language":"vi","categories":["dose"],'
+        b'"safety_expectations":{"dose":"x"}}\n'
+    )
+    test_path.write_bytes(test_payload)
+    safety_path.write_bytes(safety_payload)
+    lock_path = tmp_path / "artifact_lock.yaml"
+    lock_path.write_text(
+        yaml.safe_dump(
+            {
+                "manifests": {
+                    "asr_test_local_sha256": hashlib.sha256(test_payload).hexdigest()
+                },
+                "evaluation": {
+                    "medical_safety_asr_vi_sha256": hashlib.sha256(
+                        safety_payload
+                    ).hexdigest()
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(asr_suite, "ROOT", tmp_path)
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSONL"):
+        validate_asr_locked_inputs(
+            {
+                "evaluation": {
+                    "locked_asr_safety_suite": "data/eval/safety.jsonl",
+                    "required_slices": ["dose"],
+                }
+            },
+            test_path,
+            safety_path,
+            lock_path,
+        )
+
+
+def test_mt_locked_input_validation_binds_test_and_safety_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    test_path = tmp_path / "data" / "processed" / "manifests" / "mt--test.jsonl"
+    safety_path = tmp_path / "data" / "eval" / "safety.jsonl"
+    test_path.parent.mkdir(parents=True)
+    safety_path.parent.mkdir(parents=True)
+    test_payload = b'{"id":"one","en":"a","vi":"b"}\n'
+    safety_payload = b'{"id":"safe","en":"a","vi":"b"}\n'
+    test_path.write_bytes(test_payload)
+    safety_path.write_bytes(safety_payload)
+    expected = {
+        "test": hashlib.sha256(test_payload).hexdigest(),
+        "safety": hashlib.sha256(safety_payload).hexdigest(),
+    }
+    lock_path = tmp_path / "artifact_lock.yaml"
+    lock_path.write_text(
+        yaml.safe_dump(
+            {
+                "manifests": {"mt_test_sha256": expected["test"]},
+                "evaluation": {"medical_safety_mt_sha256": expected["safety"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mt_suite, "ROOT", tmp_path)
+
+    assert validate_mt_locked_inputs(
+        {"evaluation": {"locked_mt_safety_suite": "data/eval/safety.jsonl"}},
+        test_path,
+        safety_path,
+        lock_path,
+    ) == expected
 
 
 def test_explicit_benchmark_device_is_preserved():
@@ -358,6 +449,20 @@ def test_prediction_checkpoint_verifies_exact_inputs_and_payload(tmp_path: Path)
     assert loaded[0] == predictions
     assert loaded[1] == provenance
     assert prediction_provenance_path(path).is_file()
+
+
+def test_manifest_digest_claim_is_checked_before_inference(tmp_path: Path):
+    args = checkpoint_args(tmp_path)
+    specification = prediction_checkpoint_specification(args)
+
+    validate_manifest_sha256_claim(
+        specification,
+        specification["manifest"]["sha256"],
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        validate_manifest_sha256_claim(specification, "0" * 64)
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        validate_manifest_sha256_claim(specification, "not-a-digest")
 
 
 def test_prediction_checkpoint_rejects_legacy_generation_contract(tmp_path: Path):
