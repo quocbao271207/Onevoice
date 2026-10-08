@@ -27,6 +27,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/seal_quantization_parity.py` — tái chấm float/compiled predictions trên cùng manifest khóa, paired-bootstrap metric và zero-regression bảy slice lâm sàng trước khi khóa parity evidence vào deployment gate
 - `scripts/seal_qcs6490_measurement.py` — chạy trên board thật để kiểm live identity, raw latency/power/thermal, timestamp, memory và compiled artifact trước khi phát hành measurement evidence bất biến
 - `scripts/create_verified_backup.py` — tạo backup data/model/report nguyên tử; manifest v2 exact-schema/bounded khóa SHA-256 từng file/archive và terminal `comparison.json`, tar byte-reproducible không mang UID/GID/user/mtime máy tạo, cấm symlink/special member rồi tự đọc lại toàn bộ trước khi công bố; bake-off không chuyển terminal nếu backup chưa verify và commit local/tracking/live remote chưa trùng
+- `demo/demo_web.py` — UI web chỉ bind `127.0.0.1`, có Host/CSRF/CSP/no-store, request/audio bounded, không lộ candidate fail safety và không tự phát audio; playback dùng token one-time 120 giây và confirmation server-side
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board
@@ -49,6 +50,14 @@ Quy trình dữ liệu bắt buộc: `audit → nghe mẫu/duyệt license → m
 ```
 
 Kết quả regression gần nhất được ghi trong `project_analysis.md`; không dùng con số test cũ trong README làm release gate. Ba baseline CPU và full base cascade đã pass; CLI text mode pass; GPU gate `ready=true` và xác minh đủ 31.929 FLAC (3.541.434.742 bytes). Ablation decoding local giữ greedy cho ASR/MT: beam search chậm hơn 3–4,8 lần nhưng không cải thiện validation đáng tin cậy; prompt y khoa tĩnh bị loại vì tạo một lỗi thuật ngữ nguy hiểm.
+
+Demo web cục bộ chỉ được mở sau khi model artifact đã sẵn sàng; server không nhận bind address bên ngoài loopback:
+
+```powershell
+.venv\Scripts\python.exe demo\demo_web.py --port 8765
+```
+
+Mở `http://127.0.0.1:8765`. Audio không tự phát; nút playback chỉ xuất hiện sau safety gate và câu hành động lâm sàng yêu cầu xác nhận riêng.
 
 ## Kế hoạch thực thi tiếp theo
 
