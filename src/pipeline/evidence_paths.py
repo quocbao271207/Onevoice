@@ -83,3 +83,43 @@ def resolve_regular_file_under(
     if resolved_root not in resolved.parents:
         raise ValueError(f"{label} must remain under {resolved_root}")
     return resolved
+
+
+def resolve_regular_directory_under(
+    value: Any,
+    *,
+    project_root: Path,
+    allowed_root: Path,
+    label: str,
+) -> Path:
+    """Resolve one directory without permitting link traversal or path escape."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} path is missing")
+    project_boundary = Path(os.path.abspath(project_root))
+    root = Path(os.path.abspath(allowed_root))
+    path = Path(raw)
+    if not path.is_absolute():
+        path = project_boundary / path
+    path = Path(os.path.abspath(path))
+    try:
+        root_relative = root.relative_to(project_boundary)
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must remain under {root}") from exc
+    if _is_link_or_junction(project_boundary):
+        raise ValueError(
+            f"{label} cannot traverse a symlink or junction: {project_boundary}"
+        )
+    current = project_boundary
+    for part in (*root_relative.parts, *relative.parts):
+        current /= part
+        if _is_link_or_junction(current):
+            raise ValueError(f"{label} cannot traverse a symlink or junction: {current}")
+    if not path.is_dir():
+        raise FileNotFoundError(f"{label} is missing or not a directory: {path}")
+    resolved = path.resolve(strict=True)
+    resolved_root = root.resolve(strict=True)
+    if resolved_root not in resolved.parents:
+        raise ValueError(f"{label} must remain under {resolved_root}")
+    return resolved

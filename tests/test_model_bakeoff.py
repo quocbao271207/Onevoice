@@ -24,8 +24,11 @@ from scripts.run_model_bakeoff import (
     interval_stronger,
     invocation_binding,
     license_gate,
+    load_config,
     multi_metric_stronger,
+    read_json_mapping,
     report_score,
+    resolve_regular_directory_under,
     resolve_regular_file_under,
     run_stage,
     select_finalists,
@@ -66,6 +69,78 @@ def candidate(candidate_id: str) -> dict:
             if item["id"] == candidate_id:
                 return item
     raise AssertionError(candidate_id)
+
+
+def test_bakeoff_config_and_state_use_strict_bounded_ingress(tmp_path: Path):
+    valid_config = tmp_path / "valid.yaml"
+    valid_config.write_text("version: 1\n", encoding="utf-8")
+    assert load_config(valid_config) == {"version": 1}
+
+    duplicate_config = tmp_path / "duplicate.yaml"
+    duplicate_config.write_text("version: 1\nversion: 1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="strict YAML"):
+        load_config(duplicate_config)
+
+    alias_config = tmp_path / "alias.yaml"
+    alias_config.write_text("version: &version 1\ncopy: *version\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="strict YAML"):
+        load_config(alias_config)
+
+    nonfinite_config = tmp_path / "nonfinite.yaml"
+    nonfinite_config.write_text("version: 1\nlimit: .nan\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="non-finite"):
+        load_config(nonfinite_config)
+
+    implicit_type_config = tmp_path / "implicit-type.yaml"
+    implicit_type_config.write_text("version: 1\ndate: 2026-10-09\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported YAML type"):
+        load_config(implicit_type_config)
+
+    duplicate_state = tmp_path / "duplicate.json"
+    duplicate_state.write_text(
+        '{"execution_status":"complete","execution_status":"running"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="strict JSON"):
+        read_json_mapping(
+            duplicate_state,
+            maximum_bytes=1_000,
+            label="Test state",
+        )
+
+    nonfinite_state = tmp_path / "nonfinite.json"
+    nonfinite_state.write_text('{"value":NaN}', encoding="utf-8")
+    with pytest.raises(ValueError, match="strict JSON"):
+        read_json_mapping(
+            nonfinite_state,
+            maximum_bytes=1_000,
+            label="Test state",
+        )
+
+    oversized_state = tmp_path / "oversized.json"
+    oversized_state.write_bytes(b"{" + b" " * 1_000 + b"}")
+    with pytest.raises(ValueError, match="size is outside"):
+        read_json_mapping(
+            oversized_state,
+            maximum_bytes=1_000,
+            label="Test state",
+        )
+
+
+def test_bakeoff_state_rejects_linked_file(tmp_path: Path):
+    target_state = tmp_path / "target.json"
+    linked_state = tmp_path / "linked.json"
+    target_state.write_text('{"execution_status":"complete"}', encoding="utf-8")
+    try:
+        linked_state.symlink_to(target_state)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(ValueError, match="symlink or junction"):
+        read_json_mapping(
+            linked_state,
+            maximum_bytes=1_000,
+            label="Test state",
+        )
 
 
 def test_bakeoff_fairness_and_selection_checksums_are_locked():
@@ -1774,6 +1849,50 @@ def test_regular_deployment_file_resolution_rejects_symlink(tmp_path: Path):
             project_root=project_root,
             allowed_root=allowed_root,
             label="Deployment artifact",
+        )
+
+
+def test_regular_candidate_directory_resolution_rejects_escape(
+    tmp_path: Path,
+):
+    project_root = tmp_path / "project"
+    allowed_root = project_root / "gpu-runs"
+    candidate = allowed_root / "candidate"
+    candidate.mkdir(parents=True)
+    outside = project_root / "outside"
+    outside.mkdir()
+
+    assert resolve_regular_directory_under(
+        candidate.relative_to(project_root),
+        project_root=project_root,
+        allowed_root=allowed_root,
+        label="Candidate output",
+    ) == candidate.resolve()
+    with pytest.raises(ValueError, match="must remain under"):
+        resolve_regular_directory_under(
+            outside,
+            project_root=project_root,
+            allowed_root=allowed_root,
+            label="Candidate output",
+        )
+
+
+def test_regular_candidate_directory_resolution_rejects_link(tmp_path: Path):
+    project_root = tmp_path / "project"
+    allowed_root = project_root / "gpu-runs"
+    candidate = allowed_root / "candidate"
+    candidate.mkdir(parents=True)
+    linked = allowed_root / "candidate-link"
+    try:
+        linked.symlink_to(candidate, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+    with pytest.raises(ValueError, match="symlink or junction"):
+        resolve_regular_directory_under(
+            linked,
+            project_root=project_root,
+            allowed_root=allowed_root,
+            label="Candidate output",
         )
 
 

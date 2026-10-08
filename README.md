@@ -19,7 +19,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/verify_checkpoint_download.py` — xác minh lại archive checkpoint đã tải, sidecar, content manifest, checkpoint index và `trainer_state` mà không extract file
 - Mỗi candidate suite xuất bundle bằng chứng gồm archive, SHA-256 sidecar và manifest từng file/bytes/checksum; bundle được đọc lại và xác minh trước khi công bố
 - `scripts/run_gpu_program.py` — tự quyết định MT continuation bằng validation trend, rồi nối tuần tự MT gate → ASR pilots/full-data → ASR gate; state nguyên tử và không chạy hai GPU child đồng thời
-- `scripts/run_model_bakeoff.py` — sau khi Candidate A hoàn tất, đóng băng nó rồi chạy successive-halving đa model trên selection dev; không mở test khóa cũ để chọn model
+- `scripts/run_model_bakeoff.py` — sau khi Candidate A hoàn tất, đóng băng nó rồi chạy successive-halving đa model trên selection dev; không mở test khóa cũ để chọn model; config/state/gate/evidence control-plane được đọc bounded, strict và chống link/TOCTOU trước resume
 - `scripts/run_blind_candidate_suite.py` — khóa checksum và mở blind test v2 đúng một lần cho winner cuối
 - `scripts/prepare_deployment_benchmark.py` — tạo draft đã khóa winner/adapter và chỉ finalize evidence QCS6490 sau khi measurement artifact bất biến khớp board/model, tự tính latency/power/thermal và vượt physical-board gate
 - `scripts/capture_qcs6490_identity.py` — chạy trên board thật để khóa device-tree/sysfs ARM64; Arduino/cloud metadata không được tính là evidence QCS6490

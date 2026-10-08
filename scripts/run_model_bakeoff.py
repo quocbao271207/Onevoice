@@ -51,13 +51,17 @@ from scripts.create_verified_backup import (  # noqa: E402
     verify as verify_backup,
 )
 from src.data.quality import fingerprint_text  # noqa: E402
-from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    resolve_regular_directory_under,
+    resolve_regular_file_under,
+)
 from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity,
     selection_identity_sha256,
     selection_policy_record,
 )
+from src.utils.bounded_file import read_stable_regular_file  # noqa: E402
 
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
@@ -67,6 +71,12 @@ GIT_CHECK_TIMEOUT_SECONDS = 30.0
 MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
 MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES = 1_000_000
 MAX_IDENTITY_EVIDENCE_BYTES = 1_000_000
+MAX_BAKEOFF_CONFIG_BYTES = 1_000_000
+MAX_BAKEOFF_CONFIG_DEPTH = 32
+MAX_BAKEOFF_CONFIG_NODES = 10_000
+MAX_BAKEOFF_STATE_BYTES = 10_000_000
+MAX_CANDIDATE_GATE_BYTES = 10_000_000
+MAX_BAKEOFF_REPORT_BYTES = 100_000_000
 QUANTIZATION_PARITY_MAX_RELATIVE_DEGRADATION = 0.02
 QUANTIZATION_PARITY_MIN_SAMPLES = 32
 QUANTIZATION_PARITY_BOOTSTRAP_REPEATS = 1_000
@@ -271,6 +281,56 @@ def complete_terminal_bakeoff(
 
 class StageExecutionError(RuntimeError):
     """A launched stage returned non-zero or failed to publish its outputs."""
+
+
+class JsonDocumentDigestMismatch(ValueError):
+    """A strict JSON document did not match its external digest binding."""
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("JSON document contains a duplicate key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("JSON document contains a non-finite number")
+
+
+def read_json_mapping(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Read one stable strict-JSON document whose root is a mapping."""
+    payload = read_stable_regular_file(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise JsonDocumentDigestMismatch(f"{label} checksum does not match")
+    try:
+        parsed = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError(f"{label} is not valid strict JSON") from None
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} root must be a mapping")
+    return parsed
 
 
 def validate_loaded_runner_generation() -> None:
@@ -730,8 +790,105 @@ def bind_or_validate_invocation(
         raise ValueError("Bake-off invocation changed for the existing state directory")
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    def __init__(self, stream):
+        super().__init__(stream)
+        self._composition_depth = 0
+        self._composed_nodes = 0
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "model-bakeoff config aliases are not allowed",
+                self.peek_event().start_mark,
+            )
+        if self._composition_depth >= MAX_BAKEOFF_CONFIG_DEPTH:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "model-bakeoff config nesting is too deep",
+                self.peek_event().start_mark,
+            )
+        if self._composed_nodes >= MAX_BAKEOFF_CONFIG_NODES:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "model-bakeoff config contains too many nodes",
+                self.peek_event().start_mark,
+            )
+        self._composition_depth += 1
+        self._composed_nodes += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._composition_depth -= 1
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found a duplicate key",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _validate_config_tree(value: Any) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Model-bakeoff config contains a non-finite number")
+        return
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("Model-bakeoff config mapping keys must be strings")
+        for item in value.values():
+            _validate_config_tree(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_config_tree(item)
+        return
+    raise ValueError("Model-bakeoff config contains an unsupported YAML type")
+
+
 def load_config(path: Path) -> dict[str, Any]:
-    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = read_stable_regular_file(
+        path,
+        maximum_bytes=MAX_BAKEOFF_CONFIG_BYTES,
+        label="Model-bakeoff config",
+    )
+    try:
+        config = yaml.load(payload.decode("utf-8"), Loader=_UniqueKeySafeLoader)
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError):
+        raise ValueError("Model-bakeoff config is not valid strict YAML") from None
+    if not isinstance(config, dict):
+        raise ValueError("Model-bakeoff config root must be a mapping")
+    _validate_config_tree(config)
     if config.get("version") != 1:
         raise ValueError("Unsupported model-bakeoff config version")
     return config
@@ -928,7 +1085,7 @@ def validate_candidate_matrix(config: dict[str, Any]) -> None:
 
 def find_current_program_state(config: dict[str, Any], explicit: Path | None) -> Path:
     if explicit:
-        return explicit.resolve()
+        return Path(os.path.abspath(explicit))
     matches = sorted(
         ROOT.glob(config["prerequisite"]["current_program_state_glob"]),
         key=lambda path: path.stat().st_mtime,
@@ -940,7 +1097,17 @@ def find_current_program_state(config: dict[str, Any], explicit: Path | None) ->
 
 def wait_for_current_program(path: Path, poll_seconds: float, should_wait: bool) -> dict[str, Any]:
     while True:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            state = read_json_mapping(
+                path,
+                maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+                label="Current GPU program state",
+            )
+        except RuntimeError:
+            if not should_wait:
+                raise
+            time.sleep(poll_seconds)
+            continue
         status = state.get("execution_status")
         if status == "complete":
             return state
@@ -964,13 +1131,12 @@ def candidate_output_dir(
         if index + 1 >= len(command):
             raise ValueError(f"Current program has an invalid {task} --output-dir binding")
         output = Path(str(command[index + 1]))
-    resolved = output.resolve()
-    gpu_runs = (ROOT / "gpu-runs").resolve()
-    if not resolved.is_relative_to(gpu_runs):
-        raise ValueError(f"Candidate A evidence must remain under {gpu_runs}: {resolved}")
-    if resolved.is_symlink() or not resolved.is_dir():
-        raise FileNotFoundError(f"Candidate A output is not a regular directory: {resolved}")
-    return resolved
+    return resolve_regular_directory_under(
+        output,
+        project_root=ROOT,
+        allowed_root=ROOT / "gpu-runs",
+        label="Candidate A output",
+    )
 
 
 def validate_candidate_a_locked_evaluation(
@@ -990,7 +1156,11 @@ def validate_candidate_a_locked_evaluation(
     gate_path = output / "candidate_gate.json"
     if gate_path.is_symlink() or not gate_path.is_file():
         raise FileNotFoundError(f"Candidate A gate is incomplete: {gate_path}")
-    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    gate = read_json_mapping(
+        gate_path,
+        maximum_bytes=MAX_CANDIDATE_GATE_BYTES,
+        label=f"Candidate A {task} gate",
+    )
     status = gate.get("status")
     if status not in {"pass", "fail"} or gate.get("error") not in {None, ""}:
         raise ValueError(f"Candidate A {task} locked evaluation is not terminal: {gate_path}")
@@ -1616,11 +1786,20 @@ def validate_deployment_report(
                 else:
                     if not SHA256_RE.fullmatch(identity_sha):
                         failures.append("device.identity_evidence_sha256:invalid")
-                    elif sha256(identity_path) != identity_sha:
-                        failures.append("device.identity_evidence_sha256:mismatch")
                     try:
-                        identity = json.loads(identity_path.read_text(encoding="utf-8"))
-                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        identity = read_json_mapping(
+                            identity_path,
+                            maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
+                            label="QCS6490 identity evidence",
+                            expected_sha256=(
+                                identity_sha
+                                if SHA256_RE.fullmatch(identity_sha)
+                                else None
+                            ),
+                        )
+                    except JsonDocumentDigestMismatch:
+                        failures.append("device.identity_evidence_sha256:mismatch")
+                    except (FileNotFoundError, RuntimeError, ValueError):
                         failures.append("device.identity_evidence:invalid_json")
                     else:
                         for failure in qcs6490_identity_failures(identity):
@@ -1719,19 +1898,21 @@ def validate_deployment_report(
             if parity_path is not None:
                 if not SHA256_RE.fullmatch(parity_sha):
                     failures.append(f"{label}:parity_evidence_sha256_invalid")
-                elif sha256(parity_path) != parity_sha:
-                    failures.append(f"{label}:parity_evidence_sha256_mismatch")
                 try:
-                    loaded_parity = json.loads(
-                        parity_path.read_text(encoding="utf-8")
+                    loaded_parity = read_json_mapping(
+                        parity_path,
+                        maximum_bytes=MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
+                        label="Quantization parity evidence",
+                        expected_sha256=(
+                            parity_sha if SHA256_RE.fullmatch(parity_sha) else None
+                        ),
                     )
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                except JsonDocumentDigestMismatch:
+                    failures.append(f"{label}:parity_evidence_sha256_mismatch")
+                except (FileNotFoundError, RuntimeError, ValueError):
                     failures.append(f"{label}:parity_evidence_invalid_json")
                 else:
-                    if not isinstance(loaded_parity, dict):
-                        failures.append(f"{label}:parity_evidence_invalid")
-                    else:
-                        parity = loaded_parity
+                    parity = loaded_parity
         if parity is not None:
             for parity_failure in quantization_parity_evidence_failures(
                 parity,
@@ -1798,19 +1979,23 @@ def validate_deployment_report(
             if measurement_path is not None:
                 if not SHA256_RE.fullmatch(measurement_sha):
                     failures.append(f"{label}:measurement_evidence_sha256_invalid")
-                elif sha256(measurement_path) != measurement_sha:
-                    failures.append(f"{label}:measurement_evidence_sha256_mismatch")
                 try:
-                    loaded_measurement = json.loads(
-                        measurement_path.read_text(encoding="utf-8")
+                    loaded_measurement = read_json_mapping(
+                        measurement_path,
+                        maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+                        label="Physical measurement evidence",
+                        expected_sha256=(
+                            measurement_sha
+                            if SHA256_RE.fullmatch(measurement_sha)
+                            else None
+                        ),
                     )
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                except JsonDocumentDigestMismatch:
+                    failures.append(f"{label}:measurement_evidence_sha256_mismatch")
+                except (FileNotFoundError, RuntimeError, ValueError):
                     failures.append(f"{label}:measurement_evidence_invalid_json")
                 else:
-                    if not isinstance(loaded_measurement, dict):
-                        failures.append(f"{label}:measurement_evidence_invalid")
-                    else:
-                        measurement = loaded_measurement
+                    measurement = loaded_measurement
         if measurement is not None:
             if measurement.get("version") != 1:
                 failures.append(f"{label}:measurement_evidence_version_invalid")
@@ -2097,7 +2282,11 @@ def validate_candidate_a_freeze(
     """Re-hash an existing immutable freeze before resume or GPU work."""
     if output.is_symlink() or not output.is_file():
         raise FileNotFoundError(f"Candidate A freeze is not a regular file: {output}")
-    frozen = json.loads(output.read_text(encoding="utf-8"))
+    frozen = read_json_mapping(
+        output,
+        maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+        label="Candidate A freeze",
+    )
     if frozen.get("promotion_allowed") is not False:
         raise ValueError("Candidate A freeze cannot authorize promotion")
     source = frozen.get("source_program_state")
@@ -2482,7 +2671,11 @@ def completed_adapter(output_root: Path, task: str) -> Path:
         summary_path = run / "summary.json"
         if not summary_path.is_file():
             continue
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = read_json_mapping(
+            summary_path,
+            maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+            label=f"{task} training summary",
+        )
         if summary.get("status") == "complete":
             complete.append((run, summary))
     if len(complete) != 1:
@@ -2510,8 +2703,12 @@ def verified_resume_checkpoint(output_root: Path, task: str) -> Path | None:
             run_root.glob("checkpoint-archives/*/checkpoint_archives.json")
         ):
             try:
-                index = json.loads(index_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                index = read_json_mapping(
+                    index_path,
+                    maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+                    label="Checkpoint archive index",
+                )
+            except (FileNotFoundError, RuntimeError, ValueError) as exc:
                 raise ValueError(f"Invalid checkpoint index: {index_path}") from exc
             records = index.get("checkpoints")
             if not isinstance(records, list):
@@ -2673,7 +2870,11 @@ def benchmark_unit(
         [report_path],
         resource_limits=config["resources"],
     )
-    return json.loads(report_path.read_text(encoding="utf-8"))
+    return read_json_mapping(
+        report_path,
+        maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+        label=f"{task} selection report",
+    )
 
 
 def report_score(
@@ -3191,11 +3392,13 @@ def main() -> int:
         if not state_path.is_file():
             parser.error(f"resume state does not exist: {state_path}")
         try:
-            resume_state = json.loads(state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            parser.error(f"resume state is not valid JSON: {state_path}: {exc}")
-        if not isinstance(resume_state, dict):
-            parser.error(f"resume state root must be a mapping: {state_path}")
+            resume_state = read_json_mapping(
+                state_path,
+                maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+                label="Bake-off resume state",
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
         resume_audit = audit_completed_stage_resume(resume_state, args.python)
         print(
             json.dumps(
@@ -3216,7 +3419,11 @@ def main() -> int:
     state_dir = args.state_dir.resolve()
     state_path = state_dir / "bakeoff_state.json"
     if state_path.is_file():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = read_json_mapping(
+            state_path,
+            maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+            label="Bake-off state",
+        )
     else:
         state = {
             "created_at": utc_now(),
@@ -3302,8 +3509,10 @@ def main() -> int:
     if selection_snapshot_path.exists() and not selection_snapshot_path.is_file():
         raise ValueError("Immutable selection snapshot must be a regular file")
     if selection_snapshot_path.is_file():
-        selection_snapshot = json.loads(
-            selection_snapshot_path.read_text(encoding="utf-8")
+        selection_snapshot = read_json_mapping(
+            selection_snapshot_path,
+            maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+            label="Immutable selection snapshot",
         )
         if selection_snapshot.get("status") != "selection_complete":
             raise ValueError("Immutable selection snapshot has an invalid status")
@@ -3319,7 +3528,11 @@ def main() -> int:
     atomic_json(comparison_path, comparison)
 
     blind_lock_path = ROOT / config["data"]["blind_test_v2_lock"]
-    blind_lock = json.loads(blind_lock_path.read_text(encoding="utf-8"))
+    blind_lock = read_json_mapping(
+        blind_lock_path,
+        maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+        label="Blind v2 lock",
+    )
     if blind_lock.get("status") == "awaiting_unseen_data":
         state["stage"] = "blind_locked_test_v2"
         state["execution_status"] = "waiting_for_blind_test_v2"
@@ -3384,7 +3597,13 @@ def main() -> int:
             state_dir / "logs" / f"{stage}.log",
             [gate_path],
         )
-        blind_results.append(json.loads(gate_path.read_text(encoding="utf-8")))
+        blind_results.append(
+            read_json_mapping(
+                gate_path,
+                maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+                label=f"Blind v2 {task} gate",
+            )
+        )
     comparison["blind_test_v2"] = blind_results
     comparison["status"] = "blind_complete"
     atomic_json(comparison_path, comparison)
@@ -3451,7 +3670,11 @@ def main() -> int:
                 state_dir / "logs/prepare_deployment_draft.log",
                 [deployment_draft_path],
             )
-        deployment_draft = json.loads(deployment_draft_path.read_text(encoding="utf-8"))
+        deployment_draft = read_json_mapping(
+            deployment_draft_path,
+            maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+            label="Deployment draft",
+        )
         draft_pass, draft_failures = validate_deployment_draft(
             deployment_draft,
             expected_deployment,
@@ -3471,7 +3694,11 @@ def main() -> int:
         }
         atomic_json(state_path, state)
         return CRITICAL_EXIT_WAITING_FOR_BLIND
-    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    deployment = read_json_mapping(
+        deployment_path,
+        maximum_bytes=MAX_BAKEOFF_STATE_BYTES,
+        label="Deployment report",
+    )
     deployment_pass, deployment_failures = validate_deployment_report(
         deployment,
         expected_deployment,
