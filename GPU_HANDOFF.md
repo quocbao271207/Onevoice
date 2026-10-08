@@ -48,6 +48,8 @@ python scripts/preflight_project.py --gate gpu --output data/reports/preflight_g
 
 GPU preflight strict-parse và stable-hash config/report/manifest/inventory, so sánh SHA-256 của sáu manifest với `artifact_lock.yaml`, sau đó băm hai lượt trên cùng regular no-link file cho toàn bộ 31.929 FLAC theo `audio_inventory.jsonl`. Inventory từ chối path escape, link/junction, ID/path/hash trùng, byte/digest sai và file đổi trong lúc đọc. Không bắt đầu billed dry-run nếu một file thiếu, sai size hoặc sai hash; dự kiến preflight lâu hơn một lượt hash thường.
 
+Inventory phải được tái tạo bằng `scripts/build_audio_inventory.py`: producer strict-parse ba local manifest, khóa role/ID/canonical audio path, stable-hash file trước khi kiểm duplicate và chỉ publish inventory + summary crash-durable sau khi toàn bộ gate pass. Không chỉnh tay inventory hoặc cập nhật lock từ file sinh dở.
+
 Record `nvidia-smi`, package versions and the preflight JSON with every run.
 
 ## AIMET handoff for QCS6490
