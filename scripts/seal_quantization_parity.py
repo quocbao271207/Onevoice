@@ -9,7 +9,6 @@ file is written.  This evidence is required by the physical deployment gate.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import sys
@@ -46,6 +45,7 @@ from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
 from src.pipeline.evidence_paths import (  # noqa: E402
     resolve_regular_file_without_links,
 )
+from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
 from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
@@ -57,88 +57,19 @@ BOOTSTRAP_SEED = 20261005
 CANDIDATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-def _reject_duplicate_json_keys(
-    pairs: list[tuple[str, Any]],
-) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("JSON document contains a duplicate key")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(_value: str) -> object:
-    raise ValueError("JSON document contains a non-finite number")
-
-
-def _decode_jsonl_row(
-    raw_line: bytes,
-    *,
-    label: str,
-    line_number: int,
-) -> dict[str, Any]:
-    try:
-        row = json.loads(
-            raw_line.decode("utf-8", errors="strict"),
-            object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=_reject_json_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        raise ValueError(
-            f"{label} line {line_number} is not valid strict UTF-8 JSONL"
-        ) from None
-    if not isinstance(row, dict):
-        raise ValueError(f"{label} line {line_number} is not an object")
-    return row
-
-
 def _read_jsonl(
     path: Path,
     *,
     label: str,
 ) -> tuple[list[dict[str, Any]], str, int]:
-    path = resolve_regular_file_without_links(
-        path,
-        label=label,
-        maximum_bytes=MAX_PREDICTION_BYTES,
-    )
-    expected_digest, expected_size = sha256_stable_regular_file(
+    document = read_stable_jsonl_mappings(
         path,
         maximum_bytes=MAX_PREDICTION_BYTES,
+        maximum_line_bytes=MAX_JSONL_LINE_BYTES,
+        maximum_rows=MAX_PREDICTION_ROWS,
         label=label,
     )
-    rows: list[dict[str, Any]] = []
-    digest = hashlib.sha256()
-    observed_size = 0
-    try:
-        with path.open("rb") as handle:
-            line_number = 0
-            while raw_line := handle.readline(MAX_JSONL_LINE_BYTES + 1):
-                line_number += 1
-                if len(raw_line) > MAX_JSONL_LINE_BYTES:
-                    raise ValueError(f"{label} line {line_number} is too large")
-                observed_size += len(raw_line)
-                if observed_size > MAX_PREDICTION_BYTES:
-                    raise ValueError(f"{label} exceeds {MAX_PREDICTION_BYTES} bytes")
-                digest.update(raw_line)
-                if not raw_line.strip():
-                    continue
-                row = _decode_jsonl_row(
-                    raw_line,
-                    label=label,
-                    line_number=line_number,
-                )
-                rows.append(row)
-                if len(rows) > MAX_PREDICTION_ROWS:
-                    raise ValueError(f"{label} has too many rows")
-    except OSError:
-        raise ValueError(f"Unable to read {label}") from None
-    if observed_size != expected_size or digest.hexdigest() != expected_digest:
-        raise RuntimeError(f"{label} changed while parsing")
-    if not rows:
-        raise ValueError(f"{label} is empty")
-    return rows, expected_digest, expected_size
+    return document.rows, document.sha256, document.bytes
 
 
 def _read_json(

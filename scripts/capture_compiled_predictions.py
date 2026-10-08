@@ -28,7 +28,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.candidate_evidence import canonical_sha256  # noqa: E402
-from scripts.run_model_bakeoff import SHA256_RE, sha256  # noqa: E402
+from scripts.run_model_bakeoff import (  # noqa: E402
+    MAX_DEPLOYMENT_ARTIFACT_BYTES,
+    SHA256_RE,
+)
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    prepare_new_file_destination_without_links,
+    resolve_regular_file_without_links,
+)
+from src.pipeline.stable_jsonl import (  # noqa: E402
+    StableJsonlDocument,
+    read_stable_jsonl_mappings,
+)
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -47,35 +60,14 @@ PROCESS_TERMINATION_GRACE_SECONDS = 5.0
 CANDIDATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-def _regular_file(path: Path, *, label: str, maximum_bytes: int) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
-    size = path.stat().st_size
-    if size < 1 or size > maximum_bytes:
-        raise ValueError(f"{label} size is outside the valid range")
-
-
-def _read_jsonl(path: Path, *, label: str) -> list[dict[str, Any]]:
-    _regular_file(path, label=label, maximum_bytes=MAX_JSONL_BYTES)
-    rows: list[dict[str, Any]] = []
-    try:
-        with path.open("r", encoding="utf-8", errors="strict") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                if len(line.encode("utf-8")) > MAX_JSONL_LINE_BYTES:
-                    raise ValueError(f"{label} line {line_number} is too large")
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError(f"{label} line {line_number} is not an object")
-                rows.append(row)
-                if len(rows) > MAX_JSONL_ROWS:
-                    raise ValueError(f"{label} has too many rows")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not valid UTF-8 JSONL") from exc
-    if not rows:
-        raise ValueError(f"{label} is empty")
-    return rows
+def _read_jsonl(path: Path, *, label: str) -> StableJsonlDocument:
+    return read_stable_jsonl_mappings(
+        path,
+        maximum_bytes=MAX_JSONL_BYTES,
+        maximum_line_bytes=MAX_JSONL_LINE_BYTES,
+        maximum_rows=MAX_JSONL_ROWS,
+        label=label,
+    )
 
 
 def normalize_command_template(command: Sequence[str]) -> tuple[str, ...]:
@@ -199,18 +191,32 @@ def _remove_failed_output(path: Path) -> None:
 
 
 def _write_exclusive_json(path: Path, payload: dict[str, Any]) -> None:
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite provenance: {path}")
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    if len(serialized.encode("utf-8")) > MAX_JSON_BYTES:
-        raise ValueError("compiled prediction provenance is too large")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(serialized, encoding="utf-8")
     try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_durable_json_exclusive(
+            path,
+            payload,
+            maximum_bytes=MAX_JSON_BYTES,
+            label="Compiled prediction provenance",
+        )
+    except FileExistsError:
+        raise FileExistsError(f"Refusing to overwrite provenance: {path}") from None
+
+
+def _verify_file_identity(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
+    maximum_bytes: int,
+    label: str,
+) -> None:
+    observed_sha256, observed_bytes = sha256_stable_regular_file(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    if observed_sha256 != expected_sha256 or observed_bytes != expected_bytes:
+        raise RuntimeError(f"{label} changed during compiled inference")
 
 
 def capture_compiled_predictions(
@@ -253,25 +259,42 @@ def capture_compiled_predictions(
     if not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_TIMEOUT_SECONDS:
         raise ValueError("timeout_seconds is outside the valid range")
 
-    _regular_file(artifact_path, label="Compiled artifact", maximum_bytes=sys.maxsize)
-    manifest_rows = _read_jsonl(manifest_path, label="Manifest")
-    if output_predictions_path.exists():
+    artifact_path = resolve_regular_file_without_links(
+        artifact_path,
+        label="Compiled artifact",
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+    )
+    artifact_sha256, artifact_bytes = sha256_stable_regular_file(
+        artifact_path,
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+        label="Compiled artifact",
+    )
+    manifest = _read_jsonl(manifest_path, label="Manifest")
+    try:
+        output_predictions_path = prepare_new_file_destination_without_links(
+            output_predictions_path,
+            label="Compiled predictions output",
+        )
+    except FileExistsError:
         raise FileExistsError(
             f"Refusing to overwrite predictions: {output_predictions_path}"
+        ) from None
+    try:
+        output_provenance_path = prepare_new_file_destination_without_links(
+            output_provenance_path,
+            label="Compiled prediction provenance output",
         )
-    if output_provenance_path.exists():
+    except FileExistsError:
         raise FileExistsError(
             f"Refusing to overwrite provenance: {output_provenance_path}"
-        )
+        ) from None
     template = normalize_command_template(command)
     resolved = resolve_command_template(
         template,
         artifact_path=artifact_path,
-        manifest_path=manifest_path,
+        manifest_path=manifest.path,
         output_predictions_path=output_predictions_path,
     )
-    output_predictions_path.parent.mkdir(parents=True, exist_ok=True)
-    output_provenance_path.parent.mkdir(parents=True, exist_ok=True)
 
     started_at = now()
     if started_at.tzinfo is None:
@@ -283,15 +306,29 @@ def capture_compiled_predictions(
             raise RuntimeError("compiled runtime returned an invalid status")
         if return_code != 0:
             raise RuntimeError(f"compiled runtime failed with return code {return_code}")
-        prediction_rows = _read_jsonl(
+        predictions = _read_jsonl(
             output_predictions_path,
             label="Compiled predictions",
         )
         _validate_prediction_coverage(
-            manifest_rows,
-            prediction_rows,
+            manifest.rows,
+            predictions.rows,
             task=task,
             direction=direction,
+        )
+        _verify_file_identity(
+            artifact_path,
+            expected_sha256=artifact_sha256,
+            expected_bytes=artifact_bytes,
+            maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+            label="Compiled artifact",
+        )
+        _verify_file_identity(
+            manifest.path,
+            expected_sha256=manifest.sha256,
+            expected_bytes=manifest.bytes,
+            maximum_bytes=MAX_JSONL_BYTES,
+            label="Manifest",
         )
     except BaseException:
         _remove_failed_output(output_predictions_path)
@@ -305,9 +342,6 @@ def capture_compiled_predictions(
         _remove_failed_output(output_predictions_path)
         raise ValueError("capture duration is invalid")
 
-    artifact_resolved = artifact_path.resolve()
-    manifest_resolved = manifest_path.resolve()
-    predictions_resolved = output_predictions_path.resolve()
     command_payload = {
         "template": list(template),
         "template_sha256": canonical_sha256(list(template)),
@@ -328,20 +362,20 @@ def capture_compiled_predictions(
         "adapter_manifest_sha256": adapter_manifest_sha256,
         "decoding": {"num_beams": num_beams, "do_sample": False},
         "artifact": {
-            "path": str(artifact_resolved),
-            "bytes": artifact_path.stat().st_size,
-            "sha256": sha256(artifact_path),
+            "path": str(artifact_path),
+            "bytes": artifact_bytes,
+            "sha256": artifact_sha256,
         },
         "manifest": {
-            "path": str(manifest_resolved),
-            "bytes": manifest_path.stat().st_size,
-            "sha256": sha256(manifest_path),
+            "path": str(manifest.path),
+            "bytes": manifest.bytes,
+            "sha256": manifest.sha256,
         },
         "predictions": {
-            "path": str(predictions_resolved),
-            "bytes": output_predictions_path.stat().st_size,
-            "sha256": sha256(output_predictions_path),
-            "rows": len(prediction_rows),
+            "path": str(predictions.path),
+            "bytes": predictions.bytes,
+            "sha256": predictions.sha256,
+            "rows": len(predictions.rows),
         },
         "command": command_payload,
         "return_code": 0,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.capture_compiled_predictions as compiled_capture
 from scripts.capture_compiled_predictions import (
     capture_compiled_predictions,
     compiled_prediction_provenance_failures,
@@ -127,3 +128,49 @@ def test_capture_refuses_to_overwrite_existing_output(tmp_path: Path):
     with pytest.raises(FileExistsError, match="Refusing to overwrite predictions"):
         capture_fixture(tmp_path)
     assert (tmp_path / "predictions.jsonl").read_text(encoding="utf-8") == "owned"
+
+
+def test_capture_rejects_duplicate_prediction_fields_and_removes_output(
+    tmp_path: Path,
+):
+    def duplicate_output(command, _timeout):
+        Path(command[3]).write_text(
+            '{"id":"a","direction":"en_to_vi","hypothesis":"one",'
+            '"hypothesis":"duplicate"}\n'
+            '{"id":"b","direction":"en_to_vi","hypothesis":"two"}\n',
+            encoding="utf-8",
+        )
+        return 0
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSONL"):
+        capture_fixture(tmp_path, executor=duplicate_output)
+    assert not (tmp_path / "predictions.jsonl").exists()
+    assert not (tmp_path / "predictions.provenance.json").exists()
+
+
+def test_capture_rejects_artifact_mutation_during_runtime(tmp_path: Path):
+    def mutating_runtime(command, _timeout):
+        Path(command[1]).write_bytes(b"changed-qnn-context")
+        write_jsonl(
+            Path(command[3]),
+            [
+                {"id": "a", "direction": "en_to_vi", "hypothesis": "mot"},
+                {"id": "b", "direction": "en_to_vi", "hypothesis": "hai"},
+            ],
+        )
+        return 0
+
+    with pytest.raises(RuntimeError, match="changed during compiled inference"):
+        capture_fixture(tmp_path, executor=mutating_runtime)
+    assert not (tmp_path / "predictions.jsonl").exists()
+    assert not (tmp_path / "predictions.provenance.json").exists()
+
+
+def test_capture_caps_compiled_artifact_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(compiled_capture, "MAX_DEPLOYMENT_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(ValueError, match="exceeds 4 bytes"):
+        capture_fixture(tmp_path)

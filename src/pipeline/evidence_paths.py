@@ -67,6 +67,29 @@ def resolve_regular_file_without_links(
     )
 
 
+def prepare_new_file_destination_without_links(
+    value: Any,
+    *,
+    label: str,
+) -> Path:
+    """Create destination parents and reject existing/link-traversing targets."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} path is missing")
+    path = Path(os.path.abspath(Path(raw)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = Path(path.parts[0])
+    for part in path.parts[1:]:
+        current /= part
+        if is_link_or_junction(current):
+            raise ValueError(
+                f"{label} cannot traverse a symlink or junction: {current}"
+            )
+    if path.exists():
+        raise FileExistsError(f"{label} already exists: {path}")
+    return path
+
+
 def resolve_regular_file_under(
     value: Any,
     *,
