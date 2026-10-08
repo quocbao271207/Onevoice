@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from src.pipeline import flash_cache
 from src.pipeline.flash_cache import CachedPhrase, EMERGENCY_PHRASES, FlashCache
 from src.pipeline.orchestrator import MediVoicePipeline
 from src.pipeline.safety_guard import validate_translation
@@ -122,6 +123,40 @@ def test_valid_custom_cache_is_loaded_without_logging_raw_phrase(tmp_path, caplo
     assert phrase.requires_confirmation
     assert "Give aspirin 5 mg" not in caplog.text
     assert "Dùng aspirin 5 mg" not in caplog.text
+
+
+def test_custom_cache_rejects_duplicate_keys_nonfinite_numbers_and_oversize(tmp_path):
+    duplicate = tmp_path / "duplicate.json"
+    duplicate.write_text(
+        '[{"source":"one","source":"two"}]',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid custom flash cache JSON"):
+        FlashCache(str(duplicate)).load()
+
+    nonfinite = tmp_path / "nonfinite.json"
+    nonfinite.write_text("[NaN]", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid custom flash cache JSON"):
+        FlashCache(str(nonfinite)).load()
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"[" + b" " * flash_cache.MAX_CUSTOM_CACHE_BYTES + b"]")
+    with pytest.raises(ValueError, match="size is outside"):
+        FlashCache(str(oversized)).load()
+
+
+def test_custom_cache_rejects_linked_file_without_reading_target(tmp_path):
+    target = tmp_path / "target.json"
+    write_cache(target, [valid_custom_phrase()])
+    linked = tmp_path / "linked.json"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+
+    with pytest.raises(ValueError, match="must not be linked"):
+        FlashCache(str(linked)).load()
+    assert target.read_text(encoding="utf-8")
 
 
 def test_pipeline_rejects_cache_hit_for_wrong_target_language(

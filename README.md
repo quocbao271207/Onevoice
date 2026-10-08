@@ -29,6 +29,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/seal_qcs6490_measurement.py` — chạy trên board thật để kiểm live identity, raw latency/power/thermal, timestamp, memory và compiled artifact trước khi phát hành measurement evidence bất biến
 - `scripts/create_verified_backup.py` — tạo backup data/model/report nguyên tử; manifest v2 exact-schema/bounded khóa SHA-256 từng file/archive và terminal `comparison.json`, tar byte-reproducible không mang UID/GID/user/mtime máy tạo, cấm symlink/special member rồi tự đọc lại toàn bộ trước khi công bố; source và tar đều được quét streaming để chặn credential/private key và URL ký trong report/log mà không in secret; bake-off không chuyển terminal nếu backup chưa verify, secret scan chưa pass hoặc commit local/tracking/live remote chưa trùng
 - `demo/demo_web.py` — UI web chỉ bind `127.0.0.1`, có Host/CSRF/CSP/no-store, request/audio bounded, không lộ candidate fail safety và không tự phát audio; playback dùng token one-time 120 giây và confirmation server-side
+- `src/pipeline/flash_cache.py` — cache cụm cấp cứu exact-only; custom JSON bị giới hạn byte/entry, strict-schema, reject duplicate key/non-finite/link và chỉ publish nguyên tử sau safety validation
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board
