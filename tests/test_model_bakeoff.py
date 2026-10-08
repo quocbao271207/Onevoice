@@ -1042,6 +1042,87 @@ def test_completed_benchmark_accepts_runner_generation_only_change(tmp_path: Pat
     assert state["stages"]["stage"]["command"] == old_command
 
 
+def test_completed_training_accepts_same_interpreter_alias(tmp_path: Path):
+    state_path = tmp_path / "state.json"
+    output = tmp_path / "training-output"
+    output.mkdir()
+    log = tmp_path / "stage.log"
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    old_command = [
+        str(python),
+        "/repo/scripts/run_gpu_rounds.py",
+        "--task",
+        "mt",
+    ]
+    current_command = [
+        str(alias_parent / ".." / python.name),
+        *old_command[1:],
+    ]
+    state = {
+        "stages": {
+            "stage": {
+                "status": "complete",
+                "command": old_command,
+                "command_sha256": bakeoff.command_digest(old_command),
+                "output_evidence": bakeoff.output_evidence([output]),
+            }
+        }
+    }
+
+    run_stage("stage", current_command, state_path, state, log, [output])
+
+    assert not log.exists()
+    assert state["stages"]["stage"]["command"] == old_command
+
+
+def test_completed_training_alias_requires_recorded_output_evidence(tmp_path: Path):
+    state_path = tmp_path / "state.json"
+    output = tmp_path / "training-output"
+    output.mkdir()
+    log = tmp_path / "stage.log"
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    old_command = [str(python), "/repo/scripts/run_gpu_rounds.py", "--task", "mt"]
+    current_command = [str(alias_parent / ".." / python.name), *old_command[1:]]
+    state = {
+        "stages": {
+            "stage": {
+                "status": "complete",
+                "command": old_command,
+                "command_sha256": bakeoff.command_digest(old_command),
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="output evidence missing"):
+        run_stage("stage", current_command, state_path, state, log, [output])
+
+
+def test_interpreter_alias_compatibility_rejects_other_command_changes(
+    tmp_path: Path,
+):
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    old_command = [str(python), "/repo/scripts/run_gpu_rounds.py", "--task", "mt"]
+
+    assert not bakeoff.interpreter_alias_only_command_change(
+        old_command,
+        [
+            str(alias_parent / ".." / python.name),
+            *old_command[1:],
+            "--samples",
+            "1",
+        ],
+    )
+
+
 def test_runner_generation_compatibility_accepts_same_interpreter_alias(
     tmp_path: Path,
 ):

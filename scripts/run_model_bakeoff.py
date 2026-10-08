@@ -211,6 +211,44 @@ def resume_scoring_command_compatible(
     )
 
 
+def interpreter_alias_only_command_change(
+    previous_command: Any,
+    current_command: list[str],
+) -> bool:
+    """Accept only an equivalent spelling of the command executable.
+
+    Completed training stages created before a recovery runner upgrade do not
+    carry ``--bakeoff-runner-sha256``.  They are still immutable evidence, but
+    may have recorded the shared virtualenv interpreter through a different
+    relative alias.  Treat that spelling-only difference as compatible only
+    when both paths currently resolve, strictly, to the same regular file and
+    every remaining command token is byte-for-byte identical.
+    """
+    if (
+        not isinstance(previous_command, list)
+        or not previous_command
+        or not current_command
+        or not all(isinstance(item, str) for item in previous_command)
+        or not all(isinstance(item, str) for item in current_command)
+    ):
+        return False
+    previous = list(previous_command)
+    current = list(current_command)
+    if previous[0] == current[0] or previous[1:] != current[1:]:
+        return False
+    try:
+        previous_executable = Path(previous[0])
+        current_executable = Path(current[0])
+        return (
+            previous_executable.is_file()
+            and current_executable.is_file()
+            and previous_executable.resolve(strict=True)
+            == current_executable.resolve(strict=True)
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
 def runner_generation_only_command_change(
     previous_command: Any,
     current_command: list[str],
@@ -1287,17 +1325,26 @@ def run_stage(
             command_changed
             and resume_scoring_command_compatible(previous.get("command"), command)
         )
-        immutable_runner_upgrade = (
+        immutable_command_compatibility = (
             command_changed
-            and runner_generation_only_command_change(previous.get("command"), command)
+            and (
+                interpreter_alias_only_command_change(previous.get("command"), command)
+                or runner_generation_only_command_change(
+                    previous.get("command"), command
+                )
+            )
         )
-        if command_changed and not (recovery_only_upgrade or immutable_runner_upgrade):
+        if command_changed and not (
+            recovery_only_upgrade or immutable_command_compatibility
+        ):
             raise ValueError(f"Cannot resume {name}: command changed")
         current_evidence = output_evidence(expected_outputs)
         recorded_evidence = previous.get("output_evidence")
+        if immutable_command_compatibility and recorded_evidence is None:
+            raise ValueError(f"Cannot resume {name}: output evidence missing")
         if recorded_evidence is not None and recorded_evidence != current_evidence:
             raise ValueError(f"Cannot resume {name}: output evidence changed")
-        if immutable_runner_upgrade:
+        if immutable_command_compatibility:
             return
         if not recovery_only_upgrade:
             return

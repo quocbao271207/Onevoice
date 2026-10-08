@@ -1,6 +1,6 @@
 # OneVoice / MediVoice Edge — Project Analysis & Execution Ledger
 
-> Cập nhật gần nhất: **27/09/2026 (Asia/Bangkok)**
+> Cập nhật gần nhất: **08/10/2026 (Asia/Bangkok)**
 > Chủ dự án: **1 người**
 > Cách dùng máy: kiểm tra dữ liệu và chạy thử trên máy local; **chỉ thuê GPU online khi fine-tune**
 > Trạng thái tổng: **DỮ LIỆU/GPU-READY, LOCAL TRAINING PATH ĐÃ SMOKE PASS, RELEASE GATE ĐANG KHÓA** — ASR/MT LoRA đã chạy một bước thật trên CPU và không được promote; baseline chưa đạt accuracy gate, đồng thời suite lâm sàng còn lỗi phủ định/thuật ngữ/code-switch. PhoWhisper/NLLB vẫn cần full GPU fine-tune và QCS6490 BYOM parity trước release.
@@ -66,6 +66,7 @@ voice EN → ASR → text EN → MT → text VN → TTS → voice VN
 
 | Thời điểm | Trạng thái | Việc đã làm và lý do |
 |---|---|---|
+| 08/10/2026 | ✅ Bake-off resume hardening | Sửa nguyên nhân recovery dừng ở completed MT training stage: stage train cũ không mang `--bakeoff-runner-sha256`, nên logic tương thích 829940e không xét được trường hợp chỉ khác cách viết interpreter (`../.venv-onevoice/bin/python` so với `./.venv-onevoice/bin/python`). Resume nay chỉ chấp nhận alias khi hai đường dẫn `resolve(strict=True)` tới cùng regular file và mọi token còn lại giống byte-for-byte; mọi thay đổi argument khác vẫn bị từ chối. Completed stage chỉ được skip khi có `output_evidence` đã ghi và bằng chứng hiện tại khớp. Regression local: 275 pass, 1 skip; compile toàn bộ `src/scripts/demo/tests` pass. Không thay đổi hoặc restart process remote. |
 | 27/09/2026 | ✅ Accuracy program | Khóa kế hoạch `configs/accuracy_program.yaml`: chọn checkpoint theo WER/BLEU/chrF nhưng bắt buộc mọi slice thuốc, liều, số, đơn vị, phủ định, thuật ngữ và code-switch cùng pass. Thêm train-only clinical oversampling hệ số 2; validation/test không nhân bản và suite lâm sàng 16 cặp/32 chiều bị kiểm tra exact-pair không trùng train. |
 | 27/09/2026 | ✅ Local fine-tune smoke | Sửa training CLI hỗ trợ LoRA và chế độ CPU smoke fail-closed. Chạy thật PhoWhisper một bước: 1.769.472 tham số trainable, train/eval loss 2,5475/2,3259. Chạy thật NLLB joint một bước: 2.359.296 tham số trainable, train/eval loss 1,3301/2,2388. Cả hai artifact ghi `promotion_allowed=false`; đây chỉ chứng minh đường train hoạt động, không phải bằng chứng accuracy tăng. |
 | 27/09/2026 | ⛔ Clinical release gate | NLLB base benchmark trên suite khóa 32 chiều đạt BLEU 46,29/chrF2 63,46 nhưng safety gate fail: thuốc/liều/số/đơn vị 0 lỗi phát hiện, phủ định 5,56%, thuật ngữ 33,33%, code-switch 75%. Aggregate baseline cũng chưa đạt ngưỡng (ASR VI 20,87% >19%, ASR EN 25,54% >23%, MT BLEU 23,76 <25). `release_gate.json` đặt `promotion_allowed=false`; ví dụ nguy hiểm thật: `HIV negative` bị dịch thành `HIV dương tính`. |
