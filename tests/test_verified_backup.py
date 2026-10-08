@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import stat
 import tarfile
 from pathlib import Path
 
@@ -50,6 +52,12 @@ def rewrite_tar(path: Path, name: str, payload: bytes) -> None:
     with tarfile.open(path, mode="w", format=tarfile.PAX_FORMAT) as tar:
         member = tarfile.TarInfo(name)
         member.size = len(payload)
+        member.mode = backup.CANONICAL_TAR_MODE
+        member.mtime = backup.CANONICAL_TAR_MTIME
+        member.uid = backup.CANONICAL_TAR_OWNER_ID
+        member.gid = backup.CANONICAL_TAR_OWNER_ID
+        member.uname = ""
+        member.gname = ""
         tar.addfile(member, io.BytesIO(payload))
 
 
@@ -77,6 +85,56 @@ def test_backup_verifies_member_checksums_counts_bytes_and_structure(
     archives[0]["source_bytes"] = int(archives[0]["source_bytes"]) + 1
     write_metadata(output, archives)
     with pytest.raises(RuntimeError, match="Source byte-count mismatch in manifest"):
+        backup.verify(output)
+
+
+def test_backup_tar_is_deterministic_and_has_canonical_private_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "project"
+    source = root / "models"
+    source.mkdir(parents=True)
+    model = source / "adapter.bin"
+    model.write_bytes(b"model")
+    monkeypatch.setattr(backup, "ROOT", root)
+
+    first = tmp_path / "first.tar"
+    second = tmp_path / "second.tar"
+    backup.archive(source, first)
+    os.utime(model, (1_700_000_000, 1_700_000_000))
+    backup.archive(source, second)
+
+    assert first.read_bytes() == second.read_bytes()
+    with tarfile.open(first, mode="r") as tar:
+        member = tar.getmembers()[0]
+    assert member.mode == backup.CANONICAL_TAR_MODE
+    assert member.mtime == backup.CANONICAL_TAR_MTIME
+    assert member.uid == member.gid == backup.CANONICAL_TAR_OWNER_ID
+    assert member.uname == member.gname == ""
+    if os.name == "posix":
+        assert stat.S_IMODE(first.stat().st_mode) == backup.CANONICAL_TAR_MODE
+
+
+def test_backup_rejects_noncanonical_tar_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "project"
+    output = tmp_path / "backup"
+    monkeypatch.setattr(backup, "ROOT", root)
+    archives = write_bundle(root, output)
+    member_name = str(archives[0]["members"][0]["path"])
+    payload = (root / member_name).read_bytes()
+    with tarfile.open(output / "data.tar", mode="w", format=tarfile.PAX_FORMAT) as tar:
+        member = tarfile.TarInfo(member_name)
+        member.size = len(payload)
+        member.mode = 0o644
+        member.mtime = backup.CANONICAL_TAR_MTIME
+        member.uname = "local-user"
+        tar.addfile(member, io.BytesIO(payload))
+    refresh_archive_envelope(archives[0], output / "data.tar")
+    write_metadata(output, archives)
+
+    with pytest.raises(RuntimeError, match="Non-canonical tar metadata"):
         backup.verify(output)
 
 

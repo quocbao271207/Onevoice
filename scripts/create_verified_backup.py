@@ -47,6 +47,10 @@ MAX_RELEASE_COMPARISON_BYTES = 50_000_000
 MAX_BACKUP_MANIFEST_BYTES = 64 * 1024 * 1024
 MAX_BACKUP_CHECKSUM_BYTES = 4 * 1024
 MAX_PROJECT_ROOT_CHARS = 4 * 1024
+CANONICAL_TAR_MODE = 0o600
+CANONICAL_TAR_MTIME = 0
+CANONICAL_TAR_OWNER_ID = 0
+PRIVATE_DIRECTORY_MODE = 0o700
 MANIFEST_FIELDS = {
     "schema_version",
     "created_at",
@@ -97,6 +101,11 @@ def _absolute(path: Path) -> Path:
 def _reject_link(path: Path, label: str) -> None:
     if path.is_symlink() or _is_junction(path):
         raise ValueError(f"Refusing {label} symlink or junction: {path}")
+
+
+def _set_private_file_permissions(path: Path) -> None:
+    if os.name == "posix":
+        path.chmod(CANONICAL_TAR_MODE)
 
 
 def _reject_link_ancestors(path: Path, label: str) -> None:
@@ -335,6 +344,35 @@ def _verify_tar(
         for member in members:
             if not member.isfile():
                 raise RuntimeError(f"Non-regular tar member in {path}: {member.name}")
+            if (
+                member.mode != CANONICAL_TAR_MODE
+                or member.mtime != CANONICAL_TAR_MTIME
+                or member.uid != CANONICAL_TAR_OWNER_ID
+                or member.gid != CANONICAL_TAR_OWNER_ID
+                or member.uname
+                or member.gname
+                or member.linkname
+                or member.devmajor != 0
+                or member.devminor != 0
+            ):
+                raise RuntimeError(f"Non-canonical tar metadata in {path}: {member.name}")
+            unexpected_pax = set(member.pax_headers) - {"path", "size"}
+            if unexpected_pax:
+                raise RuntimeError(
+                    f"Unexpected PAX metadata in {path}: {member.name} "
+                    f"({sorted(unexpected_pax)})"
+                )
+            if member.pax_headers.get("path", member.name) != member.name:
+                raise RuntimeError(f"PAX path mismatch in {path}: {member.name}")
+            if "size" in member.pax_headers:
+                try:
+                    pax_size = int(member.pax_headers["size"])
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"Invalid PAX size in {path}: {member.name}"
+                    ) from error
+                if pax_size != member.size:
+                    raise RuntimeError(f"PAX size mismatch in {path}: {member.name}")
         names = [member.name for member in members]
         if len(names) != len(set(names)):
             raise RuntimeError(f"Duplicate member path: {path}")
@@ -387,7 +425,17 @@ def archive(source: Path, destination: Path, excluded: Iterable[Path] = ()) -> d
     try:
         with tarfile.open(temporary, mode="w", format=tarfile.PAX_FORMAT) as tar:
             for path, record in zip(files, records, strict=True):
-                tar.add(path, arcname=str(record["path"]), recursive=False)
+                member = tarfile.TarInfo(str(record["path"]))
+                member.size = int(record["bytes"])
+                member.mode = CANONICAL_TAR_MODE
+                member.mtime = CANONICAL_TAR_MTIME
+                member.uid = CANONICAL_TAR_OWNER_ID
+                member.gid = CANONICAL_TAR_OWNER_ID
+                member.uname = ""
+                member.gname = ""
+                with path.open("rb") as handle:
+                    tar.addfile(member, handle)
+        _set_private_file_permissions(temporary)
         _verify_tar(temporary, source_name, records)
         os.replace(temporary, destination)
     except BaseException:
@@ -416,6 +464,7 @@ def _atomic_write(path: Path, content: str) -> None:
         temporary.unlink()
     try:
         temporary.write_text(content, encoding="utf-8", newline="\n")
+        _set_private_file_permissions(temporary)
         os.replace(temporary, path)
     except BaseException:
         if temporary.exists() and temporary.is_file() and not temporary.is_symlink():
@@ -674,7 +723,7 @@ def create_backup(
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     _reject_link_ancestors(output_dir.parent, "backup output ancestor")
     staging = output_dir.with_name(f".{output_dir.name}.part-{uuid.uuid4().hex}")
-    staging.mkdir(exist_ok=False)
+    staging.mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=False)
     try:
         reports = ROOT / "data" / "reports"
         archives = [
