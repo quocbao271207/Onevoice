@@ -7,12 +7,17 @@ import csv
 import html
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-import yaml
 from scipy.signal import resample_poly
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 try:
     from scripts.materialize_audio import destination_path, download_one, refresh_audio_urls
@@ -20,7 +25,7 @@ except ModuleNotFoundError:  # Direct execution from the scripts directory.
     from materialize_audio import destination_path, download_one, refresh_audio_urls
 
 
-ROOT = Path(__file__).resolve().parents[1]
+MAX_DATASET_CONFIG_BYTES = 1_000_000
 
 
 def make_review_copy(original: Path, target: Path) -> dict[str, float]:
@@ -55,7 +60,11 @@ def main() -> int:
     parser.add_argument("--min-duration-s", type=float, default=2.0)
     parser.add_argument("--min-rms", type=float, default=0.003)
     args = parser.parse_args()
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_DATASET_CONFIG_BYTES,
+        label="Listening-pack dataset config",
+    ).mapping
     dataset_specs = config.get("datasets")
     if not isinstance(dataset_specs, dict):
         raise ValueError("Dataset config must contain a datasets mapping")

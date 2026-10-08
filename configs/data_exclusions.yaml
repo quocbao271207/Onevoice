@@ -1,5 +1,5 @@
 version: 1
-updated: 2026-09-22
+updated: "2026-09-22"
 policy: "Exclude only evidence-backed corrupt/alignment/PII records; retain false-positive scientific identifiers."
 
 exclusions:

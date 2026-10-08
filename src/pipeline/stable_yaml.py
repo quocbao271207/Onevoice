@@ -130,6 +130,47 @@ def _validate_tree(value: Any, *, label: str) -> None:
     raise ValueError(f"{label} contains an unsupported YAML type")
 
 
+def parse_strict_yaml_mapping(
+    payload: bytes,
+    *,
+    label: str,
+    maximum_depth: int = 32,
+    maximum_nodes: int = 10_000,
+) -> dict[str, Any]:
+    """Parse an already-stabilized byte payload under the strict YAML policy."""
+    for value, name in (
+        (maximum_depth, "maximum_depth"),
+        (maximum_nodes, "maximum_nodes"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(label, str) or not label:
+        raise ValueError("label must be a non-empty string")
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    try:
+        content = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise StableYamlEncodingError(f"{label} must be valid UTF-8") from None
+
+    loader = _StrictYamlLoader(
+        content,
+        label=label,
+        maximum_depth=maximum_depth,
+        maximum_nodes=maximum_nodes,
+    )
+    try:
+        mapping = loader.get_single_data()
+    except (yaml.YAMLError, RecursionError):
+        raise StableYamlSyntaxError(f"{label} is not valid strict YAML") from None
+    finally:
+        loader.dispose()
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{label} root must be a mapping")
+    _validate_tree(mapping, label=label)
+    return mapping
+
+
 def read_stable_yaml_mapping(
     path: Path,
     *,
@@ -169,26 +210,12 @@ def read_stable_yaml_mapping(
     digest = hashlib.sha256(payload).hexdigest()
     if expected_sha256 is not None and digest != expected_sha256:
         raise StableYamlDigestMismatch(f"{label} checksum does not match")
-    try:
-        content = payload.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        raise StableYamlEncodingError(f"{label} must be valid UTF-8") from None
-
-    loader = _StrictYamlLoader(
-        content,
+    mapping = parse_strict_yaml_mapping(
+        payload,
         label=label,
         maximum_depth=maximum_depth,
         maximum_nodes=maximum_nodes,
     )
-    try:
-        mapping = loader.get_single_data()
-    except (yaml.YAMLError, RecursionError):
-        raise StableYamlSyntaxError(f"{label} is not valid strict YAML") from None
-    finally:
-        loader.dispose()
-    if not isinstance(mapping, dict):
-        raise ValueError(f"{label} root must be a mapping")
-    _validate_tree(mapping, label=label)
     return StableYamlDocument(
         path=resolved,
         mapping=mapping,

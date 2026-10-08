@@ -10,11 +10,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
+
+
+MAX_PROJECT_CONFIG_BYTES = 1_000_000
 
 
 def sha256(path: Path) -> str:
@@ -99,7 +102,11 @@ def main() -> int:
     args = parser.parse_args()
 
     dataset_config_path = ROOT / "configs" / "datasets.yaml"
-    config = yaml.safe_load(dataset_config_path.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        dataset_config_path,
+        maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+        label="Preflight dataset config",
+    ).mapping
     checks = [check(True, "dataset_config", str(dataset_config_path))]
     eda_dir = ROOT / "data" / "reports" / "eda"
 
@@ -135,12 +142,20 @@ def main() -> int:
 
     review_decisions_path = ROOT / "configs" / "data_review_decisions.yaml"
     if review_decisions_path.is_file():
-        decisions = yaml.safe_load(review_decisions_path.read_text(encoding="utf-8"))
+        decisions = read_stable_yaml_mapping(
+            review_decisions_path,
+            maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+            label="Preflight data review decisions",
+        ).mapping
         pii_decision = decisions.get("pii_scan", {})
         pii_report_path = ROOT / str(pii_decision.get("report") or "")
         pii_report = load_json(pii_report_path) if pii_report_path.is_file() else {}
         exclusions_path = ROOT / "configs" / "data_exclusions.yaml"
-        exclusion_config = yaml.safe_load(exclusions_path.read_text(encoding="utf-8"))
+        exclusion_config = read_stable_yaml_mapping(
+            exclusions_path,
+            maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+            label="Preflight data exclusions",
+        ).mapping
         excluded_ids = {str(item.get("id")) for item in exclusion_config.get("exclusions", [])}
         true_positive_ids = {str(value) for value in pii_decision.get("true_positive_exclusions", [])}
         resolved_count = len(true_positive_ids) + int(pii_decision.get("retained_reviewed_false_positives") or 0)
@@ -189,7 +204,15 @@ def main() -> int:
 
         manifest_dir = ROOT / "data" / "processed" / "manifests"
         lock_path = ROOT / "configs" / "artifact_lock.yaml"
-        artifact_lock = yaml.safe_load(lock_path.read_text(encoding="utf-8")) if lock_path.is_file() else {}
+        artifact_lock = (
+            read_stable_yaml_mapping(
+                lock_path,
+                maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+                label="Preflight artifact lock",
+            ).mapping
+            if lock_path.is_file()
+            else {}
+        )
         locked_hashes = artifact_lock.get("manifests", {})
         locked_models = artifact_lock.get("base_models", {})
         locked_evaluation = artifact_lock.get("evaluation", {})

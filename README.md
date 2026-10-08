@@ -8,9 +8,9 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 
 - `project_analysis.md` — nguồn sự thật về kiến trúc, roadmap, trạng thái và quyết định
 - `configs/datasets.yaml` — registry dữ liệu, license, split và vai trò train/eval
-- `scripts/audit_datasets.py` — EDA metadata đầy đủ trước merge; URL tải ký chỉ tồn tại trong RAM và không được ghi vào record/listening report
-- `scripts/merge_manifests.py` — merge có khóa chống leakage
-- `scripts/materialize_audio.py` — refresh URL từ đúng Hugging Face datasets-server ngay trước khi tải, chỉ nhận public HTTPS và loại URL khỏi local manifest
+- `scripts/audit_datasets.py` — EDA metadata đầy đủ trước merge; dataset registry đi qua strict stable YAML boundary, URL tải ký chỉ tồn tại trong RAM và không được ghi vào record/listening report
+- `scripts/merge_manifests.py` — merge có khóa chống leakage; dataset/exclusion config strict/bounded/no-link
+- `scripts/materialize_audio.py` — đọc dataset registry strict/bounded/no-link, refresh URL từ đúng Hugging Face datasets-server ngay trước khi tải, chỉ nhận public HTTPS và loại URL khỏi local manifest
 - `scripts/sanitize_asr_report_urls.py` — dry-run mặc định để kiểm artifact EDA cũ; chỉ `--apply` mới loại nguyên tử đúng trường `audio_url`
 - `scripts/qc_local_audio.py` — decode, chuẩn hóa FLAC mono 16 kHz và loại near-silence/CPS bất khả thi
 - `scripts/run_baseline_benchmarks.py` — baseline/candidate ASR VI/EN và MT trên manifest strict/bounded đã khóa; prediction, provenance và report ghi crash-durable, resume-scoring chỉ dùng evidence exact-schema/path/bytes/SHA-256/rows đã đọc ổn định
@@ -36,7 +36,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `src/pipeline/durable_file.py` — ghi byte evidence crash-durable qua temp sở hữu riêng, `fsync` và persisted revalidation; hỗ trợ atomic replace cho checkpoint có thể tái tạo hoặc hard-link độc quyền không overwrite cho artifact bất biến
 - `src/pipeline/stable_json.py` — boundary JSON mapping dùng chung: strict UTF-8, cấm duplicate key/non-finite, stable bounded read, no-link path và optional SHA-256 binding
 - `src/pipeline/stable_jsonl.py` — boundary JSONL evidence dùng chung: streaming strict parser có byte/line/row cap, reject duplicate/non-finite/link, bind rows với stable SHA-256/bytes và có thể bắt buộc khớp digest ngoài
-- `src/pipeline/stable_yaml.py` — boundary YAML mapping dùng chung: stable bounded/no-link read, strict UTF-8, cấm alias/duplicate/non-finite/kiểu ngầm ngoài JSON-compatible, giới hạn depth/node và hỗ trợ exact SHA-256 binding
+- `src/pipeline/stable_yaml.py` — boundary YAML mapping dùng chung cho runtime, training, data/preflight và blind policy: stable bounded/no-link read hoặc parse exact payload đã khóa, strict UTF-8, cấm alias/duplicate/non-finite/kiểu ngầm ngoài JSON-compatible, giới hạn depth/node và hỗ trợ exact SHA-256 binding
 - `src/pipeline/flash_cache.py` — cache cụm cấp cứu exact-only; custom JSON bị giới hạn byte/entry, strict-schema, reject duplicate key/non-finite/link và chỉ publish nguyên tử sau safety validation
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê

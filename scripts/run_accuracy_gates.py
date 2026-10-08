@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
+
+
+MAX_ACCURACY_CONFIG_BYTES = 1_000_000
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -37,7 +41,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_ACCURACY_CONFIG_BYTES,
+        label="Accuracy gate config",
+    ).mapping
     thresholds = config["release_gates"]
     asr_vi = load_json(args.asr_vi)
     asr_en = load_json(args.asr_en)

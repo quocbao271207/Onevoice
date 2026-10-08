@@ -7,8 +7,6 @@ import json
 import sys
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -19,6 +17,10 @@ from scripts.audit_datasets import (  # noqa: E402
     select_listening_records,
 )
 from src.data.quality import cross_split_leakage, write_json  # noqa: E402
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
+
+
+MAX_DATASET_CONFIG_BYTES = 1_000_000
 
 
 def main() -> int:
@@ -26,7 +28,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "datasets.yaml")
     parser.add_argument("--audit-dir", type=Path, default=ROOT / "data" / "reports" / "eda")
     args = parser.parse_args()
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_DATASET_CONFIG_BYTES,
+        label="ASR leakage dataset config",
+    ).mapping
 
     for name, spec in config["datasets"].items():
         if not spec.get("enabled") or spec.get("task") != "asr":

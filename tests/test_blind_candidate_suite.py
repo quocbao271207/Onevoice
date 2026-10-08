@@ -1466,3 +1466,32 @@ def test_accuracy_policy_is_checksum_locked(tmp_path: Path):
     path.write_text("version: 2\n", encoding="utf-8")
     with pytest.raises(ValueError, match="Accuracy policy checksum mismatch"):
         load_locked_accuracy_config(config)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("version: 1\nversion: 1\n", "not valid UTF-8 YAML"),
+        ("version: &version 1\ncopy: *version\n", "not valid UTF-8 YAML"),
+        ("version: 1\nlimit: .nan\n", "non-finite"),
+        ("version: 1\ndate: 2026-10-09\n", "unsupported YAML type"),
+    ],
+)
+def test_accuracy_policy_uses_strict_yaml(
+    tmp_path: Path,
+    payload: str,
+    message: str,
+):
+    path = tmp_path / "accuracy.yaml"
+    path.write_text(payload, encoding="utf-8")
+    config = {
+        "data": {
+            "accuracy_program": {
+                "path": str(path),
+                "sha256": sha256(path),
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match=message):
+        load_locked_accuracy_config(config)

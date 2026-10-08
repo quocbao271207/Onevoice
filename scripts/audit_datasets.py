@@ -18,8 +18,6 @@ from urllib.parse import urlencode
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -33,9 +31,11 @@ from src.data.quality import (  # noqa: E402
     vietnamese_mark_ratio,
     write_json,
 )
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 
 API = "https://datasets-server.huggingface.co"
+MAX_DATASET_CONFIG_BYTES = 1_000_000
 
 
 def api_json(endpoint: str, params: dict[str, Any], retries: int = 8) -> dict[str, Any]:
@@ -400,7 +400,11 @@ def main() -> int:
     parser.add_argument("--max-rows", type=int, default=0, help="Per split; 0 performs a full audit.")
     args = parser.parse_args()
 
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_DATASET_CONFIG_BYTES,
+        label="Dataset audit config",
+    ).mapping
     selected = set(args.dataset or [])
     summaries: list[dict[str, Any]] = []
     for name, spec in config["datasets"].items():

@@ -14,22 +14,34 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
-import yaml
-
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
+
+
 DATASET_CONFIG = ROOT / "configs" / "datasets.yaml"
 ARTIFACT_LOCK = ROOT / "configs" / "artifact_lock.yaml"
+MAX_PROJECT_CONFIG_BYTES = 1_000_000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def load_registry() -> tuple[dict, dict]:
-    registry = yaml.safe_load(DATASET_CONFIG.read_text(encoding="utf-8"))["datasets"]
-    revisions = yaml.safe_load(ARTIFACT_LOCK.read_text(encoding="utf-8"))["datasets"]
+    registry = read_stable_yaml_mapping(
+        DATASET_CONFIG,
+        maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+        label="Dataset registry",
+    ).mapping["datasets"]
+    revisions = read_stable_yaml_mapping(
+        ARTIFACT_LOCK,
+        maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+        label="Dataset artifact lock",
+    ).mapping["datasets"]
     return registry, revisions
 
 

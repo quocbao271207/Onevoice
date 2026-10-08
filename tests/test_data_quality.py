@@ -10,6 +10,7 @@ from src.pipeline.orchestrator import MediVoicePipeline
 from src.pipeline.mt_engine import MTEngine, MTResult, NLLB_BASE_REVISION
 from src.utils.text_normalization import normalize_for_wer
 from scripts.merge_manifests import merge_task, source_records
+from scripts import download_datasets
 from scripts.download_datasets import download_dataset, load_registry
 from scripts.qc_local_audio import dedupe_exact_audio, repair_dc_offsets
 from scripts.apply_listening_review import LANGUAGE_BY_SOURCE
@@ -629,6 +630,23 @@ def test_download_registry_contains_only_locked_enabled_sources():
     for spec in registry.values():
         if spec.get("enabled", False):
             assert spec["repo_id"] in revisions
+
+
+def test_download_registry_rejects_ambiguous_yaml(tmp_path, monkeypatch):
+    import pytest
+
+    registry = tmp_path / "datasets.yaml"
+    registry.write_text(
+        "datasets: {}\ndatasets: {}\n",
+        encoding="utf-8",
+    )
+    lock = tmp_path / "artifact-lock.yaml"
+    lock.write_text("datasets: {}\n", encoding="utf-8")
+    monkeypatch.setattr(download_datasets, "DATASET_CONFIG", registry)
+    monkeypatch.setattr(download_datasets, "ARTIFACT_LOCK", lock)
+
+    with pytest.raises(ValueError, match="strict YAML"):
+        load_registry()
 
 
 def test_snapshot_downloader_refuses_disabled_and_eval_only_sources(tmp_path):

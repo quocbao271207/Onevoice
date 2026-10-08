@@ -5,15 +5,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterator
 
-import yaml
-
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
+
+
 ROLES = ("test", "validation", "train")
+MAX_PROJECT_CONFIG_BYTES = 1_000_000
 FATAL_FLAGS = {
     "empty_text",
     "invalid_duration",
@@ -247,12 +251,20 @@ def main() -> int:
     parser.add_argument("--allow-reviewed", action="store_true")
     args = parser.parse_args()
 
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+        label="Manifest merge dataset config",
+    ).mapping
     excluded_ids: set[str] = set()
     if args.exclusions.is_file():
         excluded_ids.update(item["id"] for item in read_jsonl(args.exclusions) if item.get("id"))
     if args.exclusions_config.is_file():
-        exclusion_config = yaml.safe_load(args.exclusions_config.read_text(encoding="utf-8")) or {}
+        exclusion_config = read_stable_yaml_mapping(
+            args.exclusions_config,
+            maximum_bytes=MAX_PROJECT_CONFIG_BYTES,
+            label="Manifest merge exclusions config",
+        ).mapping
         excluded_ids.update(item["id"] for item in exclusion_config.get("exclusions", []) if item.get("id"))
 
     by_task: dict[str, list[tuple[str, dict[str, Any]]]] = {"asr": [], "mt": []}

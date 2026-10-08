@@ -17,8 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -36,6 +34,11 @@ from src.pipeline.selection_policy import (  # noqa: E402
     configured_selection_hashes,
     selection_identity,
     selection_policy_record,
+)
+from src.pipeline.stable_yaml import (  # noqa: E402
+    StableYamlEncodingError,
+    StableYamlSyntaxError,
+    parse_strict_yaml_mapping,
 )
 from src.utils.bounded_file import (  # noqa: E402
     read_stable_regular_file,
@@ -725,11 +728,12 @@ def load_locked_accuracy_config(
     if actual != record["sha256"]:
         raise ValueError(f"Accuracy policy checksum mismatch: {actual}")
     try:
-        loaded = yaml.safe_load(payload.decode("utf-8"))
-    except (UnicodeDecodeError, yaml.YAMLError):
+        loaded = parse_strict_yaml_mapping(
+            payload,
+            label="Accuracy policy",
+        )
+    except (StableYamlEncodingError, StableYamlSyntaxError):
         raise ValueError("Accuracy policy is not valid UTF-8 YAML") from None
-    if not isinstance(loaded, dict):
-        raise ValueError("Accuracy policy root must be a mapping")
     return loaded
 
 

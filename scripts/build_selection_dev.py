@@ -15,16 +15,16 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data.quality import fingerprint_text  # noqa: E402
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 
 SEED = 20261005
+MAX_BAKEOFF_CONFIG_BYTES = 1_000_000
 NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 UNIT_RE = re.compile(
     r"(?:\b(?:mg|mcg|g|kg|ml|mmhg|bpm|gram|gam|microgram|nanogram|đơn vị|units?)\b|%)",
@@ -299,7 +299,11 @@ def main() -> int:
     if min(args.mt_size, args.asr_size) < 1:
         parser.error("selection sizes must be positive")
 
-    config = yaml.safe_load((ROOT / "configs/model_bakeoff.yaml").read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        ROOT / "configs/model_bakeoff.yaml",
+        maximum_bytes=MAX_BAKEOFF_CONFIG_BYTES,
+        label="Selection-dev bake-off config",
+    ).mapping
     excluded_rows: dict[str, list[dict[str, Any]]] = {"mt": [], "asr": []}
     exclusion_paths = [
         *(ROOT / path for path in config["data"]["train"].values()),

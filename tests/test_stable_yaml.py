@@ -7,6 +7,7 @@ from src.pipeline.stable_yaml import (
     StableYamlDigestMismatch,
     StableYamlEncodingError,
     StableYamlSyntaxError,
+    parse_strict_yaml_mapping,
     read_stable_yaml_mapping,
 )
 
@@ -34,6 +35,19 @@ def test_stable_yaml_returns_mapping_and_exact_identity(tmp_path: Path):
     assert document.mapping == {"version": 1, "items": [{"enabled": True}]}
     assert document.sha256 == hashlib.sha256(payload).hexdigest()
     assert document.bytes == len(payload)
+
+
+def test_strict_yaml_parser_handles_an_already_stabilized_payload():
+    assert parse_strict_yaml_mapping(
+        b"version: 1\n",
+        label="Embedded config",
+    ) == {"version": 1}
+
+    with pytest.raises(StableYamlSyntaxError, match="strict YAML"):
+        parse_strict_yaml_mapping(
+            b"version: 1\nversion: 2\n",
+            label="Embedded config",
+        )
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +16,10 @@ from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-import yaml
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 try:
     from scripts.audit_datasets import (
@@ -28,10 +32,10 @@ except ModuleNotFoundError:  # Direct execution from the scripts directory.
     from audit_datasets import api_json, durable_asr_record, normalize_asr_row, split_sizes
 
 
-ROOT = Path(__file__).resolve().parents[1]
 MAX_AUDIO_URL_CHARS = 16 * 1024
 MAX_AUDIO_DOWNLOAD_BYTES = 128 * 1024 * 1024
 MAX_DATASET_ROWS = 10_000_000
+MAX_DATASET_CONFIG_BYTES = 1_000_000
 DATASET_AUDIO_URL_HOST = "datasets-server.huggingface.co"
 PATH_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -251,7 +255,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "datasets.yaml")
     args = parser.parse_args()
 
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_DATASET_CONFIG_BYTES,
+        label="Audio materialization dataset config",
+    ).mapping
     desired: dict[tuple[str, str], dict[str, tuple[str, dict[str, Any]]]] = {}
     role_totals: Counter[str] = Counter()
     for role in args.roles:
