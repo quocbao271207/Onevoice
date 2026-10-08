@@ -11,6 +11,7 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
+    atomic_json,
     audit_completed_stage_resume,
     assert_interrupted_stage_is_not_live,
     bind_or_validate_invocation,
@@ -141,6 +142,50 @@ def test_bakeoff_state_rejects_linked_file(tmp_path: Path):
             maximum_bytes=1_000,
             label="Test state",
         )
+
+
+def test_atomic_bakeoff_json_is_bounded_strict_and_cleans_failed_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state_path = tmp_path / "state.json"
+    atomic_json(state_path, {"status": "running", "step": 1})
+    persisted = state_path.read_bytes()
+    assert persisted.endswith(b"\n")
+    assert json.loads(persisted) == {"status": "running", "step": 1}
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+    with pytest.raises(ValueError, match="not serializable"):
+        atomic_json(state_path, {"value": float("nan")})
+    assert state_path.read_bytes() == persisted
+
+    with pytest.raises(ValueError, match="exceeds 20 bytes"):
+        atomic_json(state_path, {"payload": "too large"}, maximum_bytes=20)
+    assert state_path.read_bytes() == persisted
+
+    monkeypatch.setattr(
+        bakeoff.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+    with pytest.raises(OSError, match="write failed"):
+        atomic_json(state_path, {"status": "updated"})
+    assert state_path.read_bytes() == persisted
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+def test_atomic_bakeoff_json_rejects_linked_destination(tmp_path: Path):
+    target = tmp_path / "target.json"
+    target.write_text('{"preserved":true}\n', encoding="utf-8")
+    linked = tmp_path / "state.json"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+
+    with pytest.raises(ValueError, match="cannot be a link"):
+        atomic_json(linked, {"preserved": False})
+    assert target.read_text(encoding="utf-8") == '{"preserved":true}\n'
 
 
 def test_bakeoff_fairness_and_selection_checksums_are_locked():

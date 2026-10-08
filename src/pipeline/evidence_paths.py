@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-def _is_link_or_junction(path: Path) -> bool:
+def is_link_or_junction(path: Path) -> bool:
     try:
         metadata = path.lstat()
     except OSError:
@@ -33,7 +33,7 @@ def resolve_regular_file(
     if not raw:
         raise ValueError(f"{label} path is missing")
     path = Path(os.path.abspath(Path(raw)))
-    if _is_link_or_junction(path):
+    if is_link_or_junction(path):
         raise ValueError(f"{label} cannot be a symlink or junction: {path}")
     if not path.is_file():
         raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
@@ -65,14 +65,14 @@ def resolve_regular_file_under(
         relative = path.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"{label} must remain under {root}") from exc
-    if _is_link_or_junction(project_boundary):
+    if is_link_or_junction(project_boundary):
         raise ValueError(
             f"{label} cannot traverse a symlink or junction: {project_boundary}"
         )
     current = project_boundary
     for part in (*root_relative.parts, *relative.parts):
         current /= part
-        if _is_link_or_junction(current):
+        if is_link_or_junction(current):
             raise ValueError(f"{label} cannot traverse a symlink or junction: {current}")
     resolved = resolve_regular_file(
         path,
@@ -107,14 +107,14 @@ def resolve_regular_directory_under(
         relative = path.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"{label} must remain under {root}") from exc
-    if _is_link_or_junction(project_boundary):
+    if is_link_or_junction(project_boundary):
         raise ValueError(
             f"{label} cannot traverse a symlink or junction: {project_boundary}"
         )
     current = project_boundary
     for part in (*root_relative.parts, *relative.parts):
         current /= part
-        if _is_link_or_junction(current):
+        if is_link_or_junction(current):
             raise ValueError(f"{label} cannot traverse a symlink or junction: {current}")
     if not path.is_dir():
         raise FileNotFoundError(f"{label} is missing or not a directory: {path}")
