@@ -54,6 +54,7 @@ from src.data.quality import fingerprint_text  # noqa: E402
 from src.pipeline.evidence_paths import (  # noqa: E402
     resolve_regular_directory_under,
     resolve_regular_file_under,
+    resolve_regular_file_without_links,
 )
 from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
@@ -1722,6 +1723,44 @@ def validate_deployment_report(
     if report.get("measurement_source") != "physical_board":
         failures.append("measurement_source:not_physical_board")
 
+    selection = report.get("selection_comparison")
+    if not isinstance(selection, dict) or set(selection) != {"path", "sha256"}:
+        failures.append("selection_comparison:invalid")
+    else:
+        selection_sha = selection.get("sha256")
+        selection_path: Path | None = None
+        if not isinstance(selection_sha, str) or not SHA256_RE.fullmatch(
+            selection_sha
+        ):
+            failures.append("selection_comparison:sha256_invalid")
+        try:
+            selection_path = resolve_regular_file_without_links(
+                selection.get("path"),
+                label="Selection comparison",
+                maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+            )
+        except FileNotFoundError:
+            failures.append("selection_comparison:missing_file")
+        except ValueError:
+            failures.append("selection_comparison:path_unsafe")
+        if selection_path is not None:
+            try:
+                read_json_mapping(
+                    selection_path,
+                    maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+                    label="Selection comparison",
+                    expected_sha256=(
+                        selection_sha
+                        if isinstance(selection_sha, str)
+                        and SHA256_RE.fullmatch(selection_sha)
+                        else None
+                    ),
+                )
+            except JsonDocumentDigestMismatch:
+                failures.append("selection_comparison:sha256_mismatch")
+            except (FileNotFoundError, RuntimeError, ValueError):
+                failures.append("selection_comparison:invalid_json")
+
     gate = report.get("deployment_gate")
     expected_gate_metrics = deployment_required_metrics(required_metrics)
     if not isinstance(gate, dict):
@@ -2230,9 +2269,29 @@ def validate_deployment_draft(
     if not isinstance(selection, dict):
         failures.append("selection_comparison:missing")
     else:
-        if selection.get("path") != str(comparison_path.resolve()):
+        try:
+            resolved_comparison = resolve_regular_file_without_links(
+                comparison_path,
+                label="Selection comparison",
+                maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+            )
+            comparison_sha256, _ = sha256_stable_regular_file(
+                resolved_comparison,
+                maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+                label="Selection comparison",
+            )
+        except (FileNotFoundError, RuntimeError, ValueError):
+            failures.append("selection_comparison:file_invalid")
+            resolved_comparison = None
+            comparison_sha256 = None
+        if resolved_comparison is not None and selection.get("path") != str(
+            resolved_comparison
+        ):
             failures.append("selection_comparison:path_mismatch")
-        if selection.get("sha256") != sha256(comparison_path):
+        if (
+            comparison_sha256 is not None
+            and selection.get("sha256") != comparison_sha256
+        ):
             failures.append("selection_comparison:checksum_mismatch")
 
     expected_by_key = {

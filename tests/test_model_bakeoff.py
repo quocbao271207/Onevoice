@@ -2200,6 +2200,9 @@ def test_deployment_expectations_bind_exact_adapter_tree(tmp_path: Path):
 def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: Path):
     checksum = "a" * 64
     project_root = tmp_path / "project"
+    selection = project_root / "selection-comparison.json"
+    selection.parent.mkdir(parents=True)
+    selection.write_text('{"status":"blind_complete"}', encoding="utf-8")
     identity = (
         project_root
         / "data/reports/model_bakeoff/board-evidence/qcs6490-identity.json"
@@ -2375,6 +2378,10 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "target": "QCS6490",
         "measurement_source": "physical_board",
         "measured_at": "2026-10-06T12:00:00+07:00",
+        "selection_comparison": {
+            "path": str(selection.resolve()),
+            "sha256": bakeoff.sha256(selection),
+        },
         "device": {
             "chipset": "QCS6490",
             "board": "Dragonwing RB3 Gen 2 Vision Kit",

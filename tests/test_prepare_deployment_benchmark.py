@@ -14,7 +14,14 @@ from scripts.prepare_deployment_benchmark import (
     selected_winner_specs,
 )
 from scripts.run_blind_candidate_suite import coverage_counts
-from scripts.run_model_bakeoff import QUANTIZATION_PARITY_SLICES, sha256, tree_manifest
+from scripts.run_model_bakeoff import (
+    QUANTIZATION_PARITY_SLICES,
+    deployment_expectations,
+    deployment_required_metrics,
+    sha256,
+    tree_manifest,
+    validate_deployment_report,
+)
 from src.data.quality import fingerprint_text
 from src.pipeline.license_policy import license_decisions
 from src.pipeline.selection_policy import selection_policy_record
@@ -500,6 +507,17 @@ def test_template_binds_all_selected_winners(tmp_path: Path):
     assert all(winner["temperature_samples_c"] == [] for winner in report["winners"])
 
 
+def test_template_rejects_selection_argument_file_mismatch(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    comparison["status"] = "complete"
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the stable file payload",
+    ):
+        build_template(selection, comparison, config, project_root)
+
+
 def test_template_allows_one_mt_candidate_to_win_both_directions(tmp_path: Path):
     selection, comparison, config, project_root = deployment_fixture(
         tmp_path,
@@ -659,6 +677,20 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
         )
         assert winner["artifact_sha256"] == sha256(artifact)
         assert winner["model_bytes"] == artifact.stat().st_size
+
+    selection.write_text('{"status":"tampered"}', encoding="utf-8")
+    expected = deployment_expectations(selected_winner_specs(comparison))
+    gate = config["promotion_gate"]
+    passed, failures = validate_deployment_report(
+        report,
+        expected,
+        deployment_required_metrics(list(gate["deployment_metrics"])),
+        int(gate["deployment_min_runs"]),
+        project_root,
+    )
+
+    assert not passed
+    assert "selection_comparison:sha256_mismatch" in failures
 
 
 def test_finalize_rejects_changed_winner_binding(tmp_path: Path):

@@ -39,13 +39,15 @@ from scripts.run_model_bakeoff import (  # noqa: E402
     percentile_linear,
     quantization_parity_evidence_failures,
     read_json_mapping,
-    sha256,
     validate_deployment_report,
 )
 from scripts.run_blind_candidate_suite import (  # noqa: E402
     verify_completed_blind_selection,
 )
-from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    resolve_regular_file_under,
+    resolve_regular_file_without_links,
+)
 from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
 from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
@@ -97,12 +99,43 @@ def selected_winner_specs(comparison: dict[str, Any]) -> list[tuple[str, str | N
     return specs
 
 
+def _load_bound_selection_comparison(
+    selection_path: Path,
+    comparison: dict[str, Any],
+) -> tuple[Path, dict[str, Any], str]:
+    """Bind the caller payload to one stable, link-free selection document."""
+    resolved = resolve_regular_file_without_links(
+        selection_path,
+        label="Selection comparison",
+        maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+    )
+    digest, _ = sha256_stable_regular_file(
+        resolved,
+        maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+        label="Selection comparison",
+    )
+    loaded = read_json_mapping(
+        resolved,
+        maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+        label="Selection comparison",
+        expected_sha256=digest,
+    )
+    if loaded != comparison:
+        raise ValueError(
+            "Selection comparison argument does not match the stable file payload"
+        )
+    return resolved, loaded, digest
+
+
 def build_template(
     selection_path: Path,
     comparison: dict[str, Any],
     config: dict[str, Any],
     project_root: Path = ROOT,
 ) -> dict[str, Any]:
+    selection_path, comparison, selection_sha256 = (
+        _load_bound_selection_comparison(selection_path, comparison)
+    )
     winner_specs = selected_winner_specs(comparison)
     verify_completed_blind_selection(
         selection_path,
@@ -119,8 +152,8 @@ def build_template(
         "measurement_source": "physical_board",
         "measured_at": None,
         "selection_comparison": {
-            "path": str(selection_path.resolve()),
-            "sha256": sha256(selection_path),
+            "path": str(selection_path),
+            "sha256": selection_sha256,
         },
         "device": {
             "chipset": "QCS6490",
@@ -303,6 +336,9 @@ def finalize_report(
     config: dict[str, Any],
     project_root: Path = ROOT,
 ) -> dict[str, Any]:
+    selection_path, comparison, selection_sha256 = (
+        _load_bound_selection_comparison(selection_path, comparison)
+    )
     winner_specs = selected_winner_specs(comparison)
     verify_completed_blind_selection(
         selection_path,
@@ -331,8 +367,8 @@ def finalize_report(
     final["target"] = "QCS6490"
     final["measurement_source"] = "physical_board"
     final["selection_comparison"] = {
-        "path": str(selection_path.resolve()),
-        "sha256": sha256(selection_path),
+        "path": str(selection_path),
+        "sha256": selection_sha256,
     }
     device = final.get("device")
     if not isinstance(device, dict):
