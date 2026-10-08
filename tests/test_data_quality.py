@@ -307,6 +307,113 @@ def test_mt_engine_direct_api_exposes_failure_without_logging_raw_text(caplog):
     )
 
 
+def test_mt_direction_state_and_generation_share_one_critical_section():
+    import numpy as np
+
+    class TrackingLock:
+        def __init__(self):
+            self.active = False
+            self.entries = 0
+
+        def __enter__(self):
+            assert not self.active
+            self.active = True
+            self.entries += 1
+            return self
+
+        def __exit__(self, *_exc_info):
+            self.active = False
+
+    lock = TrackingLock()
+
+    class FakeInputs(dict):
+        def to(self, _device):
+            assert lock.active
+            return self
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __init__(self):
+            self._src_lang = None
+
+        @property
+        def src_lang(self):
+            return self._src_lang
+
+        @src_lang.setter
+        def src_lang(self, value):
+            assert lock.active
+            self._src_lang = value
+
+        def __call__(self, *_args, **_kwargs):
+            assert lock.active
+            return FakeInputs(input_ids=np.zeros((1, 3), dtype=np.int64))
+
+        def convert_tokens_to_ids(self, _value):
+            assert lock.active
+            return 2
+
+        def decode(self, _tokens, **_kwargs):
+            assert lock.active
+            return "Dùng aspirin 5 mg."
+
+    class FakeModel:
+        def generate(self, **_kwargs):
+            assert lock.active
+            return [[2, 3, 1]]
+
+    engine = MTEngine(device="cpu")
+    engine.tokenizer = FakeTokenizer()
+    engine.model = FakeModel()
+    engine.loaded_model_path = "mt-model"
+    engine._is_loaded = True
+    engine._inference_lock = lock
+
+    result = engine.translate("Give aspirin 5 mg.", "en", "vi")
+
+    assert result.safety_passed
+    assert lock.entries == 1
+    assert lock.active is False
+
+
+def test_mt_inference_lock_is_released_after_model_failure():
+    import numpy as np
+    import pytest
+
+    class FakeInputs(dict):
+        def to(self, _device):
+            return self
+
+    class FakeTokenizer:
+        src_lang = None
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __call__(self, *_args, **_kwargs):
+            return FakeInputs(input_ids=np.zeros((1, 3), dtype=np.int64))
+
+        def convert_tokens_to_ids(self, _value):
+            return 2
+
+    class FailingModel:
+        def generate(self, **_kwargs):
+            raise RuntimeError("simulated MT inference failure")
+
+    engine = MTEngine(device="cpu")
+    engine.tokenizer = FakeTokenizer()
+    engine.model = FailingModel()
+    engine.loaded_model_path = "mt-model"
+    engine._is_loaded = True
+
+    with pytest.raises(RuntimeError, match="simulated MT inference failure"):
+        engine.translate("Give aspirin 5 mg.", "en", "vi")
+
+    assert engine._inference_lock.acquire(blocking=False)
+    engine._inference_lock.release()
+
+
 def test_mt_engine_rejects_blank_and_overlength_source_without_truncation():
     import numpy as np
     import pytest

@@ -16,6 +16,7 @@ import math
 import time
 import json
 from numbers import Real
+from threading import Lock
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -258,6 +259,7 @@ class MTEngine:
         self.tokenizer = None
         self._is_loaded = False
         self.loaded_model_path: Optional[str] = None
+        self._inference_lock = Lock()
 
     @property
     def is_ready(self) -> bool:
@@ -274,7 +276,8 @@ class MTEngine:
         if self.is_ready:
             logger.info("MT engine already ready; skipping reload")
             return
-        self._is_loaded = False
+        with self._inference_lock:
+            self._is_loaded = False
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -327,11 +330,12 @@ class MTEngine:
             loaded_model_path = fallback
 
         param_count = sum(p.numel() for p in model.parameters()) / 1e6
-        self.device = resolved_device
-        self.tokenizer = tokenizer
-        self.model = model
-        self.loaded_model_path = loaded_model_path
-        self._is_loaded = True
+        with self._inference_lock:
+            self.device = resolved_device
+            self.tokenizer = tokenizer
+            self.model = model
+            self.loaded_model_path = loaded_model_path
+            self._is_loaded = True
         logger.info(f"MT model loaded: {param_count:.0f}M parameters on {self.device}")
 
     def translate(
@@ -370,51 +374,59 @@ class MTEngine:
         direction = f"{source_lang}_to_{target_lang}"
         if source_lang not in NLLB_LANG_CODES or target_lang not in NLLB_LANG_CODES or source_lang == target_lang:
             raise ValueError(f"Unsupported translation direction: {direction}")
-        self.tokenizer.src_lang = NLLB_LANG_CODES[source_lang]
-
-        # Tokenize
         import torch
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=False,
-        )
-        input_ids = inputs.get("input_ids")
-        if input_ids is None or not hasattr(input_ids, "shape") or len(input_ids.shape) < 2:
-            raise RuntimeError("MT tokenizer did not return batched input_ids")
-        source_tokens = int(input_ids.shape[-1])
-        if source_tokens > self.max_source_tokens:
-            raise ValueError(
-                "MT source has "
-                f"{source_tokens} tokens; limit is {self.max_source_tokens}. "
-                "Refusing to silently truncate clinical text."
-            )
-        inputs = inputs.to(self.device)
 
-        # Generate translation
-        first_token_time = None
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                num_beams=self.num_beams,
-                forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(NLLB_LANG_CODES[target_lang]),
+        # The tokenizer stores source language as mutable shared state. Keep
+        # direction selection, tokenization, generation, and decoding in one
+        # critical section so concurrent opposite-direction requests cannot
+        # contaminate each other.
+        with self._inference_lock:
+            self.tokenizer.src_lang = NLLB_LANG_CODES[source_lang]
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=False,
+            )
+            input_ids = inputs.get("input_ids")
+            if (
+                input_ids is None
+                or not hasattr(input_ids, "shape")
+                or len(input_ids.shape) < 2
+            ):
+                raise RuntimeError("MT tokenizer did not return batched input_ids")
+            source_tokens = int(input_ids.shape[-1])
+            if source_tokens > self.max_source_tokens:
+                raise ValueError(
+                    "MT source has "
+                    f"{source_tokens} tokens; limit is {self.max_source_tokens}. "
+                    "Refusing to silently truncate clinical text."
+                )
+            inputs = inputs.to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    num_beams=self.num_beams,
+                    forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(
+                        NLLB_LANG_CODES[target_lang]
+                    ),
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+
+            generated_tokens = outputs[0]
+            require_completed_generation(
+                generated_tokens,
+                self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                context="MT generation",
             )
-
-        # Decode output
-        generated_tokens = outputs[0]
-        require_completed_generation(
-            generated_tokens,
-            self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-            context="MT generation",
-        )
-        translated_text = self.tokenizer.decode(
-            generated_tokens, skip_special_tokens=True
-        ).strip()
+            translated_text = self.tokenizer.decode(
+                generated_tokens,
+                skip_special_tokens=True,
+            ).strip()
 
         # Post-process with medical lexicon
         translated_text = self.lexicon.post_process(translated_text, direction)
