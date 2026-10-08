@@ -16,8 +16,10 @@ from scripts.run_model_bakeoff import (
     bind_or_validate_invocation,
     candidate_output_dir,
     completed_adapter,
+    complete_terminal_bakeoff,
     critical_safety_pass,
     deployment_expectations,
+    ensure_verified_final_backup,
     hyperparameter_profiles,
     interval_stronger,
     invocation_binding,
@@ -40,6 +42,7 @@ from scripts.run_model_bakeoff import (
     validate_deployment_report,
     validate_resources,
     validate_selection_artifacts,
+    verified_release_git_head,
     verified_resume_checkpoint,
     write_runtime_round_config,
 )
@@ -1772,6 +1775,142 @@ def test_regular_deployment_file_resolution_rejects_symlink(tmp_path: Path):
             allowed_root=allowed_root,
             label="Deployment artifact",
         )
+
+
+def test_release_git_head_requires_clean_upstream(monkeypatch: pytest.MonkeyPatch):
+    outputs = iter(("a" * 40 + "\n", "a" * 40 + "\n", ""))
+    monkeypatch.setattr(
+        bakeoff.subprocess,
+        "check_output",
+        lambda *args, **kwargs: next(outputs),
+    )
+    assert verified_release_git_head() == "a" * 40
+
+    outputs = iter(("a" * 40 + "\n", "b" * 40 + "\n", ""))
+    monkeypatch.setattr(
+        bakeoff.subprocess,
+        "check_output",
+        lambda *args, **kwargs: next(outputs),
+    )
+    with pytest.raises(RuntimeError, match="match its upstream"):
+        verified_release_git_head()
+
+
+def test_final_backup_is_release_bound_and_reusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    comparison = tmp_path / "comparison.json"
+    comparison.write_text("{}", encoding="utf-8")
+    release = {
+        "comparison_path": "data/reports/model_bakeoff/comparison.json",
+        "comparison_bytes": 2,
+        "comparison_sha256": "b" * 64,
+        "decision": "reject",
+        "promotion_allowed": False,
+        "scope": "research",
+    }
+    monkeypatch.setattr(bakeoff, "build_release_evidence", lambda *args, **kwargs: release)
+    monkeypatch.setattr(bakeoff, "verified_release_git_head", lambda: "a" * 40)
+    calls = {"create": 0, "verify": 0}
+
+    def create(output: Path, *, release_evidence: dict) -> dict:
+        calls["create"] += 1
+        output.mkdir(parents=True)
+        (output / bakeoff.BACKUP_MANIFEST_NAME).write_text("{}", encoding="utf-8")
+        return {
+            "schema_version": bakeoff.BACKUP_SCHEMA_VERSION,
+            "verification": "pass",
+            "git_head": "a" * 40,
+            "release_evidence": release_evidence,
+        }
+
+    def verify(output: Path) -> dict:
+        calls["verify"] += 1
+        return {
+            "schema_version": bakeoff.BACKUP_SCHEMA_VERSION,
+            "verification": "pass",
+            "git_head": "a" * 40,
+            "release_evidence": release,
+        }
+
+    monkeypatch.setattr(bakeoff, "create_backup", create)
+    monkeypatch.setattr(bakeoff, "verify_backup", verify)
+
+    first = ensure_verified_final_backup(
+        comparison,
+        decision="reject",
+        scope="research",
+        backup_root=tmp_path / "backups",
+    )
+    second = ensure_verified_final_backup(
+        comparison,
+        decision="reject",
+        scope="research",
+        backup_root=tmp_path / "backups",
+    )
+
+    assert first == second
+    assert calls == {"create": 1, "verify": 1}
+    assert first["release_evidence"] == release
+
+
+def test_terminal_state_remains_incomplete_when_backup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state_path = tmp_path / "state.json"
+    state: dict = {"stages": {}}
+    monkeypatch.setattr(
+        bakeoff,
+        "ensure_verified_final_backup",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("backup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="backup failed"):
+        complete_terminal_bakeoff(
+            state_path,
+            state,
+            tmp_path / "comparison.json",
+            decision="reject",
+            promotion_allowed=False,
+            scope="research",
+        )
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["stage"] == "verified_backup"
+    assert persisted["execution_status"] == "backing_up"
+    assert "verified_backup" not in persisted
+
+
+def test_terminal_state_completes_only_with_verified_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state_path = tmp_path / "state.json"
+    state: dict = {"stages": {}}
+    backup_record = {"schema_version": 2, "verification": "pass"}
+    monkeypatch.setattr(
+        bakeoff,
+        "ensure_verified_final_backup",
+        lambda *args, **kwargs: backup_record,
+    )
+
+    result = complete_terminal_bakeoff(
+        state_path,
+        state,
+        tmp_path / "comparison.json",
+        decision="promote",
+        promotion_allowed=True,
+        scope="production",
+    )
+
+    assert result == backup_record
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["stage"] == "promotion_or_reject"
+    assert persisted["execution_status"] == "complete"
+    assert persisted["decision"] == "promote"
+    assert persisted["verified_backup"] == backup_record
 
 
 def test_deployment_expectations_bind_exact_adapter_tree(tmp_path: Path):

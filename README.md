@@ -26,7 +26,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/capture_compiled_predictions.py` — chạy compiled inference bằng argv không qua shell và khóa artifact/manifest/decoding/prediction checksum vào provenance bất biến trước parity gate
 - `scripts/seal_quantization_parity.py` — tái chấm float/compiled predictions trên cùng manifest khóa, paired-bootstrap metric và zero-regression bảy slice lâm sàng trước khi khóa parity evidence vào deployment gate
 - `scripts/seal_qcs6490_measurement.py` — chạy trên board thật để kiểm live identity, raw latency/power/thermal, timestamp, memory và compiled artifact trước khi phát hành measurement evidence bất biến
-- `scripts/create_verified_backup.py` — tạo backup data/model/report nguyên tử; manifest v2 khóa SHA-256 từng file và từng archive, cấm symlink/special member và tự đọc lại toàn bộ tar trước khi công bố
+- `scripts/create_verified_backup.py` — tạo backup data/model/report nguyên tử; manifest v2 khóa SHA-256 từng file/archive và terminal `comparison.json`, cấm symlink/special member rồi tự đọc lại toàn bộ tar trước khi công bố; bake-off không chuyển sang terminal nếu backup này chưa verify
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê
 - `AIHUB_DEPLOYMENT_PLAN.md` — kế hoạch QCS6490: smoke, export, INT8, profile, gate trước GPU và benchmark board

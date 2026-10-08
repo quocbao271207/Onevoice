@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tarfile
 from pathlib import Path
 
@@ -219,6 +220,96 @@ def test_create_backup_publishes_only_after_full_verification(
     assert {path.name for path in output.iterdir()} == backup.EXPECTED_OUTPUT_NAMES
     assert backup.verify(output)["verification"] == "pass"
     assert not list(tmp_path.glob(f".{output.name}.part-*"))
+
+
+def test_create_backup_rejects_linked_output_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "project"
+    write_sources(root)
+    real_parent = tmp_path / "real-backups"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-backups"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Directory symlink creation is unavailable: {error}")
+    monkeypatch.setattr(backup, "ROOT", root)
+
+    with pytest.raises(ValueError, match="backup output ancestor symlink or junction"):
+        backup.create_backup(linked_parent / "release")
+    assert not (real_parent / "release").exists()
+
+    backup.create_backup(real_parent / "release")
+    with pytest.raises(ValueError, match="backup directory ancestor symlink or junction"):
+        backup.verify(linked_parent / "release")
+
+
+def test_release_backup_binds_terminal_comparison_and_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    output = tmp_path / "release-backup"
+    reports = write_sources(root)
+    comparison = reports / "model_bakeoff" / "comparison.json"
+    comparison.parent.mkdir()
+    comparison.write_text(
+        json.dumps(
+            {
+                "status": "complete",
+                "scope": "production",
+                "promotion_allowed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(backup, "ROOT", root)
+    release = backup.build_release_evidence(
+        comparison,
+        decision="promote",
+        scope="production",
+    )
+
+    verified = backup.create_backup(output, release_evidence=release)
+
+    assert verified["release_evidence"] == release
+    assert backup.verify(output)["release_evidence"] == release
+
+    manifest_path = output / backup.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["release_evidence"]["decision"] = "reject"
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="decision disagrees"):
+        backup.verify(output)
+
+
+def test_release_evidence_rejects_nonterminal_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "project"
+    reports = write_sources(root)
+    comparison = reports / "model_bakeoff" / "comparison.json"
+    comparison.parent.mkdir()
+    comparison.write_text(
+        json.dumps(
+            {
+                "status": "blind_complete",
+                "scope": "research",
+                "promotion_allowed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(backup, "ROOT", root)
+
+    with pytest.raises(ValueError, match="not terminal"):
+        backup.build_release_evidence(
+            comparison,
+            decision="reject",
+            scope="research",
+        )
 
 
 def test_create_backup_removes_staging_directory_on_failure(

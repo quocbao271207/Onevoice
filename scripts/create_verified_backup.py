@@ -33,6 +33,16 @@ EXPECTED_OUTPUT_NAMES = {
     CHECKSUMS_NAME,
 }
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+RELEASE_COMPARISON_MEMBER = "data/reports/model_bakeoff/comparison.json"
+RELEASE_EVIDENCE_FIELDS = {
+    "comparison_path",
+    "comparison_bytes",
+    "comparison_sha256",
+    "decision",
+    "promotion_allowed",
+    "scope",
+}
+MAX_RELEASE_COMPARISON_BYTES = 50_000_000
 
 
 def _sha256_stream(handle: BinaryIO, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -65,6 +75,13 @@ def _absolute(path: Path) -> Path:
 def _reject_link(path: Path, label: str) -> None:
     if path.is_symlink() or _is_junction(path):
         raise ValueError(f"Refusing {label} symlink or junction: {path}")
+
+
+def _reject_link_ancestors(path: Path, label: str) -> None:
+    """Reject an existing symlink or junction anywhere in an output path."""
+    absolute = _absolute(path)
+    for candidate in (absolute, *absolute.parents):
+        _reject_link(candidate, label)
 
 
 def iter_files(source: Path, excluded: Iterable[Path]) -> list[Path]:
@@ -165,6 +182,128 @@ def _validated_member_records(
     if [str(item["path"]) for item in records] != sorted(names):
         raise ValueError(f"Member manifest for {archive_name} must be sorted by path")
     return records
+
+
+def _release_comparison_payload(payload: bytes) -> dict[str, object]:
+    if len(payload) < 2 or len(payload) > MAX_RELEASE_COMPARISON_BYTES:
+        raise ValueError("Release comparison size is outside the valid range")
+    try:
+        comparison = json.loads(payload.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Release comparison is not valid UTF-8 JSON") from error
+    if not isinstance(comparison, dict):
+        raise ValueError("Release comparison root must be an object")
+    return comparison
+
+
+def _validate_release_decision(
+    comparison: dict[str, object],
+    *,
+    decision: object,
+    promotion_allowed: object,
+    scope: object,
+) -> None:
+    if comparison.get("status") != "complete":
+        raise ValueError("Release comparison is not terminal")
+    if not isinstance(promotion_allowed, bool):
+        raise ValueError("Release promotion flag must be boolean")
+    expected_decision = "promote" if promotion_allowed else "reject"
+    if decision != expected_decision:
+        raise ValueError("Release decision disagrees with promotion flag")
+    if comparison.get("promotion_allowed") is not promotion_allowed:
+        raise ValueError("Release evidence promotion flag mismatch")
+    if scope not in {"research", "production"} or comparison.get("scope") != scope:
+        raise ValueError("Release evidence scope mismatch")
+
+
+def build_release_evidence(
+    comparison_path: Path,
+    *,
+    decision: str,
+    scope: str,
+) -> dict[str, object]:
+    """Bind a terminal bake-off decision to the comparison archived in reports.tar."""
+    comparison_path = _absolute(comparison_path)
+    _reject_link(comparison_path, "release comparison")
+    if not comparison_path.is_file():
+        raise FileNotFoundError(comparison_path)
+    try:
+        member = comparison_path.relative_to(_absolute(ROOT)).as_posix()
+    except ValueError as error:
+        raise ValueError("Release comparison is outside project root") from error
+    if member != RELEASE_COMPARISON_MEMBER:
+        raise ValueError(
+            f"Release comparison must be {RELEASE_COMPARISON_MEMBER}: {member}"
+        )
+    size = comparison_path.stat().st_size
+    if size < 2 or size > MAX_RELEASE_COMPARISON_BYTES:
+        raise ValueError("Release comparison size is outside the valid range")
+    with comparison_path.open("rb") as handle:
+        payload = handle.read(MAX_RELEASE_COMPARISON_BYTES + 1)
+    if len(payload) != size:
+        raise RuntimeError("Release comparison changed while reading")
+    comparison = _release_comparison_payload(payload)
+    promotion_allowed = comparison.get("promotion_allowed")
+    _validate_release_decision(
+        comparison,
+        decision=decision,
+        promotion_allowed=promotion_allowed,
+        scope=scope,
+    )
+    return {
+        "comparison_path": member,
+        "comparison_bytes": len(payload),
+        "comparison_sha256": hashlib.sha256(payload).hexdigest(),
+        "decision": decision,
+        "promotion_allowed": promotion_allowed,
+        "scope": scope,
+    }
+
+
+def _verify_release_evidence(
+    value: object,
+    report_records: list[dict[str, object]],
+    report_archive: Path,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != RELEASE_EVIDENCE_FIELDS:
+        raise ValueError("Backup release_evidence schema is invalid")
+    member = str(value.get("comparison_path") or "")
+    if member != RELEASE_COMPARISON_MEMBER:
+        raise ValueError("Backup release comparison path is invalid")
+    expected = next(
+        (record for record in report_records if record["path"] == member),
+        None,
+    )
+    if expected is None:
+        raise ValueError("Backup reports archive lacks the release comparison")
+    declared_bytes = _non_negative_int(
+        value.get("comparison_bytes"),
+        "release_evidence:comparison_bytes",
+    )
+    declared_sha256 = _validated_sha256(
+        value.get("comparison_sha256"),
+        "release_evidence:comparison_sha256",
+    )
+    if declared_bytes != expected["bytes"] or declared_sha256 != expected["sha256"]:
+        raise RuntimeError("Backup release comparison binding mismatch")
+    with tarfile.open(report_archive, mode="r") as tar:
+        try:
+            archived = tar.getmember(member)
+        except KeyError as error:
+            raise RuntimeError("Backup release comparison member is missing") from error
+        extracted = tar.extractfile(archived)
+        if extracted is None:
+            raise RuntimeError("Backup release comparison member is unreadable")
+        with extracted:
+            payload = extracted.read(MAX_RELEASE_COMPARISON_BYTES + 1)
+    comparison = _release_comparison_payload(payload)
+    _validate_release_decision(
+        comparison,
+        decision=value.get("decision"),
+        promotion_allowed=value.get("promotion_allowed"),
+        scope=value.get("scope"),
+    )
+    return dict(value)
 
 
 def _verify_tar(
@@ -304,6 +443,7 @@ def _load_manifest(output_dir: Path) -> dict[str, object]:
 
 def verify(output_dir: Path) -> dict[str, object]:
     output_dir = _absolute(output_dir)
+    _reject_link_ancestors(output_dir.parent, "backup directory ancestor")
     _reject_link(output_dir, "backup directory")
     if not output_dir.is_dir():
         raise FileNotFoundError(output_dir)
@@ -334,12 +474,14 @@ def verify(output_dir: Path) -> dict[str, object]:
     if checksum_path.read_text(encoding="utf-8") != expected_checksum_file:
         raise RuntimeError(f"{CHECKSUMS_NAME} does not match {MANIFEST_NAME}")
 
+    validated_records: dict[str, list[dict[str, object]]] = {}
     for name, expected_source in EXPECTED_ARCHIVES.items():
         item = by_name[name]
         declared_source = str(item.get("source") or "").replace("\\", "/")
         if declared_source != expected_source:
             raise ValueError(f"Unexpected source for {name}: {item.get('source')!r}")
         records = _validated_member_records(item.get("members"), expected_source, name)
+        validated_records[name] = records
         declared_files = _non_negative_int(item.get("files"), f"{name}:files")
         declared_source_bytes = _non_negative_int(
             item.get("source_bytes"), f"{name}:source_bytes"
@@ -359,6 +501,13 @@ def verify(output_dir: Path) -> dict[str, object]:
         if actual != expected_digest:
             raise RuntimeError(f"Checksum mismatch: {path}")
         _verify_tar(path, expected_source, records)
+    release_evidence = manifest.get("release_evidence")
+    if release_evidence is not None:
+        _verify_release_evidence(
+            release_evidence,
+            validated_records["reports.tar"],
+            output_dir / "reports.tar",
+        )
     verified = dict(manifest)
     verified["verification"] = "pass"
     return verified
@@ -376,7 +525,7 @@ def _git_head() -> str | None:
 def _summary(output_dir: Path, manifest: dict[str, object]) -> dict[str, object]:
     archives = manifest["archives"]
     assert isinstance(archives, list)
-    return {
+    summary: dict[str, object] = {
         "output_dir": str(output_dir),
         "schema_version": manifest["schema_version"],
         "verification": manifest.get("verification"),
@@ -396,11 +545,19 @@ def _summary(output_dir: Path, manifest: dict[str, object]) -> dict[str, object]
             if isinstance(item, dict)
         ],
     }
+    if "release_evidence" in manifest:
+        summary["release_evidence"] = manifest["release_evidence"]
+    return summary
 
 
-def create_backup(output_dir: Path) -> dict[str, object]:
+def create_backup(
+    output_dir: Path,
+    *,
+    release_evidence: dict[str, object] | None = None,
+) -> dict[str, object]:
+    output_dir = _absolute(output_dir)
+    _reject_link_ancestors(output_dir.parent, "backup output ancestor")
     _reject_link(output_dir, "backup output")
-    output_dir = output_dir.resolve(strict=False)
     source_roots = tuple(
         path.resolve()
         for path in (ROOT / "data", ROOT / "models", ROOT / "data" / "reports")
@@ -410,6 +567,7 @@ def create_backup(output_dir: Path) -> dict[str, object]:
     if output_dir.exists():
         raise FileExistsError(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
+    _reject_link_ancestors(output_dir.parent, "backup output ancestor")
     staging = output_dir.with_name(f".{output_dir.name}.part-{uuid.uuid4().hex}")
     staging.mkdir(exist_ok=False)
     try:
@@ -427,6 +585,8 @@ def create_backup(output_dir: Path) -> dict[str, object]:
             "format": "uncompressed POSIX tar with per-member SHA-256",
             "archives": archives,
         }
+        if release_evidence is not None:
+            manifest["release_evidence"] = dict(release_evidence)
         write_metadata(staging, manifest)
         verified = verify(staging)
         os.replace(staging, output_dir)

@@ -43,6 +43,13 @@ from scripts.candidate_evidence import (  # noqa: E402
     evidence_sidecars,
     verify_evidence_archive,
 )
+from scripts.create_verified_backup import (  # noqa: E402
+    MANIFEST_NAME as BACKUP_MANIFEST_NAME,
+    SCHEMA_VERSION as BACKUP_SCHEMA_VERSION,
+    build_release_evidence,
+    create_backup,
+    verify as verify_backup,
+)
 from src.data.quality import fingerprint_text  # noqa: E402
 from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
 from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
@@ -55,6 +62,7 @@ from src.pipeline.selection_policy import (  # noqa: E402
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
 MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
 MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES = 1_000_000
 MAX_IDENTITY_EVIDENCE_BYTES = 1_000_000
@@ -90,6 +98,127 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 
 LOADED_RUNNER_SHA256 = sha256(Path(__file__).resolve())
 TRAIN_STAGE_MAX_ATTEMPTS = 3
+
+
+def verified_release_git_head(project_root: Path = ROOT) -> str:
+    """Require one clean tracked checkout whose HEAD is present on its upstream."""
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+        upstream = subprocess.check_output(
+            ["git", "rev-parse", "@{upstream}"],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+        tracked_status = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Final backup requires a tracked Git checkout with upstream") from exc
+    if not GIT_COMMIT_RE.fullmatch(head) or head != upstream:
+        raise RuntimeError("Final backup requires local HEAD to match its upstream")
+    if tracked_status:
+        raise RuntimeError("Final backup requires a clean tracked worktree")
+    return head
+
+
+def ensure_verified_final_backup(
+    comparison_path: Path,
+    *,
+    decision: str,
+    scope: str,
+    backup_root: Path | None = None,
+) -> dict[str, Any]:
+    """Create or reuse the schema-2 backup bound to one terminal comparison."""
+    release_evidence = build_release_evidence(
+        comparison_path,
+        decision=decision,
+        scope=scope,
+    )
+    git_head = verified_release_git_head()
+    comparison_sha256 = str(release_evidence["comparison_sha256"])
+    root = backup_root or ROOT / ".backups"
+    output_dir = Path(
+        os.path.abspath(
+            root
+            / f"onevoice-model-bakeoff-{comparison_sha256[:16]}-{git_head[:12]}"
+        )
+    )
+    if output_dir.exists():
+        verified = verify_backup(output_dir)
+    else:
+        verified = create_backup(
+            output_dir,
+            release_evidence=release_evidence,
+        )
+    if (
+        verified.get("schema_version") != BACKUP_SCHEMA_VERSION
+        or verified.get("verification") != "pass"
+        or verified.get("git_head") != git_head
+        or verified.get("release_evidence") != release_evidence
+    ):
+        raise ValueError("Final backup does not match the terminal release evidence")
+    manifest_path = output_dir / BACKUP_MANIFEST_NAME
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise FileNotFoundError("Final backup manifest is missing or linked")
+    return {
+        "path": str(output_dir),
+        "schema_version": BACKUP_SCHEMA_VERSION,
+        "verification": "pass",
+        "manifest": {
+            "path": str(manifest_path),
+            "bytes": manifest_path.stat().st_size,
+            "sha256": sha256(manifest_path),
+        },
+        "comparison_sha256": comparison_sha256,
+        "git_head": git_head,
+        "release_evidence": release_evidence,
+    }
+
+
+def complete_terminal_bakeoff(
+    state_path: Path,
+    state: dict[str, Any],
+    comparison_path: Path,
+    *,
+    decision: str,
+    promotion_allowed: bool,
+    scope: str,
+) -> dict[str, Any]:
+    """Publish the final state only after a release-bound backup verifies."""
+    if decision != ("promote" if promotion_allowed else "reject"):
+        raise ValueError("Terminal decision disagrees with promotion flag")
+    state.update(
+        {
+            "stage": "verified_backup",
+            "execution_status": "backing_up",
+            "promotion_allowed": promotion_allowed,
+            "decision": decision,
+        }
+    )
+    atomic_json(state_path, state)
+    backup = ensure_verified_final_backup(
+        comparison_path,
+        decision=decision,
+        scope=scope,
+    )
+    state.update(
+        {
+            "stage": "promotion_or_reject",
+            "execution_status": "complete",
+            "verified_backup": backup,
+        }
+    )
+    atomic_json(state_path, state)
+    return backup
 
 
 class StageExecutionError(RuntimeError):
@@ -3223,11 +3352,14 @@ def main() -> int:
             }
         )
         atomic_json(comparison_path, comparison)
-        state["stage"] = "promotion_or_reject"
-        state["execution_status"] = "complete"
-        state["promotion_allowed"] = False
-        state["decision"] = "reject"
-        atomic_json(state_path, state)
+        backup = complete_terminal_bakeoff(
+            state_path,
+            state,
+            comparison_path,
+            decision="reject",
+            promotion_allowed=False,
+            scope=args.scope,
+        )
         print(
             json.dumps(
                 {
@@ -3236,6 +3368,7 @@ def main() -> int:
                     "candidate_a_freeze": str(freeze_path),
                     "comparison": str(comparison_path),
                     "decision": state["decision"],
+                    "verified_backup": backup,
                     "note": "Deployment was not run because the blind hard gate failed.",
                 },
                 ensure_ascii=False,
@@ -3323,11 +3456,15 @@ def main() -> int:
         }
     )
     atomic_json(comparison_path, comparison)
-    state["stage"] = "promotion_or_reject"
-    state["execution_status"] = "complete"
-    state["promotion_allowed"] = promotion_allowed
-    state["decision"] = "promote" if promotion_allowed else "reject"
-    atomic_json(state_path, state)
+    decision = "promote" if promotion_allowed else "reject"
+    backup = complete_terminal_bakeoff(
+        state_path,
+        state,
+        comparison_path,
+        decision=decision,
+        promotion_allowed=promotion_allowed,
+        scope=args.scope,
+    )
     print(
         json.dumps(
             {
@@ -3336,6 +3473,7 @@ def main() -> int:
                 "candidate_a_freeze": str(freeze_path),
                 "comparison": str(comparison_path),
                 "decision": state["decision"],
+                "verified_backup": backup,
             },
             ensure_ascii=False,
             indent=2,
