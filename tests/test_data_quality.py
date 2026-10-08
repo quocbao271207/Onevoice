@@ -5,7 +5,7 @@ from src.training.finetune_whisper_vi import ASRTrainingConfig, augment_waveform
 from scripts.audit_mt_alignment import comparison_text
 from src.pipeline.safety_guard import validate_translation
 from src.pipeline.asr_engine import ASREngine
-from src.pipeline.audio_frontend import AudioConfig
+from src.pipeline.audio_frontend import AudioConfig, AudioFrontend
 from src.pipeline.orchestrator import MediVoicePipeline
 from src.pipeline.mt_engine import MTEngine, MTResult, NLLB_BASE_REVISION
 from src.utils.text_normalization import normalize_for_wer
@@ -257,6 +257,52 @@ def test_asr_resamples_and_downmixes_to_whisper_rate():
     assert sample_rate == 16000
     assert audio.ndim == 1
     assert abs(len(audio) - 16000) <= 1
+
+
+def test_audio_boundary_rejects_empty_nonfinite_and_unnormalized_input():
+    import numpy as np
+    import pytest
+
+    invalid = (
+        np.array([], dtype=np.float32),
+        np.array([0.0, np.nan], dtype=np.float32),
+        np.array([0.0, np.inf], dtype=np.float32),
+        np.array([0.0, 1.25], dtype=np.float32),
+        np.array([[1.25, -1.25]], dtype=np.float32),
+    )
+    for audio in invalid:
+        with pytest.raises(ValueError):
+            ASREngine._to_whisper_rate(audio, 16000)
+    with pytest.raises(ValueError, match="finite"):
+        AudioFrontend().process_chunk(np.array([0.0, np.nan], dtype=np.float32))
+
+
+def test_audio_boundary_rejects_invalid_rate_shape_and_channel_layout():
+    import numpy as np
+    import pytest
+
+    mono = np.zeros(160, dtype=np.float32)
+    with pytest.raises(ValueError, match="sample_rate"):
+        ASREngine._to_whisper_rate(mono, 0)
+    with pytest.raises(ValueError, match="sample_rate"):
+        ASREngine._to_whisper_rate(mono, 7999)
+    with pytest.raises(ValueError, match="one- or two-dimensional"):
+        ASREngine._to_whisper_rate(np.zeros((2, 2, 2), dtype=np.float32), 16000)
+    with pytest.raises(ValueError, match="channel-last"):
+        ASREngine._to_whisper_rate(np.zeros((2, 160), dtype=np.float32), 16000)
+
+
+def test_audio_config_rejects_invalid_runtime_values():
+    import pytest
+
+    with pytest.raises(ValueError, match="sample_rate"):
+        AudioConfig(sample_rate=0)
+    with pytest.raises(ValueError, match="chunk_duration_ms"):
+        AudioConfig(chunk_duration_ms=0)
+    with pytest.raises(ValueError, match="vad_threshold"):
+        AudioConfig(vad_threshold=1.1)
+    with pytest.raises(ValueError, match="vad_threshold"):
+        AudioConfig(vad_threshold="0.5")
 
 
 def test_merge_locks_test_recording_group_before_train(tmp_path):

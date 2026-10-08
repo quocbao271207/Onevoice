@@ -19,6 +19,8 @@ from math import gcd
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 
+from .audio_frontend import validate_audio_input
+
 logger = logging.getLogger(__name__)
 
 BASE_MODEL_REVISIONS = {
@@ -68,9 +70,7 @@ class ASREngine:
     @staticmethod
     def _to_whisper_rate(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
         """Whisper feature extractors require mono 16 kHz input."""
-        value = np.asarray(audio, dtype=np.float32)
-        if value.ndim == 2:
-            value = value.mean(axis=1)
+        value = validate_audio_input(audio, sample_rate)
         if sample_rate == 16000:
             return value, sample_rate
         from scipy.signal import resample_poly

@@ -8,11 +8,53 @@ Pipeline Stage 1: Raw Audio → Clean Audio Chunks with speech boundaries
 import numpy as np
 import logging
 import math
+from numbers import Integral, Real
 from typing import Optional, Generator, Tuple
 from dataclasses import dataclass, field
 from collections import deque
 
 logger = logging.getLogger(__name__)
+
+
+MAX_AUDIO_CHANNELS = 8
+MIN_SAMPLE_RATE = 8_000
+MAX_SAMPLE_RATE = 384_000
+
+
+def validate_audio_input(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Validate and normalize an inference audio boundary to mono float32."""
+    if (
+        isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, Integral)
+        or not MIN_SAMPLE_RATE <= int(sample_rate) <= MAX_SAMPLE_RATE
+    ):
+        raise ValueError(
+            "sample_rate must be an integer in "
+            f"[{MIN_SAMPLE_RATE}, {MAX_SAMPLE_RATE}]"
+        )
+    try:
+        value = np.asarray(audio, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("audio must be a numeric array") from exc
+    if value.ndim == 2:
+        channels = value.shape[1]
+        if not 1 <= channels <= MAX_AUDIO_CHANNELS:
+            raise ValueError(
+                "two-dimensional audio must be channel-last with 1 to "
+                f"{MAX_AUDIO_CHANNELS} channels"
+            )
+    elif value.ndim != 1:
+        raise ValueError("audio must be one- or two-dimensional")
+    if value.size == 0:
+        raise ValueError("audio must contain at least one sample")
+    if not np.isfinite(value).all():
+        raise ValueError("audio must contain only finite samples")
+    peak = float(np.max(np.abs(value)))
+    if peak > 1.0 + 1e-6:
+        raise ValueError("audio must be normalized to [-1, 1]")
+    if value.ndim == 2:
+        value = value.mean(axis=1, dtype=np.float32)
+    return np.ascontiguousarray(value, dtype=np.float32)
 
 
 @dataclass
@@ -29,6 +71,37 @@ class AudioConfig:
     silence_chunks: int = field(init=False)
 
     def __post_init__(self):
+        integer_fields = {
+            "sample_rate": self.sample_rate,
+            "bit_depth": self.bit_depth,
+            "channels": self.channels,
+            "chunk_duration_ms": self.chunk_duration_ms,
+            "silence_duration_ms": self.silence_duration_ms,
+        }
+        for name, value in integer_fields.items():
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise ValueError(f"{name} must be an integer")
+        if not MIN_SAMPLE_RATE <= self.sample_rate <= MAX_SAMPLE_RATE:
+            raise ValueError(
+                f"sample_rate must be in [{MIN_SAMPLE_RATE}, {MAX_SAMPLE_RATE}]"
+            )
+        if self.bit_depth not in {8, 16, 24, 32}:
+            raise ValueError("bit_depth must be one of 8, 16, 24, or 32")
+        if not 1 <= self.channels <= MAX_AUDIO_CHANNELS:
+            raise ValueError(
+                f"channels must be in [1, {MAX_AUDIO_CHANNELS}]"
+            )
+        if self.chunk_duration_ms <= 0:
+            raise ValueError("chunk_duration_ms must be positive")
+        if self.silence_duration_ms < 0:
+            raise ValueError("silence_duration_ms cannot be negative")
+        if (
+            isinstance(self.vad_threshold, bool)
+            or not isinstance(self.vad_threshold, Real)
+            or not math.isfinite(self.vad_threshold)
+            or not 0.0 <= self.vad_threshold <= 1.0
+        ):
+            raise ValueError("vad_threshold must be finite and in [0, 1]")
         self.chunk_size = int(self.sample_rate * self.chunk_duration_ms / 1000)
         # A partial chunk still requires one full observation. Rounding down can
         # terminate speech earlier than the configured silence duration.
@@ -81,6 +154,7 @@ class VoiceActivityDetector:
         Returns:
             Speech probability between 0.0 and 1.0
         """
+        audio_chunk = validate_audio_input(audio_chunk, sample_rate)
         if self._is_loaded and self.model is not None:
             import torch
             tensor = torch.from_numpy(audio_chunk).float()
@@ -133,6 +207,7 @@ class NoiseSuppressor:
         Returns:
             Denoised audio signal
         """
+        audio = validate_audio_input(audio, sample_rate)
         if not self._is_loaded:
             return audio
 
@@ -145,10 +220,11 @@ class NoiseSuppressor:
                 prop_decrease=0.8,  # Aggressive noise reduction for hospital env
                 stationary=True
             )
-            return reduced.astype(np.float32)
+            reduced = reduced.astype(np.float32)
         except Exception as e:
             logger.warning(f"Noise suppression failed: {e}. Returning original audio.")
             return audio
+        return validate_audio_input(reduced, sample_rate)
 
 
 class AudioFrontend:
