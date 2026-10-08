@@ -621,6 +621,166 @@ def build_report(
     return report
 
 
+def verify_challenge_artifact(
+    challenge_path: Path,
+    report_path: Path,
+    source_list_path: Path,
+    project_root: Path = ROOT,
+) -> tuple[bool, str]:
+    """Validate a mined challenge artifact without trusting its report."""
+    try:
+        challenge_data = challenge_path.read_bytes()
+        rows = _decode_jsonl(challenge_data, display_path(challenge_path))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        source_list_data = source_list_path.read_bytes()
+        if not isinstance(report, dict) or report.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError("challenge report schema mismatch")
+        if report.get("status") != "awaiting_human_review":
+            raise ValueError("challenge report must remain awaiting_human_review")
+        policy = report.get("policy") or {}
+        if policy != {
+            "source_role": "validation_only",
+            "evaluation_only": True,
+            "auto_correction_eligible": False,
+            "minimum_rows": MIN_CHALLENGE_ROWS,
+            "maximum_rows": MAX_CHALLENGE_ROWS,
+        }:
+            raise ValueError("challenge report policy mismatch")
+        artifact = report.get("artifact") or {}
+        expected_artifact = {
+            "bytes": len(challenge_data),
+            "sha256": sha256_bytes(challenge_data),
+            "rows": len(rows),
+        }
+        for key, value in expected_artifact.items():
+            if artifact.get(key) != value:
+                raise ValueError(f"challenge artifact {key} mismatch")
+        if artifact.get("path") != display_path(challenge_path):
+            raise ValueError("challenge artifact path mismatch")
+        if not MIN_CHALLENGE_ROWS <= len(rows) <= MAX_CHALLENGE_ROWS:
+            raise ValueError("challenge row count is outside the locked policy")
+        source_list = report.get("source_list") or {}
+        if source_list.get("sha256") != sha256_bytes(source_list_data):
+            raise ValueError("challenge source-list SHA-256 mismatch")
+        if source_list.get("bytes") != len(source_list_data):
+            raise ValueError("challenge source-list byte count mismatch")
+        if source_list.get("path") != display_path(source_list_path):
+            raise ValueError("challenge source-list path mismatch")
+        prediction_sources = report.get("prediction_sources") or []
+        labels = [source.get("label") for source in prediction_sources]
+        if (
+            source_list.get("sources") != len(prediction_sources)
+            or len(labels) != len(set(labels))
+            or not all(isinstance(label, str) and label for label in labels)
+        ):
+            raise ValueError("challenge prediction-source inventory mismatch")
+
+        challenge_ids: set[str] = set()
+        by_task: dict[str, int] = defaultdict(int)
+        by_direction: dict[str, int] = defaultdict(int)
+        by_hazard: dict[str, int] = defaultdict(int)
+        expected_manifest_paths = {
+            "asr": "data/processed/manifests/asr--validation-local.jsonl",
+            "mt": "data/eval/mt_selection_dev.jsonl",
+        }
+        manifest_digests: dict[str, str] = {}
+        manifest_records = report.get("manifests") or {}
+        for task, relative_path in expected_manifest_paths.items():
+            record = manifest_records.get(task) or {}
+            manifest_path = project_root / relative_path
+            manifest_data = manifest_path.read_bytes()
+            manifest_rows = _decode_jsonl(manifest_data, relative_path)
+            expected_manifest = {
+                "task": task,
+                "path": relative_path,
+                "bytes": len(manifest_data),
+                "sha256": sha256_bytes(manifest_data),
+                "rows": len(manifest_rows),
+            }
+            for key, value in expected_manifest.items():
+                if record.get(key) != value:
+                    raise ValueError(f"challenge {task} manifest {key} mismatch")
+            manifest_digests[task] = expected_manifest["sha256"]
+        for row in rows:
+            challenge_id = row.get("challenge_id")
+            task = row.get("task")
+            direction = row.get("direction")
+            if row.get("schema_version") != SCHEMA_VERSION:
+                raise ValueError("challenge row schema mismatch")
+            if not isinstance(challenge_id, str) or not challenge_id:
+                raise ValueError("challenge row is missing challenge_id")
+            if challenge_id in challenge_ids:
+                raise ValueError(f"duplicate challenge_id: {challenge_id}")
+            challenge_ids.add(challenge_id)
+            if task not in {"asr", "mt"}:
+                raise ValueError(f"unsupported challenge task: {task}")
+            if (task == "asr" and direction is not None) or (
+                task == "mt" and direction not in {"en_to_vi", "vi_to_en"}
+            ):
+                raise ValueError(f"invalid challenge direction: {challenge_id}")
+            if row.get("review_status") != "pending":
+                raise ValueError(f"challenge review_status is not pending: {challenge_id}")
+            if row.get("reviewer") is not None or row.get("reviewed_at") is not None:
+                raise ValueError(f"pending challenge has review metadata: {challenge_id}")
+            if row.get("evaluation_only") is not True:
+                raise ValueError(f"challenge is not evaluation-only: {challenge_id}")
+            if row.get("auto_correction_eligible") is not False:
+                raise ValueError(f"challenge enables auto-correction: {challenge_id}")
+            if row.get("hazard_level") not in {"critical", "high", "moderate"}:
+                raise ValueError(f"invalid challenge hazard level: {challenge_id}")
+            if not isinstance(row.get("hazard_basis"), list) or not row["hazard_basis"]:
+                raise ValueError(f"challenge is missing hazard basis: {challenge_id}")
+            provenance = row.get("provenance") or {}
+            if provenance.get("manifest_path") != expected_manifest_paths[task]:
+                raise ValueError(f"challenge is not validation-derived: {challenge_id}")
+            if provenance.get("manifest_sha256") != manifest_digests[task]:
+                raise ValueError(f"challenge manifest digest mismatch: {challenge_id}")
+            observations = row.get("observations")
+            if not isinstance(observations, list) or not observations:
+                raise ValueError(f"challenge has no observations: {challenge_id}")
+            if not any(observation.get("error_detected") is True for observation in observations):
+                raise ValueError(f"challenge has no detected error: {challenge_id}")
+            for observation in observations:
+                if not isinstance(observation.get("hypothesis"), str):
+                    raise ValueError(f"challenge hypothesis is invalid: {challenge_id}")
+            if task == "mt" and not any(
+                observation.get("error_detected") is True
+                and bool(observation.get("safety_issues"))
+                for observation in observations
+            ):
+                raise ValueError(f"MT challenge lacks safety evidence: {challenge_id}")
+            if task == "asr" and not any(
+                observation.get("error_detected") is True
+                and float(observation.get("word_error_rate") or 0.0) > 0.0
+                for observation in observations
+            ):
+                raise ValueError(f"ASR challenge lacks word-error evidence: {challenge_id}")
+            by_task[task] += 1
+            by_direction[direction or "transcription"] += 1
+            by_hazard[row["hazard_level"]] += 1
+        coverage = {
+            "by_task": dict(sorted(by_task.items())),
+            "by_direction": dict(sorted(by_direction.items())),
+            "by_hazard_level": dict(sorted(by_hazard.items())),
+        }
+        if report.get("coverage") != coverage:
+            raise ValueError("challenge coverage report mismatch")
+        return True, (
+            f"rows={len(rows)} sha256={expected_artifact['sha256']} "
+            f"status={report['status']}"
+        )
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        return False, str(exc)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(

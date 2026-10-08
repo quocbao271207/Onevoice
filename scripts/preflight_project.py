@@ -183,6 +183,7 @@ def main() -> int:
         checks.append(check(False, "data_review_decisions", "missing"))
 
     if args.gate == "gpu":
+        from scripts.build_terminology_challenge_set import verify_challenge_artifact
         from src.training.finetune_mt_medical import MTTrainingConfig
         from src.training.finetune_whisper_vi import ASRTrainingConfig
 
@@ -247,6 +248,40 @@ def main() -> int:
                     f"sha256={actual} expected={expected}",
                 )
             )
+        challenge_paths = {
+            "sources": ROOT / str(locked_evaluation.get("terminology_challenge_sources") or ""),
+            "artifact": ROOT / str(locked_evaluation.get("terminology_challenge_set") or ""),
+            "report": ROOT / str(locked_evaluation.get("terminology_challenge_report") or ""),
+        }
+        challenge_hash_keys = {
+            "sources": "terminology_challenge_sources_sha256",
+            "artifact": "terminology_challenge_set_sha256",
+            "report": "terminology_challenge_report_sha256",
+        }
+        challenge_hashes_match = all(
+            path.is_file()
+            and sha256(path) == locked_evaluation.get(challenge_hash_keys[name])
+            for name, path in challenge_paths.items()
+        )
+        challenge_ok, challenge_detail = (
+            verify_challenge_artifact(
+                challenge_paths["artifact"],
+                challenge_paths["report"],
+                challenge_paths["sources"],
+            )
+            if challenge_hashes_match
+            else (False, "missing artifact or SHA-256 mismatch")
+        )
+        checks.append(
+            check(
+                challenge_hashes_match
+                and challenge_ok
+                and locked_evaluation.get("terminology_challenge_status")
+                == "awaiting_human_review",
+                "terminology_challenge_set",
+                challenge_detail,
+            )
+        )
         for name, path in {
             "manifest_validation": ROOT / "data" / "reports" / "manifests" / "validation.json",
             "audio_qc": ROOT / "data" / "reports" / "audio_qc.json",

@@ -17,6 +17,7 @@ from scripts.build_terminology_challenge_set import (
     mine_candidates,
     parse_source_spec,
     select_challenges,
+    verify_challenge_artifact,
     write_jsonl,
 )
 
@@ -274,7 +275,11 @@ def test_committed_challenge_set_is_validation_only_hash_locked_and_pending():
         if line
     ]
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    verified, verification_detail = verify_challenge_artifact(
+        challenge_path, report_path, source_list_path
+    )
 
+    assert verified, verification_detail
     assert 100 <= len(rows) <= 200
     assert len(rows) == report["artifact"]["rows"] == 128
     assert len({row["challenge_id"] for row in rows}) == len(rows)
@@ -316,3 +321,35 @@ def test_committed_challenge_set_is_validation_only_hash_locked_and_pending():
     assert source_list_sha == report["source_list"]["sha256"]
     assert source_list_sha == lock["terminology_challenge_sources_sha256"]
     assert report["status"] == lock["terminology_challenge_status"]
+
+
+def test_verifier_rejects_hash_consistent_auto_correction_tamper(tmp_path: Path):
+    challenge_path = ROOT / "data/eval/terminology_challenge_set.jsonl"
+    report_path = ROOT / "data/eval/terminology_challenge_set.report.json"
+    source_list_path = ROOT / "configs/terminology_challenge_sources.txt"
+    rows = [
+        json.loads(line)
+        for line in challenge_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    rows[0]["auto_correction_eligible"] = True
+    tampered_challenge = tmp_path / "challenge.jsonl"
+    tampered_data = write_jsonl(tampered_challenge, rows)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["artifact"].update(
+        {
+            "path": tampered_challenge.resolve().as_posix(),
+            "bytes": len(tampered_data),
+            "sha256": hashlib.sha256(tampered_data).hexdigest(),
+            "rows": len(rows),
+        }
+    )
+    tampered_report = tmp_path / "report.json"
+    tampered_report.write_text(json.dumps(report), encoding="utf-8")
+
+    verified, detail = verify_challenge_artifact(
+        tampered_challenge, tampered_report, source_list_path
+    )
+
+    assert not verified
+    assert "auto-correction" in detail
