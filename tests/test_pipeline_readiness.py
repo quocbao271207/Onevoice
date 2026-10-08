@@ -154,6 +154,35 @@ def test_engine_readiness_requires_complete_runtime_objects():
     assert cache.is_ready is True
 
 
+def test_component_entrypoints_recheck_complete_readiness():
+    asr = ASREngine()
+    asr._is_loaded = True
+    with pytest.raises(RuntimeError, match="not ready"):
+        asr.detect_language(np.zeros(160, dtype=np.float32), 16000)
+    with pytest.raises(RuntimeError, match="not ready"):
+        asr.transcribe(
+            np.zeros(160, dtype=np.float32),
+            language="vi",
+            sample_rate=16000,
+        )
+
+    mt = MTEngine()
+    mt._is_loaded = True
+    with pytest.raises(RuntimeError, match="not ready"):
+        mt.translate("Stable.", "en", "vi")
+
+    tts = TTSEngine()
+    tts._is_loaded = True
+    tts._voices = {"vi": object()}
+    with pytest.raises(RuntimeError, match="not ready"):
+        tts.synthesize("Stable.", "en")
+
+    cache = FlashCache()
+    cache._is_loaded = True
+    with pytest.raises(RuntimeError, match="not ready"):
+        cache.lookup("Stable.", "en")
+
+
 def test_tts_load_does_not_publish_one_language_when_second_fails(
     tmp_path,
     monkeypatch,

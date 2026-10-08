@@ -145,6 +145,13 @@ class ASREngine:
             )
         )
 
+    def _require_ready(self) -> None:
+        if not self.is_ready:
+            raise RuntimeError(
+                "ASR engine is not ready; call load() and verify all "
+                "configured language models"
+            )
+
     @staticmethod
     def _to_whisper_rate(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, int]:
         """Whisper feature extractors require mono 16 kHz input."""
@@ -271,9 +278,8 @@ class ASREngine:
         Returns:
             Language code: "vi" or "en"
         """
+        self._require_ready()
         audio, sample_rate = self._validated_whisper_audio(audio, sample_rate)
-        if not self._is_loaded:
-            raise RuntimeError("ASR engine not loaded. Call load() first.")
 
         try:
             import torch
@@ -348,8 +354,7 @@ class ASREngine:
         Returns:
             ASRResult with transcribed text and metadata
         """
-        if not self._is_loaded:
-            raise RuntimeError("ASR engine not loaded. Call load() first.")
+        self._require_ready()
 
         start_time = time.perf_counter()
 

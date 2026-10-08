@@ -371,8 +371,10 @@ class FlashCache:
         Returns:
             CachedPhrase if found, None otherwise
         """
-        if not self._is_loaded:
-            return None
+        if not self.is_ready:
+            raise RuntimeError(
+                "Flash cache is not ready; call load() and verify its phrases"
+            )
 
         start_time = time.perf_counter()
 

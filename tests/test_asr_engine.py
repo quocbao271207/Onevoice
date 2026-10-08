@@ -49,17 +49,18 @@ class FakeModel:
 
 
 def loaded_engine(sequence) -> tuple[ASREngine, FakeProcessor]:
-    engine = ASREngine(device="cpu")
+    engine = ASREngine(device="cpu", languages=("vi",))
     processor = FakeProcessor()
     engine.models = {"vi": FakeModel(sequence)}
     engine.processors = {"vi": processor}
+    engine.loaded_model_paths = {"vi": "vi-model"}
     engine._is_loaded = True
     return engine, processor
 
 
 def test_asr_rejects_audio_beyond_whisper_window_before_model_dispatch():
-    engine = ASREngine(max_input_duration_seconds=1.0)
-    engine._is_loaded = True
+    engine, _processor = loaded_engine([2, 1, 0])
+    engine.max_input_duration_seconds = 1.0
 
     with pytest.raises(ValueError, match="1.000s.*limit is 1.000s"):
         engine.transcribe(
@@ -119,9 +120,10 @@ def test_asr_rejects_nonfinite_confidence_proxy():
         def compute_transition_scores(self, *_args, **_kwargs):
             return torch.tensor([[float("nan")]], dtype=torch.float32)
 
-    engine = ASREngine(device="cpu")
+    engine = ASREngine(device="cpu", languages=("vi",))
     engine.models = {"vi": NonfiniteConfidenceModel([2, 10, 1, 0])}
     engine.processors = {"vi": FakeProcessor()}
+    engine.loaded_model_paths = {"vi": "vi-model"}
     engine._is_loaded = True
 
     with pytest.raises(RuntimeError, match="confidence proxy"):
@@ -143,12 +145,14 @@ def test_asr_constructor_rejects_unsafe_generation_contract():
 
 def test_asr_language_detection_never_defaults_after_runtime_failure():
     engine = ASREngine()
-    with pytest.raises(RuntimeError, match="not loaded"):
+    with pytest.raises(RuntimeError, match="not ready"):
         engine.detect_language(np.zeros(1600, dtype=np.float32), 16000)
 
+    engine = ASREngine(languages=("vi",))
     engine._is_loaded = True
     engine.processors = {"vi": FakeProcessor()}
     engine.models = {"vi": object()}
+    engine.loaded_model_paths = {"vi": "vi-model"}
     with pytest.raises(RuntimeError, match="Language detection failed"):
         engine.detect_language(np.zeros(1600, dtype=np.float32), 16000)
 

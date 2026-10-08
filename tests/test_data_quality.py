@@ -288,6 +288,7 @@ def test_mt_engine_direct_api_exposes_failure_without_logging_raw_text(caplog):
     engine = MTEngine(device="cpu")
     engine.tokenizer = FakeTokenizer()
     engine.model = FakeModel()
+    engine.loaded_model_path = "mt-model"
     engine._is_loaded = True
     caplog.set_level("INFO", logger="src.pipeline.mt_engine")
 
@@ -325,6 +326,7 @@ def test_mt_engine_rejects_blank_and_overlength_source_without_truncation():
     engine = MTEngine(device="cpu", max_source_tokens=4)
     engine.tokenizer = FakeTokenizer()
     engine.model = object()
+    engine.loaded_model_path = "mt-model"
     engine._is_loaded = True
 
     with pytest.raises(ValueError, match="must not be blank"):
@@ -365,6 +367,7 @@ def test_mt_engine_rejects_generation_that_never_reaches_eos():
     engine = MTEngine(device="cpu")
     engine.tokenizer = FakeTokenizer()
     engine.model = FakeModel()
+    engine.loaded_model_path = "mt-model"
     engine._is_loaded = True
 
     with pytest.raises(RuntimeError, match="did not produce EOS"):

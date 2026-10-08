@@ -114,7 +114,8 @@ def test_tts_stops_consuming_chunks_as_soon_as_duration_limit_is_crossed():
             raise AssertionError("TTS must stop before requesting another chunk")
 
     engine = TTSEngine(max_duration_seconds=0.001)
-    engine._voices = {"en": UnboundedVoice()}
+    voice = UnboundedVoice()
+    engine._voices = {"vi": voice, "en": voice}
     engine._is_loaded = True
 
     with pytest.raises(RuntimeError, match="duration exceeds limit"):

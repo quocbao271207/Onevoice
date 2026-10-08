@@ -351,8 +351,11 @@ class MTEngine:
         Returns:
             MTResult with translated text and performance metrics
         """
-        if not self._is_loaded:
-            raise RuntimeError("MT engine not loaded. Call load() first.")
+        if not self.is_ready:
+            raise RuntimeError(
+                "MT engine is not ready; call load() and verify the model, "
+                "tokenizer, and loaded model path"
+            )
 
         validate_mt_source_text(
             text,

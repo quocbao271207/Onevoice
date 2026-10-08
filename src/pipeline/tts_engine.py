@@ -192,8 +192,10 @@ class TTSEngine:
         return resample_poly(audio, target_rate // common, source_rate // common).astype(np.float32)
 
     def synthesize(self, text: str, language: str = "vi") -> TTSResult:
-        if not self._is_loaded:
-            raise RuntimeError("TTS engine is not loaded; call load() first")
+        if not self.is_ready:
+            raise RuntimeError(
+                "TTS engine is not ready; call load() and verify both voices"
+            )
         if language not in self._voices:
             raise ValueError(f"Unsupported TTS language: {language}")
         validate_tts_text(text, self.max_text_characters)
