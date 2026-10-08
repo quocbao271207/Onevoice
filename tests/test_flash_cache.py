@@ -154,7 +154,7 @@ def test_custom_cache_rejects_linked_file_without_reading_target(tmp_path):
     except OSError:
         pytest.skip("symlink creation unavailable")
 
-    with pytest.raises(ValueError, match="must not be linked"):
+    with pytest.raises(ValueError, match="symlink or junction"):
         FlashCache(str(linked)).load()
     assert target.read_text(encoding="utf-8")
 

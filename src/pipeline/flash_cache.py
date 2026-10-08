@@ -12,9 +12,7 @@ understanding of real clinical emergency workflows.
 
 import json
 import logging
-import os
 import re
-import stat
 import time
 import unicodedata
 import numpy as np
@@ -23,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .safety_guard import validate_translation
+from ..utils.bounded_file import read_stable_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +36,6 @@ CUSTOM_CACHE_REQUIRED_FIELDS = {
     "target_lang",
 }
 CUSTOM_CACHE_OPTIONAL_FIELDS = {"category", "requires_confirmation"}
-
-
-def _is_junction(path: Path) -> bool:
-    checker = getattr(path, "is_junction", None)
-    if checker and checker():
-        return True
-    try:
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
-    except OSError:
-        return False
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    return bool(reparse_flag and attributes & reparse_flag and path.is_dir())
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -66,39 +53,11 @@ def _reject_json_constant(_value: str) -> object:
 
 def _read_custom_cache(path: Path) -> object:
     """Read one stable regular file with strict JSON semantics and a byte cap."""
-    if path.is_symlink() or _is_junction(path):
-        raise ValueError("Configured custom flash cache must not be linked")
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"Configured custom flash cache does not exist: {path}"
-        )
-    before = path.stat()
-    if before.st_size < 1 or before.st_size > MAX_CUSTOM_CACHE_BYTES:
-        raise ValueError(
-            f"Custom flash cache size is outside 1..{MAX_CUSTOM_CACHE_BYTES} bytes"
-        )
-    try:
-        with path.open("rb") as handle:
-            payload = handle.read(MAX_CUSTOM_CACHE_BYTES + 1)
-            descriptor = os.fstat(handle.fileno())
-    except OSError as exc:
-        raise ValueError("Failed to read custom flash cache") from exc
-    after = path.stat()
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_descriptor = (
-        descriptor.st_dev,
-        descriptor.st_ino,
-        descriptor.st_size,
-        descriptor.st_mtime_ns,
+    payload = read_stable_regular_file(
+        path,
+        maximum_bytes=MAX_CUSTOM_CACHE_BYTES,
+        label="Configured custom flash cache",
     )
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if (
-        len(payload) != before.st_size
-        or len(payload) > MAX_CUSTOM_CACHE_BYTES
-        or identity_before != identity_descriptor
-        or identity_before != identity_after
-    ):
-        raise RuntimeError("Custom flash cache changed while reading")
     try:
         text = payload.decode("utf-8")
         return json.loads(

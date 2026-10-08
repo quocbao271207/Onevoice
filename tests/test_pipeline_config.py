@@ -1,9 +1,11 @@
+import json
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 import yaml
 
+from src.pipeline import mt_engine, orchestrator
 from src.pipeline.mt_engine import MTResult, MedicalLexicon
 from src.pipeline.orchestrator import MediVoicePipeline
 
@@ -42,8 +44,68 @@ def test_explicit_pipeline_config_must_exist_and_be_a_unique_mapping(tmp_path):
         "runtime:\n  allow_base_model_fallback: true\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="duplicate key.*runtime"):
+    with pytest.raises(ValueError, match="Invalid pipeline config YAML"):
         MediVoicePipeline(config_path=str(duplicate))
+
+
+def test_pipeline_config_rejects_aliases_and_resource_exhaustion(
+    tmp_path,
+    monkeypatch,
+):
+    alias = tmp_path / "alias.yaml"
+    alias.write_text("runtime: &runtime {}\nflash_cache: *runtime\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid pipeline config YAML"):
+        MediVoicePipeline(config_path=str(alias))
+
+    nested = "value"
+    for _ in range(orchestrator.MAX_PIPELINE_CONFIG_DEPTH + 1):
+        nested = f"[{nested}]"
+    too_deep = tmp_path / "too-deep.yaml"
+    too_deep.write_text(f"pipeline: {nested}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid pipeline config YAML"):
+        MediVoicePipeline(config_path=str(too_deep))
+
+    node_heavy = tmp_path / "node-heavy.yaml"
+    node_heavy.write_text("runtime: {}\n", encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "MAX_PIPELINE_CONFIG_NODES", 2)
+    with pytest.raises(ValueError, match="Invalid pipeline config YAML"):
+        MediVoicePipeline(config_path=str(node_heavy))
+
+    oversized = tmp_path / "oversized.yaml"
+    oversized.write_bytes(b"#" * (orchestrator.MAX_PIPELINE_CONFIG_BYTES + 1))
+    with pytest.raises(ValueError, match="size is outside"):
+        MediVoicePipeline(config_path=str(oversized))
+
+    empty = tmp_path / "empty.yaml"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError, match="size is outside"):
+        MediVoicePipeline(config_path=str(empty))
+
+    invalid_utf8 = tmp_path / "invalid-utf8.yaml"
+    invalid_utf8.write_bytes(b"runtime: \xff")
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        MediVoicePipeline(config_path=str(invalid_utf8))
+
+
+def test_pipeline_config_rejects_linked_file(tmp_path):
+    target = write_config(tmp_path / "target.yaml", canonical_config())
+    linked = tmp_path / "linked.yaml"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(ValueError, match="symlink or junction"):
+        MediVoicePipeline(config_path=str(linked))
+
+
+def test_pipeline_config_parse_error_does_not_echo_file_content(tmp_path):
+    marker = "DO_NOT_ECHO_PIPELINE_SECRET"
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text(f"runtime: [\n  {marker}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid pipeline config YAML") as caught:
+        MediVoicePipeline(config_path=str(malformed))
+    assert marker not in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -201,7 +263,7 @@ def test_explicit_medical_lexicon_path_must_exist(tmp_path):
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
-        ('{"vi_to_en": {}, "vi_to_en": {}}', "duplicate key.*vi_to_en"),
+        ('{"vi_to_en": {}, "vi_to_en": {}}', "Invalid medical lexicon JSON"),
         ('{"wrong_direction": {"a": "b"}}', "unknown sections.*wrong_direction"),
         ('{"vi_to_en": []}', "vi_to_en must be an object"),
         ('{"vi_to_en": {"aspirin": ""}}', "values must be non-empty strings"),
@@ -250,3 +312,67 @@ def test_medical_lexicon_merges_valid_bidirectional_terms(tmp_path):
 
     assert lexicon.vi_to_en["đau ngực"] == "chest pain"
     assert lexicon.en_to_vi["dyspnea"] == "khó thở"
+
+
+def test_medical_lexicon_rejects_link_oversize_and_control_terms(tmp_path):
+    oversized = tmp_path / "oversized-lexicon.json"
+    oversized.write_bytes(b"{" + b" " * mt_engine.MAX_MEDICAL_LEXICON_BYTES + b"}")
+    with pytest.raises(ValueError, match="size is outside"):
+        MedicalLexicon(str(oversized))
+
+    control = tmp_path / "control-lexicon.json"
+    control.write_text(
+        json.dumps({"vi_to_en": {"đau\nngực": "chest pain"}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="control characters"):
+        MedicalLexicon(str(control))
+
+    target = tmp_path / "target-lexicon.json"
+    target.write_text('{"vi_to_en": {"đau ngực": "chest pain"}}', encoding="utf-8")
+    linked = tmp_path / "linked-lexicon.json"
+    try:
+        linked.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(ValueError, match="symlink or junction"):
+        MedicalLexicon(str(linked))
+
+
+def test_medical_lexicon_rejects_nonfinite_and_bounded_terms(tmp_path):
+    nonfinite = tmp_path / "nonfinite-lexicon.json"
+    nonfinite.write_text(
+        '{"vi_to_en": {"aspirin": NaN}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Invalid medical lexicon JSON"):
+        MedicalLexicon(str(nonfinite))
+
+    too_long = tmp_path / "long-lexicon.json"
+    too_long.write_text(
+        json.dumps(
+            {
+                "vi_to_en": {
+                    "a" * (mt_engine.MAX_MEDICAL_TERM_CHARACTERS + 1): "term"
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="term exceeds"):
+        MedicalLexicon(str(too_long))
+
+    too_many = tmp_path / "large-lexicon.json"
+    too_many.write_text(
+        json.dumps(
+            {
+                "vi_to_en": {
+                    f"term-{index}": "translation"
+                    for index in range(mt_engine.MAX_MEDICAL_LEXICON_ENTRIES + 1)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="exceeds.*entries"):
+        MedicalLexicon(str(too_many))

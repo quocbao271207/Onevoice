@@ -11,10 +11,11 @@ The current backend is deterministic utterance-level generation. Streaming
 first-token timing and device latency are not reported until instrumented.
 """
 
+import json
 import logging
 import math
 import time
-import json
+import unicodedata
 from numbers import Real
 from threading import Lock
 from typing import Optional, Dict, List
@@ -23,6 +24,7 @@ from pathlib import Path
 
 from .generation_guard import require_completed_generation
 from .safety_guard import safety_issue_codes, validate_translation
+from ..utils.bounded_file import read_stable_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,8 @@ NLLB_BASE_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
 DEFAULT_MAX_SOURCE_TOKENS = 256
 DEFAULT_MAX_SOURCE_CHARACTERS = 4096
 MAX_MEDICAL_LEXICON_BYTES = 1_000_000
+MAX_MEDICAL_LEXICON_ENTRIES = 10_000
+MAX_MEDICAL_TERM_CHARACTERS = 4096
 MEDICAL_LEXICON_DIRECTIONS = {"vi_to_en", "en_to_vi"}
 
 
@@ -55,9 +59,20 @@ def _unique_json_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"Medical lexicon contains duplicate key {key!r}")
+            raise ValueError("Medical lexicon contains a duplicate JSON key")
         result[key] = value
     return result
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("Medical lexicon contains a non-finite JSON number")
+
+
+def _contains_disallowed_term_character(value: str) -> bool:
+    return any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        for character in value
+    )
 
 
 def validate_mt_source_text(
@@ -141,20 +156,19 @@ class MedicalLexicon:
     def _load_from_file(self, path: str):
         """Validate and atomically load additional terms from a JSON file."""
         lexicon_path = Path(path)
-        if not lexicon_path.is_file():
-            raise FileNotFoundError(f"Configured medical lexicon does not exist: {path}")
-        if lexicon_path.stat().st_size > MAX_MEDICAL_LEXICON_BYTES:
-            raise ValueError(
-                "Medical lexicon exceeds "
-                f"{MAX_MEDICAL_LEXICON_BYTES} bytes: {lexicon_path}"
-            )
+        payload = read_stable_regular_file(
+            lexicon_path,
+            maximum_bytes=MAX_MEDICAL_LEXICON_BYTES,
+            label="Configured medical lexicon",
+        )
         try:
             data = json.loads(
-                lexicon_path.read_text(encoding="utf-8"),
+                payload.decode("utf-8"),
                 object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
             )
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Invalid medical lexicon {lexicon_path}: {exc}") from exc
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            raise ValueError("Invalid medical lexicon JSON") from None
         if not isinstance(data, dict):
             raise ValueError("Medical lexicon root must be an object")
         unknown = set(data) - MEDICAL_LEXICON_DIRECTIONS
@@ -164,6 +178,7 @@ class MedicalLexicon:
             )
 
         validated = {}
+        entry_count = 0
         for direction in MEDICAL_LEXICON_DIRECTIONS:
             terms = data.get(direction, {})
             if not isinstance(terms, dict):
@@ -178,7 +193,26 @@ class MedicalLexicon:
                     raise ValueError(
                         f"Medical lexicon {direction} values must be non-empty strings"
                     )
+                if (
+                    len(source) > MAX_MEDICAL_TERM_CHARACTERS
+                    or len(target) > MAX_MEDICAL_TERM_CHARACTERS
+                ):
+                    raise ValueError(
+                        f"Medical lexicon {direction} term exceeds "
+                        f"{MAX_MEDICAL_TERM_CHARACTERS} characters"
+                    )
+                if _contains_disallowed_term_character(
+                    source
+                ) or _contains_disallowed_term_character(target):
+                    raise ValueError(
+                        f"Medical lexicon {direction} terms must not contain control characters"
+                    )
                 clean_terms[source] = target
+                entry_count += 1
+                if entry_count > MAX_MEDICAL_LEXICON_ENTRIES:
+                    raise ValueError(
+                        f"Medical lexicon exceeds {MAX_MEDICAL_LEXICON_ENTRIES} entries"
+                    )
             validated[direction] = clean_terms
         if not any(validated.values()):
             raise ValueError("Medical lexicon must contain at least one term")

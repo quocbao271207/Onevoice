@@ -36,6 +36,7 @@ from .mt_engine import MTEngine, MTResult, validate_mt_source_text
 from .tts_engine import TTSEngine, TTSResult, validate_tts_audio
 from .flash_cache import CachedPhrase, FlashCache
 from .safety_guard import safety_issue_codes, validate_translation
+from ..utils.bounded_file import read_stable_regular_file
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,8 @@ def _exclusive_interactive_session(method):
     return wrapped
 
 MAX_PIPELINE_CONFIG_BYTES = 1_000_000
+MAX_PIPELINE_CONFIG_DEPTH = 32
+MAX_PIPELINE_CONFIG_NODES = 10_000
 MAX_LATENCY_HISTORY_SAMPLES = 10_000
 ALLOWED_PIPELINE_CONFIG_SECTIONS = {
     "pipeline",
@@ -164,7 +167,39 @@ TTS_LANGUAGE_CONFIG_KEYS = {"engine", "model_path", "speaker_id", "sample_rate"}
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
-    pass
+    def __init__(self, stream):
+        super().__init__(stream)
+        self._composition_depth = 0
+        self._composed_nodes = 0
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "pipeline config aliases are not allowed",
+                self.peek_event().start_mark,
+            )
+        if self._composition_depth >= MAX_PIPELINE_CONFIG_DEPTH:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "pipeline config nesting is too deep",
+                self.peek_event().start_mark,
+            )
+        if self._composed_nodes >= MAX_PIPELINE_CONFIG_NODES:
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                "pipeline config contains too many nodes",
+                self.peek_event().start_mark,
+            )
+        self._composition_depth += 1
+        self._composed_nodes += 1
+        try:
+            return super().compose_node(parent, index)
+        finally:
+            self._composition_depth -= 1
 
 
 def _construct_unique_mapping(loader, node, deep=False):
@@ -195,6 +230,19 @@ _UniqueKeySafeLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
     _construct_unique_mapping,
 )
+
+
+def _read_pipeline_config(path: Path) -> str:
+    """Read a stable, bounded regular config file without exposing its content."""
+    payload = read_stable_regular_file(
+        path,
+        maximum_bytes=MAX_PIPELINE_CONFIG_BYTES,
+        label="Pipeline config",
+    )
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Pipeline config must be valid UTF-8") from None
 
 
 @dataclass
@@ -356,17 +404,11 @@ class MediVoicePipeline:
             logger.warning("No config file found. Using defaults.")
             return {}
         path = Path(config_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Pipeline config does not exist: {path}")
-        if path.stat().st_size > MAX_PIPELINE_CONFIG_BYTES:
-            raise ValueError(
-                f"Pipeline config exceeds {MAX_PIPELINE_CONFIG_BYTES} bytes: {path}"
-            )
+        content = _read_pipeline_config(path)
         try:
-            with path.open(encoding="utf-8") as handle:
-                config = yaml.load(handle, Loader=_UniqueKeySafeLoader)
-        except (OSError, UnicodeError, yaml.YAMLError) as exc:
-            raise ValueError(f"Invalid pipeline config {path}: {exc}") from exc
+            config = yaml.load(content, Loader=_UniqueKeySafeLoader)
+        except (yaml.YAMLError, RecursionError):
+            raise ValueError("Invalid pipeline config YAML") from None
         if not isinstance(config, dict):
             raise ValueError("Pipeline config root must be a mapping")
         self._validate_config(config)
