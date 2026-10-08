@@ -312,6 +312,130 @@ def runner_generation_only_command_change(
     return previous == current
 
 
+def audit_completed_stage_resume(
+    state: dict[str, Any],
+    current_python: str,
+) -> dict[str, Any]:
+    """Read-only audit of completed stage commands and recorded outputs.
+
+    The audit applies the only two execution-identity changes accepted during
+    resume: an equivalent interpreter spelling and the loaded benchmark-runner
+    generation. It never mutates state or launches a subprocess.
+    """
+    failures: list[str] = []
+    details: list[dict[str, Any]] = []
+    stages = state.get("stages")
+    if not isinstance(stages, dict):
+        return {
+            "status": "fail",
+            "completed_stage_count": 0,
+            "stages": [],
+            "failures": ["state.stages must be a mapping"],
+        }
+    if not isinstance(current_python, str) or not current_python.strip():
+        return {
+            "status": "fail",
+            "completed_stage_count": 0,
+            "stages": [],
+            "failures": ["current Python executable must be a non-empty string"],
+        }
+
+    for name in sorted(stages):
+        record = stages[name]
+        if not isinstance(record, dict) or record.get("status") != "complete":
+            continue
+        stage_failures: list[str] = []
+        compatibility = "invalid"
+        stored_command = record.get("command")
+        if (
+            not isinstance(stored_command, list)
+            or not stored_command
+            or not all(isinstance(item, str) for item in stored_command)
+        ):
+            stage_failures.append("stored command is invalid")
+        else:
+            stored_digest = command_digest(stored_command)
+            if record.get("command_sha256") != stored_digest:
+                stage_failures.append("stored command digest does not match command")
+            current_command = list(stored_command)
+            current_command[0] = current_python
+            runner_option = "--bakeoff-runner-sha256"
+            is_benchmark = any(
+                Path(item).name == "run_baseline_benchmarks.py"
+                for item in current_command
+            )
+            if is_benchmark:
+                if current_command.count(runner_option) != 1:
+                    stage_failures.append(
+                        "benchmark runner generation binding is missing or ambiguous"
+                    )
+                else:
+                    runner_index = current_command.index(runner_option) + 1
+                    if runner_index >= len(current_command) or not SHA256_RE.fullmatch(
+                        current_command[runner_index].lower()
+                    ):
+                        stage_failures.append(
+                            "benchmark runner generation value is missing or invalid"
+                        )
+                    else:
+                        current_command[runner_index] = LOADED_RUNNER_SHA256
+            if not stage_failures:
+                if stored_command == current_command:
+                    compatibility = "exact"
+                elif interpreter_alias_only_command_change(
+                    stored_command,
+                    current_command,
+                ):
+                    compatibility = "interpreter_alias"
+                elif runner_generation_only_command_change(
+                    stored_command,
+                    current_command,
+                ):
+                    compatibility = "runner_generation"
+                else:
+                    stage_failures.append(
+                        "current execution identity is not resume-compatible"
+                    )
+
+        recorded_evidence = record.get("output_evidence")
+        if not isinstance(recorded_evidence, list) or not recorded_evidence:
+            stage_failures.append("recorded output evidence is missing")
+        elif any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
+            or not item["path"]
+            for item in recorded_evidence
+        ):
+            stage_failures.append("recorded output evidence is invalid")
+        else:
+            try:
+                current_evidence = output_evidence(
+                    [Path(item["path"]) for item in recorded_evidence]
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                stage_failures.append(f"output evidence cannot be verified: {exc}")
+            else:
+                if current_evidence != recorded_evidence:
+                    stage_failures.append("recorded output evidence changed")
+
+        details.append(
+            {
+                "stage": name,
+                "command_compatibility": compatibility,
+                "status": "pass" if not stage_failures else "fail",
+                "failures": stage_failures,
+            }
+        )
+        failures.extend(f"{name}: {failure}" for failure in stage_failures)
+
+    return {
+        "status": "pass" if not failures else "fail",
+        "completed_stage_count": len(details),
+        "stages": details,
+        "failures": failures,
+    }
+
+
 def pid_is_live(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -2322,6 +2446,11 @@ def main() -> int:
     parser.add_argument("--wait-current", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--preflight", action="store_true")
+    parser.add_argument(
+        "--resume-audit",
+        action="store_true",
+        help="Read-only validation of completed stage commands and output evidence.",
+    )
     parser.add_argument("--scope", choices=["research", "production"], default="research")
     parser.add_argument(
         "--approve-research-license",
@@ -2334,6 +2463,27 @@ def main() -> int:
         parser.error("--poll-seconds must be positive")
     config = load_config(args.config)
     report = preflight(config, set(args.approve_research_license))
+    if args.resume_audit:
+        if args.execute:
+            parser.error("--resume-audit cannot be combined with --execute")
+        state_path = args.state_dir.resolve() / "bakeoff_state.json"
+        if not state_path.is_file():
+            parser.error(f"resume state does not exist: {state_path}")
+        try:
+            resume_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            parser.error(f"resume state is not valid JSON: {state_path}: {exc}")
+        if not isinstance(resume_state, dict):
+            parser.error(f"resume state root must be a mapping: {state_path}")
+        resume_audit = audit_completed_stage_resume(resume_state, args.python)
+        print(
+            json.dumps(
+                {**report, "resume_audit": resume_audit},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if resume_audit["status"] == "pass" else 2
     if args.preflight or not args.execute:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0

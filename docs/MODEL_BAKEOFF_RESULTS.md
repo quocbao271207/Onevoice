@@ -109,6 +109,12 @@ python scripts/build_selection_dev.py
 python scripts/build_terminology_challenge_set.py
 python scripts/run_model_bakeoff.py --preflight
 
+# Trước mọi recovery, audit read-only completed stages dưới đúng interpreter.
+# Lệnh trả mã 2 nếu command/evidence không còn tương thích.
+python scripts/run_model_bakeoff.py --resume-audit \
+  --state-dir gpu-runs/model-bakeoff \
+  --python ./.venv-onevoice/bin/python
+
 # Chỉ chạy sau khi current program state complete. Process này có thể chờ mà không dùng GPU.
 python scripts/run_model_bakeoff.py \
   --execute --wait-current \
@@ -122,7 +128,7 @@ python scripts/run_blind_candidate_suite.py --action lock \
   --asr-manifest /secure/blind_v2_asr.jsonl
 ```
 
-Runner có resume theo command digest, checkpoint watcher, archive/checksum từng round và từ chối chạy hai command khác nhau dưới cùng stage. Mỗi file đầu ra của stage còn được khóa path/bytes/SHA-256 trong state; file bị thay thế sau khi hoàn tất sẽ làm resume fail-closed. Benchmark do waiter cũ hoàn tất nhưng chưa có khóa output sẽ tự chạy lại đúng đường CPU scoring từ prediction checkpoint đã xác minh bằng `--resume-scoring`, không nạp model hoặc suy luận GPU lần nữa. Trước khi bất kỳ adapter bake-off nào được benchmark, runner đọc lại tar, sidecar và content manifest của mọi round rồi đối chiếu toàn bộ cây adapter sống theo path/bytes/SHA-256; chỉ có `adapter_config.json` là không đủ. Manifest freeze/winner dùng đường dẫn POSIX ổn định giữa local và GPU, đồng thời từ chối symlink ở root hoặc bất kỳ file con nào. Khi blind v2 chưa sẵn sàng, runner dừng ở trạng thái chờ thay vì tự mở test cũ.
+Runner có resume theo command digest, checkpoint watcher, archive/checksum từng round và từ chối chạy hai command khác nhau dưới cùng stage. `--resume-audit` là đường chỉ đọc: nó đối chiếu digest lệnh đã lưu, interpreter alias theo đúng stage root, runner generation và output evidence của mọi stage `complete` mà không sửa state hoặc spawn subprocess; phải pass trước khi tạo recovery waiter. Mỗi file đầu ra của stage còn được khóa path/bytes/SHA-256 trong state; file bị thay thế sau khi hoàn tất sẽ làm resume fail-closed. Benchmark do waiter cũ hoàn tất nhưng chưa có khóa output sẽ tự chạy lại đúng đường CPU scoring từ prediction checkpoint đã xác minh bằng `--resume-scoring`, không nạp model hoặc suy luận GPU lần nữa. Trước khi bất kỳ adapter bake-off nào được benchmark, runner đọc lại tar, sidecar và content manifest của mọi round rồi đối chiếu toàn bộ cây adapter sống theo path/bytes/SHA-256; chỉ có `adapter_config.json` là không đủ. Manifest freeze/winner dùng đường dẫn POSIX ổn định giữa local và GPU, đồng thời từ chối symlink ở root hoặc bất kỳ file con nào. Khi blind v2 chưa sẵn sàng, runner dừng ở trạng thái chờ thay vì tự mở test cũ.
 
 ## Deployment reference
 

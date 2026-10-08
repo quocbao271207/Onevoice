@@ -11,6 +11,7 @@ import yaml
 import scripts.run_model_bakeoff as bakeoff
 from scripts.build_selection_dev import collect_leakage_values, filter_disjoint
 from scripts.run_model_bakeoff import (
+    audit_completed_stage_resume,
     assert_interrupted_stage_is_not_live,
     bind_or_validate_invocation,
     candidate_output_dir,
@@ -1103,6 +1104,157 @@ def test_interpreter_alias_resolution_uses_stage_working_directory(
         old_command,
         current_command,
     )
+
+
+def test_resume_audit_verifies_alias_and_completed_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    python = repo / "python"
+    python.write_text("", encoding="utf-8")
+    alias_parent = repo / "alias"
+    alias_parent.mkdir()
+    output = tmp_path / "report.json"
+    output.write_text('{"verified": true}', encoding="utf-8")
+    command = ["./python", "/repo/scripts/run_gpu_rounds.py", "--task", "mt"]
+    state = {
+        "stages": {
+            "completed_training": {
+                "status": "complete",
+                "command": command,
+                "command_sha256": bakeoff.command_digest(command),
+                "output_evidence": bakeoff.output_evidence([output]),
+            },
+            "interrupted_training": {"status": "error"},
+        }
+    }
+    monkeypatch.setattr(bakeoff, "ROOT", repo)
+
+    audit = audit_completed_stage_resume(state, "./alias/../python")
+
+    assert audit == {
+        "status": "pass",
+        "completed_stage_count": 1,
+        "stages": [
+            {
+                "stage": "completed_training",
+                "command_compatibility": "interpreter_alias",
+                "status": "pass",
+                "failures": [],
+            }
+        ],
+        "failures": [],
+    }
+
+
+def test_resume_audit_fails_closed_on_changed_output_or_interpreter(
+    tmp_path: Path,
+):
+    old_python = tmp_path / "old-python"
+    old_python.write_text("", encoding="utf-8")
+    new_python = tmp_path / "new-python"
+    new_python.write_text("", encoding="utf-8")
+    output = tmp_path / "report.json"
+    output.write_text("original", encoding="utf-8")
+    command = [str(old_python), "/repo/scripts/run_gpu_rounds.py"]
+    state = {
+        "stages": {
+            "completed_training": {
+                "status": "complete",
+                "command": command,
+                "command_sha256": bakeoff.command_digest(command),
+                "output_evidence": bakeoff.output_evidence([output]),
+            }
+        }
+    }
+    output.write_text("changed", encoding="utf-8")
+
+    audit = audit_completed_stage_resume(state, str(new_python))
+
+    assert audit["status"] == "fail"
+    assert audit["completed_stage_count"] == 1
+    assert audit["stages"][0]["status"] == "fail"
+    assert audit["stages"][0]["failures"] == [
+        "current execution identity is not resume-compatible",
+        "recorded output evidence changed",
+    ]
+
+
+def test_resume_audit_cli_is_read_only(tmp_path: Path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    output = tmp_path / "report.json"
+    output.write_text('{"verified": true}', encoding="utf-8")
+    command = [sys.executable, "/repo/scripts/run_gpu_rounds.py"]
+    state_path = state_dir / "bakeoff_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "stages": {
+                    "completed_training": {
+                        "status": "complete",
+                        "command": command,
+                        "command_sha256": bakeoff.command_digest(command),
+                        "output_evidence": bakeoff.output_evidence([output]),
+                    }
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    before = state_path.read_bytes()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/run_model_bakeoff.py"),
+            "--resume-audit",
+            "--state-dir",
+            str(state_dir),
+            "--python",
+            sys.executable,
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["resume_audit"]["status"] == "pass"
+    assert state_path.read_bytes() == before
+    assert list(state_dir.iterdir()) == [state_path]
+
+
+def test_resume_audit_rejects_unbound_legacy_benchmark(tmp_path: Path):
+    output = tmp_path / "selection.json"
+    output.write_text('{"verified": true}', encoding="utf-8")
+    command = [
+        sys.executable,
+        "/repo/scripts/run_baseline_benchmarks.py",
+        "--task",
+        "mt",
+    ]
+    state = {
+        "stages": {
+            "legacy_selection": {
+                "status": "complete",
+                "command": command,
+                "command_sha256": bakeoff.command_digest(command),
+                "output_evidence": bakeoff.output_evidence([output]),
+            }
+        }
+    }
+
+    audit = audit_completed_stage_resume(state, sys.executable)
+
+    assert audit["status"] == "fail"
+    assert audit["failures"] == [
+        "legacy_selection: benchmark runner generation binding is missing or ambiguous"
+    ]
 
 
 def test_completed_training_alias_requires_recorded_output_evidence(tmp_path: Path):
