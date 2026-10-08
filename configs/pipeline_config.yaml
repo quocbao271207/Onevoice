@@ -22,7 +22,10 @@ audio:
   bit_depth: 16             # 16-bit PCM
   channels: 1               # Mono
   chunk_duration_ms: 1000   # Frontend frame; Whisper still needs contextual windows
-  vad_threshold: 0.5        # Silero-VAD confidence threshold
+  vad_threshold: 0.5        # Fraction of voiced WebRTC 10 ms frames
+  vad_backend: "webrtc"     # Local-only; never fetch a model at runtime
+  vad_aggressiveness: 2     # WebRTC mode 0 (least) to 3 (most aggressive)
+  noise_suppression_enabled: false # Explicit pass-through until backend is clinically validated
   silence_duration_ms: 800  # Silence before end-of-speech detection
 
 asr:

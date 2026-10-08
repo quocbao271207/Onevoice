@@ -13,6 +13,7 @@ requests==2.33.1
 sacrebleu==2.6.0
 soundfile==0.14.0
 transformers==4.46.3
+webrtcvad-wheels==2.0.14.post1
 accelerate==1.1.1
 qai-hub==0.55.0
 qai-hub-models-cli==0.63.0

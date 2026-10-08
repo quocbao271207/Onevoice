@@ -50,6 +50,7 @@ def test_explicit_pipeline_config_must_exist_and_be_a_unique_mapping(tmp_path):
     ("section", "key"),
     [
         ("runtime", "allow_base_model_fallback"),
+        ("audio", "noise_suppression_enabled"),
         ("flash_cache", "enabled"),
         ("flash_cache", "fuzzy_matching"),
     ],

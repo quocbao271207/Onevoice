@@ -9,7 +9,7 @@ import numpy as np
 import logging
 import math
 from numbers import Integral, Real
-from typing import Optional, Generator, Tuple
+from typing import Optional, Generator
 from dataclasses import dataclass, field
 from collections import deque
 
@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 MAX_AUDIO_CHANNELS = 8
 MIN_SAMPLE_RATE = 8_000
 MAX_SAMPLE_RATE = 384_000
+WEBRTC_SAMPLE_RATES = {8_000, 16_000, 32_000, 48_000}
+WEBRTC_FRAME_DURATION_MS = 10
 
 
 def validate_audio_input(audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -65,6 +67,9 @@ class AudioConfig:
     channels: int = 1
     chunk_duration_ms: int = 500
     vad_threshold: float = 0.5
+    vad_backend: str = "webrtc"
+    vad_aggressiveness: int = 2
+    noise_suppression_enabled: bool = False
     silence_duration_ms: int = 800
     # Derived
     chunk_size: int = field(init=False)
@@ -76,6 +81,7 @@ class AudioConfig:
             "bit_depth": self.bit_depth,
             "channels": self.channels,
             "chunk_duration_ms": self.chunk_duration_ms,
+            "vad_aggressiveness": self.vad_aggressiveness,
             "silence_duration_ms": self.silence_duration_ms,
         }
         for name, value in integer_fields.items():
@@ -85,6 +91,17 @@ class AudioConfig:
             raise ValueError(
                 f"sample_rate must be in [{MIN_SAMPLE_RATE}, {MAX_SAMPLE_RATE}]"
             )
+        if self.vad_backend != "webrtc":
+            raise ValueError("vad_backend must be 'webrtc'")
+        if self.sample_rate not in WEBRTC_SAMPLE_RATES:
+            raise ValueError(
+                "WebRTC VAD sample_rate must be one of "
+                f"{sorted(WEBRTC_SAMPLE_RATES)}"
+            )
+        if not 0 <= self.vad_aggressiveness <= 3:
+            raise ValueError("vad_aggressiveness must be in [0, 3]")
+        if type(self.noise_suppression_enabled) is not bool:
+            raise ValueError("noise_suppression_enabled must be a boolean")
         if self.bit_depth not in {8, 16, 24, 32}:
             raise ValueError("bit_depth must be one of 8, 16, 24, or 32")
         if not 1 <= self.channels <= MAX_AUDIO_CHANNELS:
@@ -110,38 +127,55 @@ class AudioConfig:
 
 class VoiceActivityDetector:
     """
-    Voice Activity Detection using Silero-VAD v4.
+    Offline voice activity detection using WebRTC VAD.
     Detects speech boundaries in streaming audio chunks.
 
-    Silero-VAD is chosen because:
-    - Ultra-lightweight (~1.5 MB)
-    - < 10ms per frame processing
-    - High accuracy for Vietnamese speech
-    - Works well with code-switching (VI↔EN)
+    The backend accepts local PCM frames only and performs no runtime network
+    access. Chunk probability is the fraction of 10 ms frames marked voiced.
     """
 
-    def __init__(self, threshold: float = 0.5):
+    def __init__(self, threshold: float = 0.5, aggressiveness: int = 2):
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, Real)
+            or not math.isfinite(float(threshold))
+            or not 0.0 <= float(threshold) <= 1.0
+        ):
+            raise ValueError("threshold must be finite and in [0, 1]")
+        if (
+            isinstance(aggressiveness, bool)
+            or not isinstance(aggressiveness, Integral)
+            or not 0 <= int(aggressiveness) <= 3
+        ):
+            raise ValueError("aggressiveness must be an integer in [0, 3]")
         self.threshold = threshold
+        self.aggressiveness = int(aggressiveness)
         self.model = None
         self._is_loaded = False
 
     def load(self):
-        """Load the Silero-VAD model."""
+        """Load the local WebRTC VAD extension without network fallback."""
         try:
-            import torch
-            model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=True  # Use ONNX for faster inference
-            )
-            self.model = model
-            self._get_speech_timestamps = utils[0]
-            self._is_loaded = True
-            logger.info("Silero-VAD v4 loaded successfully (ONNX mode)")
-        except Exception as e:
-            logger.warning(f"Failed to load Silero-VAD: {e}. Using energy-based fallback.")
-            self._is_loaded = False
+            import webrtcvad
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install webrtcvad-wheels from requirements-local.txt; "
+                "energy fallback is disabled"
+            ) from exc
+        try:
+            self.model = webrtcvad.Vad(self.aggressiveness)
+        except Exception as exc:
+            raise RuntimeError("Failed to initialize WebRTC VAD") from exc
+        self._is_loaded = True
+        logger.info(
+            "WebRTC VAD loaded backend=local aggressiveness=%d frame_ms=%d",
+            self.aggressiveness,
+            WEBRTC_FRAME_DURATION_MS,
+        )
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_loaded and self.model is not None
 
     def detect(self, audio_chunk: np.ndarray, sample_rate: int = 16000) -> float:
         """
@@ -154,16 +188,35 @@ class VoiceActivityDetector:
         Returns:
             Speech probability between 0.0 and 1.0
         """
+        if not self.is_ready:
+            raise RuntimeError("WebRTC VAD is not loaded")
         audio_chunk = validate_audio_input(audio_chunk, sample_rate)
-        if self._is_loaded and self.model is not None:
-            import torch
-            tensor = torch.from_numpy(audio_chunk).float()
-            prob = self.model(tensor, sample_rate).item()
-            return prob
-        else:
-            # Fallback: simple energy-based VAD
-            energy = np.sqrt(np.mean(audio_chunk ** 2))
-            return min(1.0, energy / 0.02)  # Normalize against typical speech energy
+        if sample_rate not in WEBRTC_SAMPLE_RATES:
+            raise ValueError(
+                "WebRTC VAD sample_rate must be one of "
+                f"{sorted(WEBRTC_SAMPLE_RATES)}"
+            )
+        frame_samples = int(sample_rate * WEBRTC_FRAME_DURATION_MS / 1000)
+        frame_count = math.ceil(len(audio_chunk) / frame_samples)
+        padded_samples = frame_count * frame_samples
+        if padded_samples != len(audio_chunk):
+            audio_chunk = np.pad(
+                audio_chunk,
+                (0, padded_samples - len(audio_chunk)),
+            )
+        pcm16 = np.clip(
+            np.rint(audio_chunk * 32767.0),
+            -32768,
+            32767,
+        ).astype("<i2")
+        voiced_frames = 0
+        try:
+            for start in range(0, padded_samples, frame_samples):
+                frame = pcm16[start : start + frame_samples].tobytes()
+                voiced_frames += int(self.model.is_speech(frame, sample_rate))
+        except Exception as exc:
+            raise RuntimeError("WebRTC VAD inference failed") from exc
+        return voiced_frames / frame_count
 
     def is_speech(self, audio_chunk: np.ndarray, sample_rate: int = 16000) -> bool:
         """Check if chunk contains speech."""
@@ -172,29 +225,41 @@ class VoiceActivityDetector:
 
 class NoiseSuppressor:
     """
-    Noise suppression for hospital environments.
-    Uses RNNoise / WebRTC-based noise suppression.
+    Optional stationary spectral-gating backend.
 
-    Designed to handle:
-    - Ambulance sirens (75+ dB)
-    - Ventilator noise
-    - Patient monitor beeps
-    - Background chatter in ER
+    The backend remains disabled until it has clinical speech-retention
+    evidence; enabled mode never degrades silently to pass-through.
     """
 
-    def __init__(self):
+    def __init__(self, enabled: bool = False):
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        self.enabled = enabled
+        self._backend = None
         self._is_loaded = False
 
     def load(self):
-        """Load noise suppression model."""
-        try:
-            # Try to use noisereduce as a Python-native alternative
-            import noisereduce
-            self._is_loaded = True
-            logger.info("Noise suppression engine loaded (noisereduce)")
-        except ImportError:
-            logger.warning("noisereduce not available. Noise suppression disabled.")
+        """Load the configured backend or mark explicit pass-through ready."""
+        if not self.enabled:
+            self._backend = None
             self._is_loaded = False
+            logger.info("Noise suppression disabled by configuration")
+            return
+        try:
+            import noisereduce
+        except ImportError as exc:
+            raise RuntimeError(
+                "Noise suppression is enabled but noisereduce is not installed"
+            ) from exc
+        self._backend = noisereduce
+        self._is_loaded = True
+        logger.info("Noise suppression engine loaded backend=noisereduce")
+
+    @property
+    def is_ready(self) -> bool:
+        return not self.enabled or (
+            self._is_loaded and self._backend is not None
+        )
 
     def suppress(self, audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
         """
@@ -208,22 +273,22 @@ class NoiseSuppressor:
             Denoised audio signal
         """
         audio = validate_audio_input(audio, sample_rate)
-        if not self._is_loaded:
+        if not self.enabled:
             return audio
+        if not self.is_ready:
+            raise RuntimeError("Noise suppression backend is not loaded")
 
         try:
-            import noisereduce as nr
-            # Stationary noise reduction — suitable for continuous background noise
-            reduced = nr.reduce_noise(
+            # Deterministic settings; clinical validation is required before enablement.
+            reduced = self._backend.reduce_noise(
                 y=audio,
                 sr=sample_rate,
-                prop_decrease=0.8,  # Aggressive noise reduction for hospital env
-                stationary=True
+                prop_decrease=0.8,
+                stationary=True,
             )
-            reduced = reduced.astype(np.float32)
-        except Exception as e:
-            logger.warning(f"Noise suppression failed: {e}. Returning original audio.")
-            return audio
+            reduced = np.asarray(reduced, dtype=np.float32)
+        except Exception as exc:
+            raise RuntimeError("Noise suppression failed") from exc
         return validate_audio_input(reduced, sample_rate)
 
 
@@ -231,8 +296,8 @@ class AudioFrontend:
     """
     Complete Audio Frontend pipeline:
     1. Receive raw PCM audio from microphone
-    2. Apply noise suppression (RNNoise)
-    3. Run VAD (Silero-VAD)
+    2. Apply explicitly configured noise suppression
+    3. Run local WebRTC VAD
     4. Yield clean speech chunks with boundaries
 
     This module connects the 3-mic MEMS array to the ASR engine.
@@ -240,19 +305,38 @@ class AudioFrontend:
 
     def __init__(self, config: Optional[AudioConfig] = None):
         self.config = config or AudioConfig()
-        self.vad = VoiceActivityDetector(threshold=self.config.vad_threshold)
-        self.denoiser = NoiseSuppressor()
+        self.vad = VoiceActivityDetector(
+            threshold=self.config.vad_threshold,
+            aggressiveness=self.config.vad_aggressiveness,
+        )
+        self.denoiser = NoiseSuppressor(
+            enabled=self.config.noise_suppression_enabled,
+        )
         self._buffer = deque(maxlen=100)  # Rolling buffer of chunks
         self._speech_active = False
         self._silence_count = 0
         self._speech_chunks = []
+        self._is_loaded = False
 
     def load(self):
         """Initialize all audio frontend components."""
         logger.info("Loading Audio Frontend components...")
         self.vad.load()
         self.denoiser.load()
-        logger.info("Audio Frontend ready.")
+        self._is_loaded = True
+        logger.info(
+            "Audio Frontend ready vad=webrtc noise_suppression=%s",
+            "enabled" if self.denoiser.enabled else "disabled",
+        )
+
+    def get_status(self) -> dict:
+        return {
+            "ready": self._is_loaded and self.vad.is_ready and self.denoiser.is_ready,
+            "vad_backend": self.config.vad_backend,
+            "vad_loaded": self.vad.is_ready,
+            "noise_suppression_enabled": self.denoiser.enabled,
+            "noise_suppression_loaded": self.denoiser._is_loaded,
+        }
 
     def process_chunk(self, raw_chunk: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -314,7 +398,7 @@ class AudioFrontend:
         def audio_callback(indata, frames, time, status):
             if status:
                 logger.warning(f"Audio stream status: {status}")
-            chunk = indata[:, 0].astype(np.float32)  # Take first channel
+            chunk = indata.astype(np.float32, copy=True)
             self._buffer.append(chunk)
 
         with sd.InputStream(

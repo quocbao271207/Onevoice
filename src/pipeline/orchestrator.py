@@ -58,6 +58,9 @@ PIPELINE_CONFIG_KEYS = {
         "channels",
         "chunk_duration_ms",
         "vad_threshold",
+        "vad_backend",
+        "vad_aggressiveness",
+        "noise_suppression_enabled",
         "silence_duration_ms",
     },
     "asr": {"max_input_duration_seconds", "max_new_tokens", "vi", "en"},
@@ -221,6 +224,12 @@ class MediVoicePipeline:
             channels=audio_settings.get("channels", 1),
             chunk_duration_ms=audio_settings.get("chunk_duration_ms", 500),
             vad_threshold=audio_settings.get("vad_threshold", 0.5),
+            vad_backend=audio_settings.get("vad_backend", "webrtc"),
+            vad_aggressiveness=audio_settings.get("vad_aggressiveness", 2),
+            noise_suppression_enabled=audio_settings.get(
+                "noise_suppression_enabled",
+                False,
+            ),
             silence_duration_ms=audio_settings.get("silence_duration_ms", 800),
         )
 
@@ -376,6 +385,11 @@ class MediVoicePipeline:
         flash_cfg = cls._require_mapping(config, "flash_cache")
         boolean_fields = (
             (runtime_cfg, "allow_base_model_fallback", "runtime"),
+            (
+                cls._require_mapping(config, "audio"),
+                "noise_suppression_enabled",
+                "audio",
+            ),
             (flash_cfg, "enabled", "flash_cache"),
             (flash_cfg, "fuzzy_matching", "flash_cache"),
         )
