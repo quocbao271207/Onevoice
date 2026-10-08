@@ -9,8 +9,9 @@ valid MT evaluation that returns exit code 2.
 from __future__ import annotations
 
 import argparse
-import json
+import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,14 +24,47 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.candidate_evidence import (  # noqa: E402
+    MAX_EVIDENCE_ARCHIVE_BYTES,
     adapter_identity,
     canonical_sha256,
-    sha256,
     verify_evidence_archive,
 )
+from src.pipeline.adapter_evidence import stable_adapter_tree_manifest  # noqa: E402
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    is_link_or_junction,
+    resolve_regular_directory_without_links,
+    resolve_regular_file_without_links,
+)
+from src.pipeline.stable_json import (  # noqa: E402
+    read_stable_json_mapping,
+)
+from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 MT_CANDIDATE_NUM_BEAMS = 1
+MAX_PROGRAM_STATE_BYTES = 10_000_000
+MAX_TRAINING_SUMMARY_BYTES = 10_000_000
+MAX_TRAINER_STATE_BYTES = 10_000_000
+MAX_CANDIDATE_GATE_BYTES = 10_000_000
+MAX_PREDICTION_PROVENANCE_BYTES = 10_000_000
+MAX_PREDICTION_BYTES = 250_000_000
+MAX_PREDICTION_LINE_BYTES = 2_000_000
+MAX_PREDICTION_ROWS = 100_000
+MAX_LIVE_EVIDENCE_FILE_BYTES = 1_000_000_000
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHECKPOINT_RE = re.compile(r"^checkpoint-([1-9]\d*)$")
+ROUND_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+PROVENANCE_KEYS = {
+    "schema_version",
+    "specification",
+    "specification_sha256",
+    "predictions",
+    "decoding",
+    "runtime",
+}
+PREDICTION_RECORD_KEYS = {"path", "bytes", "sha256", "rows"}
 
 
 def utc_now() -> str:
@@ -38,11 +72,62 @@ def utc_now() -> str:
 
 
 def write_state(path: Path, state: dict[str, Any]) -> None:
-    """Atomically persist progress so a watcher never reads partial JSON."""
+    """Durably persist strict progress JSON through an owned random temp."""
     state["updated_at"] = utc_now()
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    write_durable_json(
+        path,
+        state,
+        maximum_bytes=MAX_PROGRAM_STATE_BYTES,
+        label="GPU program state",
+    )
+
+
+def read_program_state(path: Path) -> dict[str, Any]:
+    return read_stable_json_mapping(
+        path,
+        maximum_bytes=MAX_PROGRAM_STATE_BYTES,
+        label="GPU program state",
+    ).mapping
+
+
+def _nonnegative_integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{label} must be a finite number")
+    return parsed
+
+
+def _sha256(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _absolute_path(value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty path string")
+    return Path(os.path.abspath(value))
+
+
+def _recorded_adapter(state: dict[str, Any], field: str, label: str) -> Path:
+    value = state.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Recorded {label.lower()} path is missing")
+    adapter = resolve_regular_directory_without_links(value, label=label)
+    resolve_regular_file_without_links(
+        adapter / "adapter_config.json",
+        label=f"{label} config",
+        maximum_bytes=MAX_TRAINING_SUMMARY_BYTES,
+    )
+    return adapter
 
 
 def process_exists(pid: int) -> bool:
@@ -65,9 +150,11 @@ def wait_for_process(pid: int, poll_seconds: float, state_path: Path, state: dic
 
 def read_complete_run(run_root: Path, expected_task: str) -> dict[str, Any]:
     summary_path = run_root / "summary.json"
-    if not summary_path.is_file():
-        raise FileNotFoundError(f"missing run summary: {summary_path}")
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary = read_stable_json_mapping(
+        summary_path,
+        maximum_bytes=MAX_TRAINING_SUMMARY_BYTES,
+        label="GPU training summary",
+    ).mapping
     if summary.get("task") != expected_task:
         raise ValueError(f"expected {expected_task} run, found {summary.get('task')!r}")
     if summary.get("status") != "complete":
@@ -76,43 +163,78 @@ def read_complete_run(run_root: Path, expected_task: str) -> dict[str, Any]:
 
 
 def selected_adapter(run_root: Path, summary: dict[str, Any]) -> Path:
-    selected = str(summary.get("selected_round") or "")
-    if not selected:
+    selected = summary.get("selected_round")
+    if not isinstance(selected, str) or not ROUND_NAME_RE.fullmatch(selected):
         raise ValueError(f"run has no selected_round: {run_root}")
+    run_root = resolve_regular_directory_without_links(
+        run_root,
+        label="GPU training run",
+    )
     matches = sorted(run_root.glob(f"[0-9][0-9]-{selected}/model"))
     if len(matches) != 1:
         raise ValueError(f"expected one model directory for {selected!r}, found {len(matches)}")
-    adapter = matches[0]
-    if not (adapter / "adapter_config.json").is_file():
-        raise FileNotFoundError(f"selected adapter is incomplete: {adapter}")
+    adapter = resolve_regular_directory_without_links(
+        matches[0],
+        label="Selected training adapter",
+    )
+    resolve_regular_file_without_links(
+        adapter / "adapter_config.json",
+        label="Selected adapter config",
+        maximum_bytes=MAX_TRAINING_SUMMARY_BYTES,
+    )
     return adapter
 
 
 def checkpoint_step(path: Path) -> int:
-    try:
-        return int(path.name.rsplit("-", 1)[1])
-    except (IndexError, ValueError) as exc:
-        raise ValueError(f"invalid checkpoint directory name: {path}") from exc
+    match = CHECKPOINT_RE.fullmatch(path.name)
+    if not match:
+        raise ValueError(f"invalid checkpoint directory name: {path}")
+    return int(match.group(1))
 
 
 def latest_checkpoint(model_dir: Path) -> Path:
-    checkpoints = [
-        path
-        for path in model_dir.glob("checkpoint-*")
-        if path.is_dir() and (path / "trainer_state.json").is_file()
-    ]
+    model_dir = resolve_regular_directory_without_links(
+        model_dir,
+        label="Training model directory",
+    )
+    checkpoints = []
+    for path in model_dir.glob("checkpoint-*"):
+        if is_link_or_junction(path):
+            raise ValueError(f"Checkpoint cannot be a symlink or junction: {path}")
+        if path.is_dir() and (path / "trainer_state.json").is_file():
+            checkpoints.append(path)
     if not checkpoints:
         raise FileNotFoundError(f"no resumable checkpoint under {model_dir}")
     return max(checkpoints, key=checkpoint_step)
 
 
 def validation_history(checkpoint: Path, metric_name: str = "eval_loss") -> list[dict[str, float]]:
-    trainer_state = json.loads((checkpoint / "trainer_state.json").read_text(encoding="utf-8"))
-    history = [
-        {"step": float(item["step"]), "metric": float(item[metric_name])}
-        for item in trainer_state.get("log_history", [])
-        if item.get("step") is not None and item.get(metric_name) is not None
-    ]
+    trainer_state = read_stable_json_mapping(
+        checkpoint / "trainer_state.json",
+        maximum_bytes=MAX_TRAINER_STATE_BYTES,
+        label="Trainer validation state",
+    ).mapping
+    raw_history = trainer_state.get("log_history")
+    if not isinstance(raw_history, list):
+        raise ValueError("trainer_state.log_history must be a list")
+    history: list[dict[str, float]] = []
+    observed_steps: set[float] = set()
+    for index, item in enumerate(raw_history, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"trainer_state.log_history row {index} must be an object")
+        if item.get("step") is None or item.get(metric_name) is None:
+            continue
+        step = _finite_number(item["step"], f"trainer_state row {index} step")
+        metric = _finite_number(
+            item[metric_name],
+            f"trainer_state row {index} {metric_name}",
+        )
+        if step < 0 or metric < 0:
+            raise ValueError("Trainer validation step and metric must be non-negative")
+        if step in observed_steps:
+            raise ValueError(f"Trainer validation history has duplicate step {step}")
+        observed_steps.add(step)
+        history.append({"step": step, "metric": metric})
     return sorted(history, key=lambda item: item["step"])
 
 
@@ -187,17 +309,24 @@ def run_stage(
 
 
 def newest_complete_run(output_root: Path, task: str) -> tuple[Path, dict[str, Any]]:
-    candidates = sorted(output_root.glob(f"{task}-*"), key=lambda path: path.stat().st_mtime)
+    output_root = resolve_regular_directory_without_links(
+        output_root,
+        label=f"{task} training output root",
+    )
+    candidates = list(output_root.glob(f"{task}-*"))
+    if any(is_link_or_junction(path) for path in candidates):
+        raise ValueError(f"{task} training output cannot contain linked runs")
+    candidates.sort(key=lambda path: path.lstat().st_mtime_ns)
     for run_root in reversed(candidates):
         try:
             return run_root, read_complete_run(run_root, task)
-        except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        except (FileNotFoundError, RuntimeError, ValueError):
             continue
     raise FileNotFoundError(f"no complete {task} run under {output_root}")
 
 
 def resume_kind(state: dict[str, Any], mt_run: Path) -> str:
-    if Path(state.get("mt_run", "")).resolve() != mt_run:
+    if _absolute_path(state.get("mt_run"), "Recorded MT run") != mt_run:
         raise ValueError("resume --mt-run does not match recorded state")
     stages = state.get("stages")
     if state.get("stage") == "waiting_for_mt" and not stages:
@@ -249,37 +378,71 @@ def verify_prediction_provenance(
     provenance_path = prediction_path.with_suffix(
         prediction_path.suffix + ".provenance.json"
     )
-    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance_document = read_stable_json_mapping(
+        provenance_path,
+        maximum_bytes=MAX_PREDICTION_PROVENANCE_BYTES,
+        label="Candidate prediction provenance",
+    )
+    provenance = provenance_document.mapping
     specification = provenance.get("specification")
     if (
-        provenance.get("schema_version") != 1
+        set(provenance) != PROVENANCE_KEYS
+        or isinstance(provenance.get("schema_version"), bool)
+        or provenance.get("schema_version") != 1
         or not isinstance(specification, dict)
         or specification.get("task") != expected_task
         or specification.get("adapter") != expected_adapter_identity
-        or provenance.get("specification_sha256") != canonical_sha256(specification)
+        or _sha256(
+            provenance.get("specification_sha256"),
+            "Prediction specification digest",
+        )
+        != canonical_sha256(specification)
     ):
         raise ValueError(f"prediction provenance does not bind expected adapter: {prediction_path}")
 
     prediction_record = provenance.get("predictions")
+    prediction_document = read_stable_jsonl_mappings(
+        prediction_path,
+        maximum_bytes=MAX_PREDICTION_BYTES,
+        maximum_line_bytes=MAX_PREDICTION_LINE_BYTES,
+        maximum_rows=MAX_PREDICTION_ROWS,
+        label="Candidate predictions",
+    )
     if (
         not isinstance(prediction_record, dict)
-        or prediction_record.get("path") != str(prediction_path.resolve())
-        or int(prediction_record.get("bytes", -1)) != prediction_path.stat().st_size
-        or prediction_record.get("sha256") != sha256(prediction_path)
+        or set(prediction_record) != PREDICTION_RECORD_KEYS
+        or _absolute_path(
+            prediction_record.get("path"),
+            "Prediction provenance path",
+        )
+        != prediction_document.path
+        or _nonnegative_integer(
+            prediction_record.get("bytes"),
+            "Prediction provenance bytes",
+        )
+        != prediction_document.bytes
+        or _sha256(
+            prediction_record.get("sha256"),
+            "Prediction provenance digest",
+        )
+        != prediction_document.sha256
         or not isinstance(provenance.get("decoding"), dict)
         or not isinstance(provenance.get("runtime"), dict)
     ):
         raise ValueError(f"prediction provenance is inconsistent: {prediction_path}")
-    rows = 0
-    with prediction_path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            if not isinstance(json.loads(line), dict):
-                raise ValueError(f"prediction checkpoint row is invalid: {prediction_path}")
-            rows += 1
-    if int(prediction_record.get("rows", -1)) != rows:
+    if _nonnegative_integer(
+        prediction_record.get("rows"),
+        "Prediction provenance rows",
+    ) != len(prediction_document.rows):
         raise ValueError(f"prediction provenance row count is inconsistent: {prediction_path}")
+    persisted = read_stable_json_mapping(
+        provenance_path,
+        maximum_bytes=MAX_PREDICTION_PROVENANCE_BYTES,
+        label="Candidate prediction provenance",
+        expected_sha256=provenance_document.sha256,
+    )
+    if persisted.bytes != provenance_document.bytes:
+        raise RuntimeError("Candidate prediction provenance changed while verifying")
 
 
 def verified_candidate_result(
@@ -289,17 +452,20 @@ def verified_candidate_result(
     expected_adapter: Path,
 ) -> dict[str, Any]:
     gate_path = output_dir / "candidate_gate.json"
-    if not gate_path.is_file():
-        raise FileNotFoundError(f"candidate gate is not complete: {gate_path}")
-    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    gate_document = read_stable_json_mapping(
+        gate_path,
+        maximum_bytes=MAX_CANDIDATE_GATE_BYTES,
+        label="Candidate gate",
+    )
+    gate = gate_document.mapping
     status = gate.get("status")
+    promotion_allowed = gate.get("promotion_allowed")
     if status not in {"pass", "fail"} or gate.get("error") is not None:
         raise ValueError(f"candidate gate has no valid terminal result: {gate_path}")
-    if bool(gate.get("promotion_allowed")) != (status == "pass"):
+    if not isinstance(promotion_allowed, bool) or promotion_allowed != (
+        status == "pass"
+    ):
         raise ValueError(f"candidate gate promotion flag is inconsistent: {gate_path}")
-    if Path(str(gate.get("adapter") or "")).resolve() != expected_adapter.resolve():
-        raise ValueError(f"candidate gate adapter does not match program state: {gate_path}")
-
     archive_path = output_dir.with_suffix(".tar.gz")
     manifest = verify_evidence_archive(archive_path)
     records = {str(item["path"]): item for item in manifest["files"]}
@@ -307,6 +473,10 @@ def verified_candidate_result(
     expected_identity = adapter_identity(expected_adapter)
     if expected_identity is None:  # pragma: no cover - expected_adapter is always a Path
         raise ValueError("candidate recovery requires an adapter")
+    if _absolute_path(gate.get("adapter"), "Candidate gate adapter") != Path(
+        expected_identity["path"]
+    ):
+        raise ValueError(f"candidate gate adapter does not match program state: {gate_path}")
     required_names = {"candidate_gate.json"}
     for stem in stems:
         required_names.update(
@@ -323,12 +493,21 @@ def verified_candidate_result(
         path = output_dir / name
         archive_name = f"{output_dir.name}/{name}"
         record = records.get(archive_name)
-        if record is None or not path.is_file():
+        if record is None:
             raise ValueError(f"candidate evidence does not match archive: {path}")
-        matches_archive = (
-            int(record["bytes"]) == path.stat().st_size
-            and str(record["sha256"]) == sha256(path)
+        resolved = resolve_regular_file_without_links(
+            path,
+            label=f"Candidate evidence {name}",
+            maximum_bytes=MAX_LIVE_EVIDENCE_FILE_BYTES,
         )
+        digest, size = sha256_stable_regular_file(
+            resolved,
+            maximum_bytes=MAX_LIVE_EVIDENCE_FILE_BYTES,
+            label=f"Candidate evidence {name}",
+        )
+        matches_archive = int(record["bytes"]) == size and str(
+            record["sha256"]
+        ) == digest
         if not matches_archive:
             if name.endswith(".log"):
                 mutable_log_mismatches.append(name)
@@ -340,6 +519,16 @@ def verified_candidate_result(
             expected_task=task,
             expected_adapter_identity=expected_identity,
         )
+    if adapter_identity(expected_adapter) != expected_identity:
+        raise RuntimeError("Candidate adapter changed while verifying recovery evidence")
+    persisted_gate = read_stable_json_mapping(
+        gate_path,
+        maximum_bytes=MAX_CANDIDATE_GATE_BYTES,
+        label="Candidate gate",
+        expected_sha256=gate_document.sha256,
+    )
+    if persisted_gate.bytes != gate_document.bytes:
+        raise RuntimeError("Candidate gate changed while verifying recovery evidence")
     return {
         "return_code": 0 if status == "pass" else 2,
         "status": status,
@@ -393,12 +582,14 @@ def verify_live_directory_against_archive(
     if not expected:
         raise ValueError(f"verified archive has no files under {archive_prefix}")
 
-    observed: dict[str, Path] = {}
-    for path in sorted(directory.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"live evidence directory cannot contain symlinks: {path}")
-        if path.is_file():
-            observed[path.relative_to(directory).as_posix()] = path
+    observed_manifest = stable_adapter_tree_manifest(
+        directory,
+        label="Live training adapter",
+        required_relative_paths=(),
+    )
+    observed = {
+        str(item["path"]): item for item in observed_manifest["files"]
+    }
     if set(observed) != set(expected):
         missing = sorted(set(expected) - set(observed))
         unexpected = sorted(set(observed) - set(expected))
@@ -407,16 +598,19 @@ def verify_live_directory_against_archive(
             f"missing={missing}, unexpected={unexpected}"
         )
 
-    for relative_path, path in observed.items():
-        record = expected[relative_path]
+    for relative_path, observed_record in observed.items():
+        expected_record = expected[relative_path]
         if (
-            int(record["bytes"]) != path.stat().st_size
-            or str(record["sha256"]) != sha256(path)
+            int(expected_record["bytes"]) != int(observed_record["bytes"])
+            or str(expected_record["sha256"]) != observed_record["sha256"]
         ):
-            raise ValueError(f"live file does not match verified archive: {path}")
+            raise ValueError(
+                "live file does not match verified archive: "
+                f"{directory / relative_path}"
+            )
     return {
-        "file_count": len(observed),
-        "content_bytes": sum(path.stat().st_size for path in observed.values()),
+        "file_count": int(observed_manifest["file_count"]),
+        "content_bytes": int(observed_manifest["bytes"]),
     }
 
 
@@ -433,25 +627,48 @@ def verified_training_result(output_root: Path, *, task: str) -> dict[str, Any]:
         archive_record = round_record.get("archive")
         if not isinstance(archive_record, dict):
             raise ValueError(f"training round has no archive evidence: {run_root} row {index}")
-        round_name = str(round_record.get("name") or "")
+        round_name = round_record.get("name")
+        if not isinstance(round_name, str) or not ROUND_NAME_RE.fullmatch(round_name):
+            raise ValueError(f"training round has an invalid name: {run_root} row {index}")
         matches = list(run_root.glob(f"{index:02d}-{round_name}.tar.gz"))
         if len(matches) != 1:
             raise FileNotFoundError(
                 f"expected one archive for training round {index}: {round_name}"
             )
-        archive_path = matches[0].resolve()
-        if Path(str(archive_record.get("path") or "")).resolve() != archive_path:
+        archive_path = resolve_regular_file_without_links(
+            matches[0],
+            label="Training round archive",
+            maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+        )
+        if _absolute_path(
+            archive_record.get("path"),
+            "Training archive record path",
+        ) != archive_path:
             raise ValueError(f"training archive path mismatch: {archive_path}")
         manifest = verify_evidence_archive(archive_path)
         checksum_path = archive_path.with_suffix(archive_path.suffix + ".sha256")
         manifest_path = archive_path.with_suffix(archive_path.suffix + ".manifest.json")
         if (
-            int(archive_record.get("bytes", -1)) != int(manifest["archive_bytes"])
-            or str(archive_record.get("sha256") or "") != manifest["archive_sha256"]
-            or Path(str(archive_record.get("checksum") or "")).resolve()
-            != checksum_path.resolve()
-            or Path(str(archive_record.get("manifest") or "")).resolve()
-            != manifest_path.resolve()
+            _nonnegative_integer(
+                archive_record.get("bytes"),
+                "Training archive bytes",
+            )
+            != int(manifest["archive_bytes"])
+            or _sha256(
+                archive_record.get("sha256"),
+                "Training archive digest",
+            )
+            != manifest["archive_sha256"]
+            or _absolute_path(
+                archive_record.get("checksum"),
+                "Training archive checksum path",
+            )
+            != checksum_path
+            or _absolute_path(
+                archive_record.get("manifest"),
+                "Training archive manifest path",
+            )
+            != manifest_path
         ):
             raise ValueError(f"training archive metadata mismatch: {archive_path}")
         verified_archives.append(
@@ -535,22 +752,21 @@ def main() -> int:
     if args.wait_pid is not None and args.wait_pid <= 0:
         parser.error("--wait-pid must be positive")
 
-    state_dir = args.state_dir.resolve()
-    mt_run = args.mt_run.resolve()
+    state_dir = Path(os.path.abspath(args.state_dir))
+    mt_run = resolve_regular_directory_without_links(
+        args.mt_run,
+        label="MT training run",
+    )
     state_path = state_dir / "program_state.json"
     resume_from = "new"
     recovered_mt: dict[str, Any] | None = None
     recovered_asr_training: dict[str, Any] | None = None
     recovered_asr_candidate: dict[str, Any] | None = None
     if args.resume:
-        if not state_path.is_file():
-            raise FileNotFoundError(f"cannot resume without {state_path}")
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = read_program_state(state_path)
         resume_from = resume_kind(state, mt_run)
         if resume_from == "after_recovered_mt_candidate":
-            mt_adapter = Path(str(state.get("mt_adapter") or "")).resolve()
-            if not (mt_adapter / "adapter_config.json").is_file():
-                raise FileNotFoundError(f"recorded MT adapter is incomplete: {mt_adapter}")
+            mt_adapter = _recorded_adapter(state, "mt_adapter", "Recorded MT adapter")
             recovered_mt = verified_candidate_result(
                 state_dir / "mt-candidate",
                 task="mt",
@@ -563,9 +779,11 @@ def main() -> int:
             )
         elif resume_from == "after_recovered_asr_candidate":
             completed_candidate_code(state, "mt_candidate")
-            asr_adapter = Path(str(state.get("asr_adapter") or "")).resolve()
-            if not (asr_adapter / "adapter_config.json").is_file():
-                raise FileNotFoundError(f"recorded ASR adapter is incomplete: {asr_adapter}")
+            asr_adapter = _recorded_adapter(
+                state,
+                "asr_adapter",
+                "Recorded ASR adapter",
+            )
             recovered_asr_candidate = verified_candidate_result(
                 state_dir / "asr-candidate",
                 task="asr",

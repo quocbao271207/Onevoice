@@ -9,6 +9,7 @@ from scripts.run_gpu_program import (
     latest_checkpoint,
     newest_complete_run,
     read_complete_run,
+    read_program_state,
     record_recovered_candidate,
     record_recovered_training,
     resume_kind,
@@ -16,6 +17,7 @@ from scripts.run_gpu_program import (
     selected_adapter,
     should_extend_mt,
     validation_history,
+    verify_prediction_provenance,
     verified_candidate_result,
     verified_training_result,
     write_state,
@@ -67,6 +69,18 @@ def test_read_complete_run_rejects_failed_training(tmp_path: Path):
         read_complete_run(run, "mt")
 
 
+def test_read_complete_run_rejects_duplicate_json_keys(tmp_path: Path):
+    run = make_run(tmp_path)
+    summary = run / "summary.json"
+    summary.write_text(
+        '{"task":"mt","task":"asr","status":"complete"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        read_complete_run(run, "mt")
+
+
 def test_newest_complete_run_skips_incomplete_newer_run(tmp_path: Path):
     complete = make_run(tmp_path, task="asr")
     newer = tmp_path / "asr-20261005-000001"
@@ -93,6 +107,33 @@ def test_run_stage_accepts_candidate_gate_failure_as_evidence(tmp_path: Path):
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
     assert persisted["stages"]["candidate"]["status"] == "complete"
     assert persisted["stages"]["candidate"]["return_code"] == 2
+
+
+def test_program_state_write_is_strict_durable_and_preserves_previous_state(
+    tmp_path: Path,
+):
+    state_path = tmp_path / "program_state.json"
+    state = {"stage": "ready", "stages": {}}
+    write_state(state_path, state)
+    persisted = state_path.read_bytes()
+
+    state["invalid"] = float("nan")
+    with pytest.raises(ValueError, match="not serializable"):
+        write_state(state_path, state)
+
+    assert state_path.read_bytes() == persisted
+    assert not list(tmp_path.glob(".program_state.json.*.tmp"))
+
+
+def test_program_state_reader_rejects_duplicate_keys(tmp_path: Path):
+    state_path = tmp_path / "program_state.json"
+    state_path.write_text(
+        '{"stage":"ready","stage":"finished"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        read_program_state(state_path)
 
 
 def test_mt_extension_uses_recent_validation_trend_only(tmp_path: Path):
@@ -132,6 +173,25 @@ def test_mt_extension_stops_on_validation_plateau():
     assert evidence["reason"] == "validation_plateau_or_regression"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"log_history":[{"step":1,"eval_loss":1.0,"eval_loss":0.5}]}',
+        '{"log_history":[{"step":1,"eval_loss":NaN}]}',
+    ],
+)
+def test_validation_history_rejects_non_strict_trainer_state(
+    tmp_path: Path,
+    payload: str,
+):
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "trainer_state.json").write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        validation_history(checkpoint)
+
+
 def write_prediction_evidence(
     output: Path, stem: str, adapter: Path, *, task: str = "mt"
 ) -> None:
@@ -154,6 +214,47 @@ def write_prediction_evidence(
     prediction_path.with_suffix(prediction_path.suffix + ".provenance.json").write_text(
         json.dumps(provenance), encoding="utf-8"
     )
+
+
+def test_prediction_recovery_rejects_extra_provenance_fields(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    output = tmp_path / "candidate"
+    output.mkdir()
+    write_prediction_evidence(output, "mt_candidate", adapter)
+    prediction = output / "mt_candidate_predictions.jsonl"
+    provenance_path = prediction.with_suffix(
+        prediction.suffix + ".provenance.json"
+    )
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["untrusted"] = True
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not bind expected adapter"):
+        verify_prediction_provenance(
+            prediction,
+            expected_task="mt",
+            expected_adapter_identity=adapter_identity(adapter),
+        )
+
+
+def test_prediction_recovery_rejects_duplicate_jsonl_keys(tmp_path: Path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    output = tmp_path / "candidate"
+    output.mkdir()
+    write_prediction_evidence(output, "mt_candidate", adapter)
+    prediction = output / "mt_candidate_predictions.jsonl"
+    prediction.write_text('{"id":"one","id":"two"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSONL"):
+        verify_prediction_provenance(
+            prediction,
+            expected_task="mt",
+            expected_adapter_identity=adapter_identity(adapter),
+        )
 
 
 def test_resume_kind_accepts_only_idle_wait_or_running_mt_candidate(tmp_path: Path):
@@ -347,4 +448,17 @@ def test_recovered_training_requires_verified_round_archives(tmp_path: Path):
         "0" * 64 + f"  {Path(archive['path']).name}\n", encoding="utf-8"
     )
     with pytest.raises(ValueError, match="checksum mismatch"):
+        verified_training_result(output_root, task="asr")
+
+
+def test_recovered_training_rejects_unsafe_round_name(tmp_path: Path):
+    output_root = tmp_path / "asr-runs"
+    run = make_run(output_root, task="asr")
+    summary_path = run / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["rounds"][0]["name"] = "../outside"
+    summary["rounds"][0]["archive"] = {}
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid name"):
         verified_training_result(output_root, task="asr")
