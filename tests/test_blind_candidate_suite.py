@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import scripts.run_blind_candidate_suite as blind
 from scripts.run_blind_candidate_suite import (
     _mutex_path,
     adapter_tree_manifest,
@@ -18,6 +19,7 @@ from scripts.run_blind_candidate_suite import (
     evaluate,
     exclusive_mutex,
     load_locked_accuracy_config,
+    read_jsonl,
     sha256,
     validate_content_integrity,
     validate_identifiers,
@@ -105,6 +107,41 @@ def test_blind_lock_verifies_checksums_and_detects_tampering(tmp_path: Path):
         verify_lock(lock)
 
 
+def test_blind_lock_rejects_linked_manifest(tmp_path: Path):
+    mt = tmp_path / "mt.jsonl"
+    asr = tmp_path / "asr.jsonl"
+    mt.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr.write_text('{"id":"asr"}\n', encoding="utf-8")
+    linked_mt = tmp_path / "mt-link.jsonl"
+    try:
+        linked_mt.symlink_to(mt.name)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+    lock = tmp_path / "lock.json"
+    write_lock(lock, mt, asr)
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    payload["manifests"]["mt"]["path"] = str(linked_mt)
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        verify_lock(lock)
+
+
+def test_blind_jsonl_is_bounded_and_object_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manifest = tmp_path / "blind.jsonl"
+    manifest.write_text('["not-an-object"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="must be an object"):
+        read_jsonl(manifest)
+
+    monkeypatch.setattr(blind, "MAX_BLIND_MANIFEST_LINE_BYTES", 8)
+    manifest.write_text('{"id":"too-long"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="line 1 exceeds 8 bytes"):
+        read_jsonl(manifest)
+
+
 def test_blind_lock_rejects_legacy_schema(tmp_path: Path):
     mt = tmp_path / "mt.jsonl"
     asr = tmp_path / "asr.jsonl"
@@ -117,6 +154,21 @@ def test_blind_lock_rejects_legacy_schema(tmp_path: Path):
     lock.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="schema version 2"):
+        verify_lock(lock)
+
+
+def test_blind_lock_rejects_unknown_schema_fields(tmp_path: Path):
+    mt = tmp_path / "mt.jsonl"
+    asr = tmp_path / "asr.jsonl"
+    mt.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr.write_text('{"id":"asr"}\n', encoding="utf-8")
+    lock = tmp_path / "lock.json"
+    write_lock(lock, mt, asr)
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    payload["trusted_override"] = True
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lock schema is invalid"):
         verify_lock(lock)
 
 

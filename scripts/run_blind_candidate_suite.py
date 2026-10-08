@@ -24,6 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data.quality import fingerprint_text, normalize_text  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    resolve_regular_file,
+    resolve_regular_file_under,
+)
 from src.pipeline.license_policy import license_decisions  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     configured_selection_hashes,
@@ -34,11 +38,44 @@ from src.pipeline.selection_policy import (  # noqa: E402
 
 MAX_BLIND_REPORT_BYTES = 50_000_000
 MAX_BLIND_PROVENANCE_BYTES = 5_000_000
+MAX_BLIND_LOCK_BYTES = 5_000_000
+MAX_BLIND_MANIFEST_BYTES = 250_000_000
+MAX_BLIND_MANIFEST_LINE_BYTES = 2_000_000
+MAX_ACCURACY_CONFIG_BYTES = 1_000_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+BLIND_LOCK_ALLOWED_FIELDS = frozenset(
+    {
+        "version",
+        "status",
+        "policy",
+        "required_slices",
+        "minimum_coverage",
+        "manifests",
+        "selection",
+        "opened",
+        "locked_at",
+    }
+)
+BLIND_LOCK_REQUIRED_FIELDS = BLIND_LOCK_ALLOWED_FIELDS - {"policy", "locked_at"}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_lock_envelope(lock: dict[str, Any]) -> None:
+    if not BLIND_LOCK_REQUIRED_FIELDS.issubset(lock) or not set(lock).issubset(
+        BLIND_LOCK_ALLOWED_FIELDS
+    ):
+        raise ValueError("Blind v2 lock schema is invalid")
+    for field in ("required_slices", "minimum_coverage", "manifests"):
+        value = lock.get(field)
+        if not isinstance(value, dict) or set(value) != {"mt", "asr"}:
+            raise ValueError(f"Blind v2 lock {field} structure is invalid")
+    if "policy" in lock and not isinstance(lock["policy"], str):
+        raise ValueError("Blind v2 lock policy is invalid")
+    if "locked_at" in lock:
+        _aware_timestamp(lock["locked_at"], label="Blind lock")
 
 
 def sha256(path: Path) -> str:
@@ -80,8 +117,31 @@ def adapter_tree_manifest(adapter: Path) -> dict[str, Any]:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    path = resolve_regular_file(
+        path,
+        label="Blind JSONL manifest",
+        maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
+    )
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8", errors="strict") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                if len(line.encode("utf-8")) > MAX_BLIND_MANIFEST_LINE_BYTES:
+                    raise ValueError(
+                        f"Blind JSONL line {line_number} exceeds "
+                        f"{MAX_BLIND_MANIFEST_LINE_BYTES} bytes"
+                    )
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f"Blind JSONL line {line_number} must be an object"
+                    )
+                rows.append(row)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Blind JSONL manifest is invalid: {path}") from exc
+    return rows
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -551,12 +611,21 @@ def load_locked_accuracy_config(
     project_root: Path = ROOT,
 ) -> dict[str, Any]:
     record = config["data"]["accuracy_program"]
-    path = Path(record["path"])
-    if not path.is_absolute():
-        path = project_root / path
-    path = path.resolve()
-    if not path.is_file():
-        raise FileNotFoundError(path)
+    configured_path = Path(str(record["path"]))
+    if configured_path.is_absolute():
+        path = resolve_regular_file(
+            configured_path,
+            label="Accuracy policy",
+            maximum_bytes=MAX_ACCURACY_CONFIG_BYTES,
+        )
+    else:
+        path = resolve_regular_file_under(
+            configured_path,
+            project_root=project_root,
+            allowed_root=project_root,
+            label="Accuracy policy",
+            maximum_bytes=MAX_ACCURACY_CONFIG_BYTES,
+        )
     actual = sha256(path)
     if actual != record["sha256"]:
         raise ValueError(f"Accuracy policy checksum mismatch: {actual}")
@@ -583,14 +652,28 @@ def ensure_unseen(task: str, blind_rows: list[dict[str, Any]], config: dict[str,
 
 
 def lock_suite(lock_path: Path, mt_path: Path, asr_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    existing = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock_path = resolve_regular_file(
+        lock_path,
+        label="Blind v2 lock",
+        maximum_bytes=MAX_BLIND_LOCK_BYTES,
+    )
+    existing = _load_bounded_json(
+        lock_path,
+        label="Blind v2 lock",
+        maximum_bytes=MAX_BLIND_LOCK_BYTES,
+    )
+    _validate_lock_envelope(existing)
     if existing.get("version") != 2:
         raise ValueError("Blind v2 lock requires schema version 2")
     if existing.get("status") != "awaiting_unseen_data":
         raise ValueError("Blind v2 is already locked and cannot be replaced")
     manifests = {}
     for task, path in (("mt", mt_path), ("asr", asr_path)):
-        resolved = path.resolve()
+        resolved = resolve_regular_file(
+            path,
+            label=f"Blind {task} manifest",
+            maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
+        )
         rows = read_jsonl(resolved)
         if not rows:
             raise ValueError(f"Blind {task} manifest is empty")
@@ -730,17 +813,37 @@ def _validate_opened_slots(lock: dict[str, Any]) -> None:
 
 
 def verify_lock(lock_path: Path) -> dict[str, Any]:
-    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock_path = resolve_regular_file(
+        lock_path,
+        label="Blind v2 lock",
+        maximum_bytes=MAX_BLIND_LOCK_BYTES,
+    )
+    lock = _load_bounded_json(
+        lock_path,
+        label="Blind v2 lock",
+        maximum_bytes=MAX_BLIND_LOCK_BYTES,
+    )
+    _validate_lock_envelope(lock)
     if lock.get("version") != 2:
         raise ValueError("Blind v2 lock requires schema version 2")
     if lock.get("status") not in {"locked_unopened", "partially_opened", "opened"}:
         raise ValueError(f"Blind v2 is not locked: {lock.get('status')!r}")
     for task in ("mt", "asr"):
         record = lock["manifests"].get(task)
-        if not record:
+        if not isinstance(record, dict) or set(record) != {
+            "path",
+            "rows",
+            "sha256",
+            "coverage",
+        }:
             raise ValueError(f"Blind lock lacks {task} manifest")
-        path = Path(record["path"])
-        if not path.is_file() or sha256(path) != record["sha256"]:
+        path = resolve_regular_file(
+            record["path"],
+            label=f"Blind {task} manifest",
+            maximum_bytes=MAX_BLIND_MANIFEST_BYTES,
+        )
+        digest = str(record.get("sha256") or "")
+        if not SHA256_RE.fullmatch(digest) or sha256(path) != digest:
             raise ValueError(f"Blind {task} checksum mismatch")
         rows = read_jsonl(path)
         coverage = validate_minimum_coverage(
@@ -755,8 +858,13 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
     if selection:
         if not isinstance(selection, dict) or set(selection) != {"path", "sha256"}:
             raise ValueError("Blind selection comparison record is invalid")
-        path = Path(selection["path"])
-        if not path.is_file() or sha256(path) != selection["sha256"]:
+        path = resolve_regular_file(
+            selection["path"],
+            label="Blind selection comparison",
+            maximum_bytes=MAX_BLIND_REPORT_BYTES,
+        )
+        digest = str(selection.get("sha256") or "")
+        if not SHA256_RE.fullmatch(digest) or sha256(path) != digest:
             raise ValueError("Blind selection comparison checksum mismatch")
     _validate_opened_slots(lock)
     return lock
@@ -881,10 +989,22 @@ def _resolved_record_path(value: Any, project_root: Path, *, label: str) -> Path
         raise ValueError(f"{label} path is missing")
     path = Path(raw)
     if not path.is_absolute():
-        path = project_root / path
-    if path.is_symlink():
-        raise ValueError(f"{label} path cannot be a symlink")
-    return path.resolve()
+        return resolve_regular_file_under(
+            path,
+            project_root=project_root,
+            allowed_root=project_root,
+            label=label,
+        )
+    project_boundary = Path(os.path.abspath(project_root))
+    lexical = Path(os.path.abspath(path))
+    if lexical.is_relative_to(project_boundary):
+        return resolve_regular_file_under(
+            lexical,
+            project_root=project_boundary,
+            allowed_root=project_boundary,
+            label=label,
+        )
+    return resolve_regular_file(lexical, label=label)
 
 
 def verify_completed_blind_selection(
@@ -895,9 +1015,11 @@ def verify_completed_blind_selection(
     project_root: Path = ROOT,
 ) -> dict[str, Any]:
     """Verify all immutable blind evidence before deployment work may begin."""
-    if selection_path.is_symlink():
-        raise ValueError("Deployment selection comparison cannot be a symlink")
-    selection_path = selection_path.resolve()
+    selection_path = _resolved_record_path(
+        selection_path,
+        project_root,
+        label="Deployment selection comparison",
+    )
     loaded_comparison = _load_bounded_json(
         selection_path,
         label="Deployment selection comparison",

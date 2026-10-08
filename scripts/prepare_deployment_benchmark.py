@@ -36,13 +36,13 @@ from scripts.run_model_bakeoff import (  # noqa: E402
     load_config,
     percentile_linear,
     quantization_parity_evidence_failures,
-    resolve_regular_file_under,
     sha256,
     validate_deployment_report,
 )
 from scripts.run_blind_candidate_suite import (  # noqa: E402
     verify_completed_blind_selection,
 )
+from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
 
 
 DEFAULT_CONFIG = ROOT / "configs/model_bakeoff.yaml"

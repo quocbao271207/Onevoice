@@ -15,7 +15,6 @@ import json
 import math
 import os
 import re
-import stat
 import subprocess
 import sys
 import time
@@ -45,6 +44,7 @@ from scripts.candidate_evidence import (  # noqa: E402
     verify_evidence_archive,
 )
 from src.data.quality import fingerprint_text  # noqa: E402
+from src.pipeline.evidence_paths import resolve_regular_file_under  # noqa: E402
 from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity,
@@ -86,57 +86,6 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _is_link_or_junction(path: Path) -> bool:
-    try:
-        metadata = path.lstat()
-    except OSError:
-        return False
-    if stat.S_ISLNK(metadata.st_mode):
-        return True
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    return bool(reparse_flag and getattr(metadata, "st_file_attributes", 0) & reparse_flag)
-
-
-def resolve_regular_file_under(
-    value: Any,
-    *,
-    project_root: Path,
-    allowed_root: Path,
-    label: str,
-    maximum_bytes: int | None = None,
-) -> Path:
-    """Resolve one regular file without permitting link traversal or path escape."""
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError(f"{label} path is missing")
-    project_boundary = Path(os.path.abspath(project_root))
-    root = Path(os.path.abspath(allowed_root))
-    path = Path(raw)
-    if not path.is_absolute():
-        path = project_boundary / path
-    path = Path(os.path.abspath(path))
-    try:
-        root.relative_to(project_boundary)
-        relative = path.relative_to(root)
-        root_relative = root.relative_to(project_boundary)
-    except ValueError as exc:
-        raise ValueError(f"{label} must remain under {root}") from exc
-    current = project_boundary
-    for part in (*root_relative.parts, *relative.parts):
-        current /= part
-        if _is_link_or_junction(current):
-            raise ValueError(f"{label} cannot traverse a symlink or junction: {current}")
-    if not path.is_file():
-        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
-    resolved_root = root.resolve(strict=True)
-    resolved = path.resolve(strict=True)
-    if resolved_root not in resolved.parents:
-        raise ValueError(f"{label} must remain under {resolved_root}")
-    if maximum_bytes is not None and path.stat().st_size > maximum_bytes:
-        raise ValueError(f"{label} exceeds {maximum_bytes} bytes")
-    return resolved
 
 
 LOADED_RUNNER_SHA256 = sha256(Path(__file__).resolve())
