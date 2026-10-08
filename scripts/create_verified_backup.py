@@ -21,6 +21,7 @@ SCHEMA_VERSION = 2
 MANIFEST_NAME = "backup_manifest.json"
 MANIFEST_CHECKSUM_NAME = f"{MANIFEST_NAME}.sha256"
 CHECKSUMS_NAME = "SHA256SUMS.txt"
+BACKUP_FORMAT = "uncompressed POSIX tar with per-member SHA-256"
 EXPECTED_ARCHIVES = {
     "data.tar": "data",
     "models.tar": "models",
@@ -43,6 +44,27 @@ RELEASE_EVIDENCE_FIELDS = {
     "scope",
 }
 MAX_RELEASE_COMPARISON_BYTES = 50_000_000
+MAX_BACKUP_MANIFEST_BYTES = 64 * 1024 * 1024
+MAX_BACKUP_CHECKSUM_BYTES = 4 * 1024
+MAX_PROJECT_ROOT_CHARS = 4 * 1024
+MANIFEST_FIELDS = {
+    "schema_version",
+    "created_at",
+    "project_root",
+    "git_head",
+    "format",
+    "archives",
+}
+ARCHIVE_FIELDS = {
+    "archive",
+    "source",
+    "files",
+    "source_bytes",
+    "archive_bytes",
+    "sha256",
+    "members",
+    "verified",
+}
 
 
 def _sha256_stream(handle: BinaryIO, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -122,26 +144,23 @@ def _source_records(files: Iterable[Path]) -> list[dict[str, object]]:
 
 
 def _validated_sha256(value: object, label: str) -> str:
-    text = str(value)
-    if not SHA256_PATTERN.fullmatch(text):
+    if not isinstance(value, str) or not SHA256_PATTERN.fullmatch(value):
         raise ValueError(f"Invalid SHA-256 for {label}: {value!r}")
-    return text
+    return value
 
 
 def _non_negative_int(value: object, label: str) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"Invalid integer for {label}: {value!r}")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"Invalid integer for {label}: {value!r}") from error
-    if parsed < 0 or str(parsed) != str(value):
+    if value < 0:
         raise ValueError(f"Invalid integer for {label}: {value!r}")
-    return parsed
+    return value
 
 
 def _validate_member_path(value: object, expected_source: str) -> str:
-    text = str(value)
+    if not isinstance(value, str):
+        raise RuntimeError(f"Unsafe or misplaced member: {value!r}")
+    text = value
     member_path = PurePosixPath(text)
     source_prefix = PurePosixPath(expected_source)
     if (
@@ -424,6 +443,64 @@ def write_metadata(output_dir: Path, manifest: dict[str, object]) -> None:
     )
 
 
+def _read_bounded_file(path: Path, maximum_bytes: int, label: str) -> bytes:
+    _reject_link(path, label)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    size = path.stat().st_size
+    if size < 1 or size > maximum_bytes:
+        raise ValueError(f"{label} size is outside the valid range: {size}")
+    with path.open("rb") as handle:
+        payload = handle.read(maximum_bytes + 1)
+    if len(payload) != size or path.stat().st_size != size:
+        raise RuntimeError(f"{label} changed while reading: {path}")
+    return payload
+
+
+def _decode_utf8(payload: bytes, label: str) -> str:
+    try:
+        return payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{label} is not valid UTF-8") from error
+
+
+def _validate_manifest_schema(manifest: object) -> dict[str, object]:
+    if not isinstance(manifest, dict):
+        raise ValueError("Backup manifest root must be an object")
+    expected_fields = set(MANIFEST_FIELDS)
+    if "release_evidence" in manifest:
+        expected_fields.add("release_evidence")
+    if set(manifest) != expected_fields:
+        raise ValueError("Backup manifest schema is invalid")
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"Backup manifest schema_version must be {SCHEMA_VERSION}")
+    if manifest.get("format") != BACKUP_FORMAT:
+        raise ValueError("Backup manifest format is invalid")
+    project_root = manifest.get("project_root")
+    if (
+        not isinstance(project_root, str)
+        or not project_root
+        or len(project_root) > MAX_PROJECT_ROOT_CHARS
+        or "\x00" in project_root
+    ):
+        raise ValueError("Backup manifest project_root is invalid")
+    git_head = manifest.get("git_head")
+    if git_head is not None and (
+        not isinstance(git_head, str) or not re.fullmatch(r"[0-9a-f]{40,64}", git_head)
+    ):
+        raise ValueError("Backup manifest git_head is invalid")
+    created_at = manifest.get("created_at")
+    if not isinstance(created_at, str) or len(created_at) > 64:
+        raise ValueError("Backup manifest created_at is invalid")
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError as error:
+        raise ValueError("Backup manifest created_at is invalid") from error
+    if created.tzinfo is None or created.utcoffset() is None:
+        raise ValueError("Backup manifest created_at must include a timezone")
+    return manifest
+
+
 def _load_manifest(output_dir: Path) -> dict[str, object]:
     manifest_path = output_dir / MANIFEST_NAME
     sidecar_path = output_dir / MANIFEST_CHECKSUM_NAME
@@ -432,13 +509,26 @@ def _load_manifest(output_dir: Path) -> dict[str, object]:
         _reject_link(path, "backup metadata")
         if not path.is_file():
             raise FileNotFoundError(path)
-    expected_sidecar = f"{sha256(manifest_path)}  {MANIFEST_NAME}\n"
-    if sidecar_path.read_text(encoding="utf-8") != expected_sidecar:
+    manifest_payload = _read_bounded_file(
+        manifest_path,
+        MAX_BACKUP_MANIFEST_BYTES,
+        "backup manifest",
+    )
+    sidecar_payload = _read_bounded_file(
+        sidecar_path,
+        MAX_BACKUP_CHECKSUM_BYTES,
+        "backup manifest checksum",
+    )
+    expected_sidecar = (
+        f"{hashlib.sha256(manifest_payload).hexdigest()}  {MANIFEST_NAME}\n"
+    )
+    if _decode_utf8(sidecar_payload, "backup manifest checksum") != expected_sidecar:
         raise RuntimeError(f"{MANIFEST_CHECKSUM_NAME} does not match {MANIFEST_NAME}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"Backup manifest schema_version must be {SCHEMA_VERSION}")
-    return manifest
+    try:
+        manifest = json.loads(_decode_utf8(manifest_payload, "backup manifest"))
+    except json.JSONDecodeError as error:
+        raise ValueError("Backup manifest is not valid JSON") from error
+    return _validate_manifest_schema(manifest)
 
 
 def verify(output_dir: Path) -> dict[str, object]:
@@ -460,8 +550,13 @@ def verify(output_dir: Path) -> dict[str, object]:
     archives = manifest.get("archives")
     if not isinstance(archives, list):
         raise ValueError("Backup manifest archives must be a list")
-    if any(not isinstance(item, dict) for item in archives):
-        raise ValueError("Every backup archive record must be an object")
+    if any(
+        not isinstance(item, dict) or set(item) != ARCHIVE_FIELDS
+        for item in archives
+    ):
+        raise ValueError("Backup archive record schema is invalid")
+    if [item.get("archive") for item in archives] != list(EXPECTED_ARCHIVES):
+        raise ValueError("Backup archive records must use canonical order")
     by_name = {str(item.get("archive")): item for item in archives}
     if len(by_name) != len(archives) or set(by_name) != set(EXPECTED_ARCHIVES):
         raise ValueError("Backup manifest must contain data.tar, models.tar, and reports.tar exactly once")
@@ -471,15 +566,25 @@ def verify(output_dir: Path) -> dict[str, object]:
         for name in EXPECTED_ARCHIVES
     )
     checksum_path = output_dir / CHECKSUMS_NAME
-    if checksum_path.read_text(encoding="utf-8") != expected_checksum_file:
+    checksum_payload = _read_bounded_file(
+        checksum_path,
+        MAX_BACKUP_CHECKSUM_BYTES,
+        "backup archive checksums",
+    )
+    if _decode_utf8(checksum_payload, "backup archive checksums") != expected_checksum_file:
         raise RuntimeError(f"{CHECKSUMS_NAME} does not match {MANIFEST_NAME}")
 
     validated_records: dict[str, list[dict[str, object]]] = {}
     for name, expected_source in EXPECTED_ARCHIVES.items():
         item = by_name[name]
-        declared_source = str(item.get("source") or "").replace("\\", "/")
+        declared_source_value = item.get("source")
+        if not isinstance(declared_source_value, str):
+            raise ValueError(f"Unexpected source for {name}: {declared_source_value!r}")
+        declared_source = declared_source_value.replace("\\", "/")
         if declared_source != expected_source:
             raise ValueError(f"Unexpected source for {name}: {item.get('source')!r}")
+        if item.get("verified") is not True:
+            raise ValueError(f"Archive is not marked verified: {name}")
         records = _validated_member_records(item.get("members"), expected_source, name)
         validated_records[name] = records
         declared_files = _non_negative_int(item.get("files"), f"{name}:files")
@@ -582,7 +687,7 @@ def create_backup(
             "created_at": datetime.now(timezone.utc).isoformat(),
             "project_root": str(ROOT),
             "git_head": _git_head(),
-            "format": "uncompressed POSIX tar with per-member SHA-256",
+            "format": BACKUP_FORMAT,
             "archives": archives,
         }
         if release_evidence is not None:

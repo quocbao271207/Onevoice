@@ -15,7 +15,10 @@ def write_metadata(output: Path, archives: list[dict[str, object]]) -> None:
         output,
         {
             "schema_version": backup.SCHEMA_VERSION,
-            "format": "test",
+            "created_at": "2026-10-09T00:00:00+00:00",
+            "project_root": str(backup.ROOT),
+            "git_head": None,
+            "format": backup.BACKUP_FORMAT,
             "archives": archives,
         },
     )
@@ -159,6 +162,71 @@ def test_backup_rejects_manifest_tampering(tmp_path: Path, monkeypatch: pytest.M
     manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match=backup.MANIFEST_CHECKSUM_NAME):
+        backup.verify(output)
+
+
+def test_backup_rejects_noncanonical_manifest_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "project"
+    output = tmp_path / "backup"
+    monkeypatch.setattr(backup, "ROOT", root)
+    write_bundle(root, output)
+    manifest_path = output / backup.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    manifest["untrusted_note"] = "looks verified"
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="manifest schema is invalid"):
+        backup.verify(output)
+
+    manifest.pop("untrusted_note")
+    manifest["archives"][0]["untrusted_note"] = "looks verified"
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="archive record schema is invalid"):
+        backup.verify(output)
+
+    manifest["archives"][0].pop("untrusted_note")
+    manifest["archives"][0], manifest["archives"][1] = (
+        manifest["archives"][1],
+        manifest["archives"][0],
+    )
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="canonical order"):
+        backup.verify(output)
+
+
+def test_backup_rejects_invalid_manifest_types_and_unbounded_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "project"
+    output = tmp_path / "backup"
+    monkeypatch.setattr(backup, "ROOT", root)
+    write_bundle(root, output)
+    manifest_path = output / backup.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    manifest["created_at"] = "2026-10-09T00:00:00"
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="must include a timezone"):
+        backup.verify(output)
+
+    manifest["created_at"] = "2026-10-09T00:00:00+00:00"
+    manifest["git_head"] = "not-a-commit"
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="git_head is invalid"):
+        backup.verify(output)
+
+    manifest["git_head"] = None
+    manifest["archives"][0]["files"] = "1"
+    backup.write_metadata(output, manifest)
+    with pytest.raises(ValueError, match="Invalid integer"):
+        backup.verify(output)
+
+    manifest["archives"][0]["files"] = 1
+    backup.write_metadata(output, manifest)
+    manifest_path.write_bytes(b"x" * (backup.MAX_BACKUP_MANIFEST_BYTES + 1))
+    with pytest.raises(ValueError, match="manifest size is outside"):
         backup.verify(output)
 
 
