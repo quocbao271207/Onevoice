@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.data.quality import fingerprint_text, normalize_text  # noqa: E402
+from src.pipeline.license_policy import license_decisions  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     configured_selection_hashes,
     selection_policy_record,
@@ -761,8 +762,8 @@ def verify_selection_winner(
     direction: str | None,
     candidate_id: str,
     adapter: Path,
-    expected_policy: dict[str, Any],
-    expected_selection_hashes: dict[str, str],
+    config: dict[str, Any],
+    scope: str,
 ) -> dict[str, Any]:
     comparison_path = comparison_path.resolve()
     if not comparison_path.is_file():
@@ -770,10 +771,12 @@ def verify_selection_winner(
     comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
     if comparison.get("status") != "selection_complete":
         raise ValueError("Blind evaluation requires a finalized selection comparison")
-    if comparison.get("selection_policy") != expected_policy:
+    if comparison.get("selection_policy") != selection_policy_record(config):
         raise ValueError("Blind evaluation selection policy is missing, stale, or mismatched")
-    if comparison.get("selection_sha256") != expected_selection_hashes:
+    if comparison.get("selection_sha256") != configured_selection_hashes(config):
         raise ValueError("Blind evaluation selection inputs are missing, stale, or mismatched")
+    if comparison.get("scope") != scope:
+        raise ValueError("Blind evaluation scope differs from the selected bake-off")
     key = str(direction or "vi")
     try:
         winner = comparison["results"][task]["winners"][key]
@@ -781,6 +784,23 @@ def verify_selection_winner(
         raise ValueError(f"Selection comparison lacks winner for {task}/{key}") from exc
     if winner.get("candidate_id") != candidate_id:
         raise ValueError(f"Blind candidate is not the selected winner for {task}/{key}")
+    approvals = comparison.get("research_license_approvals")
+    if (
+        not isinstance(approvals, list)
+        or any(not isinstance(value, str) or not value for value in approvals)
+        or approvals != sorted(set(approvals))
+    ):
+        raise ValueError("Blind evaluation research license approvals are invalid")
+    expected_decisions = license_decisions(config, set(approvals))
+    if comparison.get("license_decisions") != expected_decisions:
+        raise ValueError("Blind evaluation license decisions are missing or mismatched")
+    decision = expected_decisions.get(candidate_id)
+    if not isinstance(decision, dict) or decision.get("gpu_allowed") is not True:
+        raise ValueError("Blind candidate lacks the license approval used by selection")
+    if decision.get("task") != task:
+        raise ValueError("Blind candidate license decision belongs to another task")
+    if scope == "production" and decision.get("production_eligible") is not True:
+        raise ValueError("Candidate license is not approved for production promotion")
     adapter = adapter.resolve()
     if Path(str(winner.get("adapter") or "")).resolve() != adapter:
         raise ValueError(f"Blind adapter path does not match selected winner for {task}/{key}")
@@ -840,8 +860,8 @@ def _evaluate_slot(
         args.direction,
         args.candidate,
         args.adapter,
-        selection_policy_record(config),
-        configured_selection_hashes(config),
+        config,
+        args.scope,
     )
     selection_record = {
         "path": selection["path"],

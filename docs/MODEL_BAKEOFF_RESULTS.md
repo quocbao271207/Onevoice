@@ -49,7 +49,7 @@ Checkpoint ASR full-data bước 500, 750 và 1.000 đã được watcher phát 
 | PhoWhisper-base | ASR nhẹ | BSD-3-Clause | Qua gate |
 | Qualcomm Whisper-Small-Quantized | Deployment reference | Apache-2.0 | Chỉ đo deployment, không fine-tune |
 
-License metadata được pin cùng revision trong `configs/model_bakeoff.yaml`. Đây là gate kỹ thuật fail-closed, không thay thế tư vấn pháp lý. VinAI chỉ được mở bằng `--approve-research-license <candidate-id>`; cờ này không bao giờ đổi `production_eligible` thành true.
+License metadata được pin cùng revision trong `configs/model_bakeoff.yaml`. Đây là gate kỹ thuật fail-closed, không thay thế tư vấn pháp lý. VinAI chỉ được mở bằng `--approve-research-license <candidate-id>`; cờ này không bao giờ đổi `production_eligible` thành true. Danh sách approval và quyết định license chuẩn của toàn bộ candidate được khóa vào selection snapshot/identity. Blind runner tự tính lại quyết định từ config, từ chối approval trùng, sai hoặc candidate lạ, và không chấp nhận winner nếu snapshot thiếu đúng explicit approval đã dùng trong bake-off; scope production vẫn bắt buộc `production_eligible=true`.
 
 ## Dữ liệu công bằng
 

@@ -42,9 +42,10 @@ from scripts.run_model_bakeoff import (
     verified_resume_checkpoint,
     write_runtime_round_config,
 )
-from scripts.watch_checkpoints import archive_ready_checkpoints
-from scripts.run_gpu_rounds import archive_round
 from scripts.candidate_evidence import archive_evidence
+from scripts.run_gpu_rounds import archive_round
+from scripts.watch_checkpoints import archive_ready_checkpoints
+from src.pipeline.license_policy import license_decisions
 from src.pipeline.selection_policy import selection_policy_record
 
 
@@ -511,6 +512,21 @@ def test_vinai_license_fails_closed_before_gpu():
     assert license_gate(item, {item["id"]}) == (True, "explicit_research_approval")
     assert item["license"]["production_eligible"] is False
 
+    decisions = license_decisions(config(), {item["id"]})
+    assert decisions[item["id"]] == {
+        "task": "mt",
+        "gpu_allowed": True,
+        "reason": "explicit_research_approval",
+        "license_id": "agpl-3.0",
+        "source": "https://huggingface.co/vinai/vinai-translate-en2vi-v2",
+        "review_status": "legal_review_required",
+        "gpu_eligible": False,
+        "production_eligible": False,
+        "research_reference_allowed": True,
+    }
+    with pytest.raises(ValueError, match="unknown candidates"):
+        license_decisions(config(), {"typo-candidate"})
+
 
 def test_only_planned_or_candidate_a_statuses_are_allowed():
     validate_candidate_matrix(config())
@@ -775,6 +791,8 @@ def test_selection_identity_ignores_later_blind_results_but_binds_winners():
         "candidate_a_freeze": "freeze.json",
         "selection_sha256": {"mt": "a", "asr": "b"},
         "selection_policy": policy,
+        "research_license_approvals": [],
+        "license_decisions": {"mt-winner": {"gpu_allowed": True}},
         "results": {
             "mt": {
                 "winners": {
@@ -808,6 +826,14 @@ def test_selection_identity_ignores_later_blind_results_but_binds_winners():
     finalized["results"]["mt"]["winners"]["en_to_vi"]["profile"] = {
         "id": "r32_lr2e5"
     }
+    assert selection_identity(finalized) != selection_identity(comparison)
+
+    finalized = json.loads(json.dumps(comparison))
+    finalized["research_license_approvals"] = ["mt-winner"]
+    assert selection_identity(finalized) != selection_identity(comparison)
+
+    finalized = json.loads(json.dumps(comparison))
+    finalized["license_decisions"]["mt-winner"]["gpu_allowed"] = False
     assert selection_identity(finalized) != selection_identity(comparison)
 
     finalized = json.loads(json.dumps(comparison))

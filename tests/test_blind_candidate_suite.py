@@ -27,6 +27,7 @@ from scripts.run_blind_candidate_suite import (
     verify_selection_winner,
 )
 from src.data.quality import fingerprint_text
+from src.pipeline.license_policy import license_decisions
 from src.pipeline.selection_policy import (
     configured_selection_hashes,
     selection_policy_record,
@@ -159,17 +160,22 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
     manifest = adapter_tree_manifest(adapter)
     comparison = tmp_path / "comparison.json"
     config = full_bakeoff_config()
+    candidate_id = "mt_m2m100_418m"
+    approvals: set[str] = set()
     comparison.write_text(
         json.dumps(
             {
                 "status": "selection_complete",
+                "scope": "research",
                 "selection_policy": selection_policy_record(config),
                 "selection_sha256": configured_selection_hashes(config),
+                "research_license_approvals": sorted(approvals),
+                "license_decisions": license_decisions(config, approvals),
                 "results": {
                     "mt": {
                         "winners": {
                             "en_to_vi": {
-                                "candidate_id": "mt-winner",
+                                "candidate_id": candidate_id,
                                 "adapter": str(adapter),
                                 "adapter_manifest_sha256": manifest["manifest_sha256"],
                             }
@@ -185,26 +191,56 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
         comparison,
         "mt",
         "en_to_vi",
-        "mt-winner",
+        candidate_id,
         adapter,
-        selection_policy_record(config),
-        configured_selection_hashes(config),
+        config,
+        "research",
     )
 
     assert selected["sha256"] == sha256(comparison)
     assert selected["adapter_manifest"]["manifest_sha256"] == manifest["manifest_sha256"]
-    stale_hashes = configured_selection_hashes(config)
-    stale_hashes["mt"] = "0" * 64
+    valid_comparison = comparison.read_text(encoding="utf-8")
+    vinai_id = "mt_vinai_en2vi_v2"
+    vinai = json.loads(valid_comparison)
+    vinai["results"]["mt"]["winners"]["en_to_vi"]["candidate_id"] = vinai_id
+    comparison.write_text(json.dumps(vinai), encoding="utf-8")
+    with pytest.raises(ValueError, match="lacks the license approval"):
+        verify_selection_winner(
+            comparison,
+            "mt",
+            "en_to_vi",
+            vinai_id,
+            adapter,
+            config,
+            "research",
+        )
+    vinai["research_license_approvals"] = [vinai_id]
+    vinai["license_decisions"] = license_decisions(config, {vinai_id})
+    comparison.write_text(json.dumps(vinai), encoding="utf-8")
+    assert verify_selection_winner(
+        comparison,
+        "mt",
+        "en_to_vi",
+        vinai_id,
+        adapter,
+        config,
+        "research",
+    )["winner"]["candidate_id"] == vinai_id
+    comparison.write_text(valid_comparison, encoding="utf-8")
+    stale = json.loads(valid_comparison)
+    stale["selection_sha256"]["mt"] = "0" * 64
+    comparison.write_text(json.dumps(stale), encoding="utf-8")
     with pytest.raises(ValueError, match="selection inputs"):
         verify_selection_winner(
             comparison,
             "mt",
             "en_to_vi",
-            "mt-winner",
+            candidate_id,
             adapter,
-            selection_policy_record(config),
-            stale_hashes,
+            config,
+            "research",
         )
+    comparison.write_text(valid_comparison, encoding="utf-8")
     with pytest.raises(ValueError, match="not the selected winner"):
         verify_selection_winner(
             comparison,
@@ -212,8 +248,8 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
             "en_to_vi",
             "other",
             adapter,
-            selection_policy_record(config),
-            configured_selection_hashes(config),
+            config,
+            "research",
         )
 
     weights.write_bytes(b"changed-after-selection")
@@ -222,10 +258,10 @@ def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Pat
             comparison,
             "mt",
             "en_to_vi",
-            "mt-winner",
+            candidate_id,
             adapter,
-            selection_policy_record(config),
-            configured_selection_hashes(config),
+            config,
+            "research",
         )
 
 
@@ -247,8 +283,8 @@ def test_blind_rejects_legacy_selection_without_bound_policy(tmp_path: Path):
             "en_to_vi",
             "legacy",
             adapter,
-            selection_policy_record(config),
-            configured_selection_hashes(config),
+            config,
+            "research",
         )
 
 
@@ -342,9 +378,15 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
                     "model": "base-model",
                     "revision": "r" * 40,
                     "model_family": "nllb",
-                    "license": {"production_eligible": True},
+                    "license": {
+                        "id": "test-license",
+                        "review_status": "approved",
+                        "production_eligible": True,
+                        "gpu_eligible": True,
+                    },
                 }
-            ]
+            ],
+            "asr": [],
         },
         "promotion_gate": {
             "critical_slices": [],
@@ -365,8 +407,11 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
         json.dumps(
             {
                 "status": "selection_complete",
+                "scope": "research",
                 "selection_policy": selection_policy_record(config),
                 "selection_sha256": configured_selection_hashes(config),
+                "research_license_approvals": [],
+                "license_decisions": license_decisions(config, set()),
                 "results": {
                     "mt": {
                         "winners": {

@@ -44,6 +44,7 @@ from scripts.candidate_evidence import (  # noqa: E402
     verify_evidence_archive,
 )
 from src.data.quality import fingerprint_text  # noqa: E402
+from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
 from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
 
 
@@ -551,22 +552,6 @@ def load_config(path: Path) -> dict[str, Any]:
     if config.get("version") != 1:
         raise ValueError("Unsupported model-bakeoff config version")
     return config
-
-
-def license_gate(candidate: dict[str, Any], research_approvals: set[str]) -> tuple[bool, str]:
-    license_info = candidate.get("license") or {}
-    if license_info.get("gpu_eligible") and license_info.get("review_status") in {
-        "approved",
-        "approved_research_only",
-    }:
-        return True, "approved"
-    if (
-        candidate["id"] in research_approvals
-        and license_info.get("research_reference_allowed")
-        and license_info.get("review_status") == "legal_review_required"
-    ):
-        return True, "explicit_research_approval"
-    return False, str(license_info.get("review_status") or "missing_license_review")
 
 
 def validate_resources(config: dict[str, Any]) -> None:
@@ -2666,6 +2651,10 @@ def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
         ),
         "selection_sha256": comparison.get("selection_sha256"),
         "selection_policy": comparison.get("selection_policy"),
+        "research_license_approvals": comparison.get(
+            "research_license_approvals"
+        ),
+        "license_decisions": comparison.get("license_decisions"),
         "winners": winners,
     }
 
@@ -2979,11 +2968,7 @@ def preflight(config: dict[str, Any], research_approvals: set[str]) -> dict[str,
     }
     validate_candidate_matrix(config)
     hashes = validate_selection_artifacts(config)
-    licenses = {}
-    for task in ("mt", "asr"):
-        for candidate in config["candidates"][task]:
-            allowed, reason = license_gate(candidate, research_approvals)
-            licenses[candidate["id"]] = {"gpu_allowed": allowed, "reason": reason}
+    licenses = license_decisions(config, research_approvals)
     return {
         "status": "pass",
         "selection_sha256": hashes,
@@ -3125,6 +3110,8 @@ def main() -> int:
         "candidate_a_locked_evaluations": candidate_a_locked_evaluations,
         "selection_sha256": report["selection_sha256"],
         "selection_policy": selection_policy_record(config),
+        "research_license_approvals": sorted(approvals),
+        "license_decisions": report["licenses"],
         "results": {"mt": mt_result, "asr": asr_result},
         "blind_test_v2": "pending",
     }
