@@ -1,0 +1,185 @@
+{
+  "artifact": {
+    "bytes": 431216,
+    "path": "data/eval/terminology_challenge_set.jsonl",
+    "rows": 128,
+    "sha256": "0e06d223220c9fb04d7448f8b9ef0fce8c642be44c47dc5713f72ce4242287d2"
+  },
+  "coverage": {
+    "by_direction": {
+      "en_to_vi": 54,
+      "transcription": 18,
+      "vi_to_en": 56
+    },
+    "by_hazard_level": {
+      "critical": 110,
+      "moderate": 18
+    },
+    "by_task": {
+      "asr": 18,
+      "mt": 110
+    }
+  },
+  "manifests": {
+    "asr": {
+      "bytes": 7004841,
+      "path": "data/processed/manifests/asr--validation-local.jsonl",
+      "rows": 3733,
+      "sha256": "57e5877a5a733cbebdf2222a2146bf5b2bb77c449ba86a66f4fe627a8be973a8",
+      "task": "asr"
+    },
+    "mt": {
+      "bytes": 294035,
+      "path": "data/eval/mt_selection_dev.jsonl",
+      "rows": 256,
+      "sha256": "a073b05299128ed3131c8eb674c17e1b44e9d25ae1166c6b59feba5622d49f6c",
+      "task": "mt"
+    }
+  },
+  "policy": {
+    "auto_correction_eligible": false,
+    "evaluation_only": true,
+    "maximum_rows": 200,
+    "minimum_rows": 100,
+    "source_role": "validation_only"
+  },
+  "prediction_sources": [
+    {
+      "bytes": 13063,
+      "label": "asr_beam4",
+      "path": "data/reports/experiments/decoding/asr_vi_val_beam4_predictions.jsonl",
+      "rows": 24,
+      "sha256": "32dff94b1f8ad9ff0a974a7803117e6788dec3ed382882421bb4ba098e0e4092"
+    },
+    {
+      "bytes": 12985,
+      "label": "asr_greedy",
+      "path": "data/reports/experiments/decoding/asr_vi_val_greedy_predictions.jsonl",
+      "rows": 24,
+      "sha256": "dfd409c79cd054ad1c16130afd0b214d642fc6e7f10b20b9260f0256338fd978"
+    },
+    {
+      "bytes": 12923,
+      "label": "asr_medical_prompt",
+      "path": "data/reports/experiments/decoding/asr_vi_val_medical_prompt_predictions.jsonl",
+      "rows": 24,
+      "sha256": "c65d173f283d27b6f76c92045b246d9ade68373b990d037d3763ec2dac8fb1bd"
+    },
+    {
+      "archive_bytes": 86652,
+      "archive_sha256": "589d9e4e53fb48275aed602c2f4bb9e3c2c8614521f8595640b1017f581a95b3",
+      "label": "m2m_en_r16",
+      "member": "pilot_r16_lr5e5/selection_predictions.jsonl",
+      "member_bytes": 227723,
+      "member_sha256": "a77480fe0393e433152a962793cc6bafad2951c21c2bdc04b1ad93e560791850",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/pilot_r16_lr5e5.tar.gz",
+      "provenance_member": "pilot_r16_lr5e5/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "1f3748b29eea4248d9e9b4ee2d1fd7fe1c08f55a2b8c6f3adf3cec5e11e0fc0a",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 85660,
+      "archive_sha256": "a71e774aac33658ce012d658cafed630905a3a3f96c33f9363ed62652fc74351",
+      "label": "m2m_en_r32",
+      "member": "pilot_r32_lr2e5/selection_predictions.jsonl",
+      "member_bytes": 226101,
+      "member_sha256": "3757ed6c4f3f5d0ed401165841c26db8b4f28bea4ba589f4f9147acb9ded4a78",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/pilot_r32_lr2e5.tar.gz",
+      "provenance_member": "pilot_r32_lr2e5/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "13c68310c6df103199cafb7e96bc00b324ec29395bbe3b383bfde06e866bb26e",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 84441,
+      "archive_sha256": "f71c16cfdc1a0e8cae653c1336ab1226b5ff3e9eb273bdb10888c1e2dd0bb60a",
+      "label": "m2m_en_r8",
+      "member": "pilot_r8_lr1e4/selection_predictions.jsonl",
+      "member_bytes": 226385,
+      "member_sha256": "88b17b57a267ce649aedcfe359e056c36367d30a3b391518a7d7337101d12d6f",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/pilot_r8_lr1e4.tar.gz",
+      "provenance_member": "pilot_r8_lr1e4/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "02db9cef4e726784b2a43aa1b7a57b2bae6660abe1cb39c0775117a1a9bacd8a",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 82761,
+      "archive_sha256": "8f86e1cf7c671e7923b8d582be9f27bd36c08d5451ad662a6b275cd1ecacf9cc",
+      "label": "m2m_en_zero",
+      "member": "zero_shot/selection_predictions.jsonl",
+      "member_bytes": 224347,
+      "member_sha256": "8497acc0fa6f8ebea38a9d6c9070c140c22134763d3c9603b037a6efd0400247",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/zero_shot.tar.gz",
+      "provenance_member": "zero_shot/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "33ebf180caa143a8861ab4c2aa5f46a997daad5ee4e39cac7a7812f5d7669d05",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 88021,
+      "archive_sha256": "d13a72783fd1d6ce6f106c88d79353ae5e424bedf20b62d15d3977c5dbd2dbf3",
+      "label": "m2m_vi_r16",
+      "member": "pilot_r16_lr5e5/selection_predictions.jsonl",
+      "member_bytes": 214835,
+      "member_sha256": "8b71804a1c1261d181c2536df2988b51a6a8e75334456ccc370646f28d10afea",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__vi_to_en/pilot_r16_lr5e5.tar.gz",
+      "provenance_member": "pilot_r16_lr5e5/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "a588f27743f6d6155199f90ed0a4641841816b4e3cb37a83d6b11be3c19a4ff0",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 92029,
+      "archive_sha256": "fc978de99aacf3d736962ce1d42a7d3aeebe67b5b928a64a62ea7031e9be4373",
+      "label": "m2m_vi_r8",
+      "member": "pilot_r8_lr1e4/selection_predictions.jsonl",
+      "member_bytes": 214727,
+      "member_sha256": "b41b4f57f5cec6dbd9ff6636dcbca2b02ca0a1f6b3bcb300a8317eea0710d958",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__vi_to_en/pilot_r8_lr1e4.tar.gz",
+      "provenance_member": "pilot_r8_lr1e4/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "a837b63099409471f24f76364b5b79700cb4753184bd22243aea5fa5b9000f8a",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 90340,
+      "archive_sha256": "19c0c78997401d7e9d62ebff36d954cfee9e28bb2a255ed3896ec96a62c189b8",
+      "label": "m2m_vi_zero",
+      "member": "zero_shot/selection_predictions.jsonl",
+      "member_bytes": 214603,
+      "member_sha256": "91defab46842d95f99db5a31d977790652c64f0bdf36aa1939a62bdcbd0d2b2a",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__vi_to_en/zero_shot.tar.gz",
+      "provenance_member": "zero_shot/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "510a88013a02444de22a536666f1243bcedae3dab2269f97dbaaf7a361b37497",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 83402,
+      "archive_sha256": "9cd0bbace3c7cb3b6bd2814529953d82bf49a32c1d6d1e7483a1f9fa22d68a8f",
+      "label": "nllb_en",
+      "member": "candidate_a_frozen_en_to_vi/selection_predictions.jsonl",
+      "member_bytes": 224242,
+      "member_sha256": "6d43760464ca63047b0bf8d70426d952cc75366cce4f2a2ed1b9306c0ab0336b",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_nllb_600m_a/candidate_a_frozen_en_to_vi.tar.gz",
+      "provenance_member": "candidate_a_frozen_en_to_vi/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "57b15b1d7eda6268bd9d28735ff7af0f8f811d671bcd7e8d055d156b7a34af15",
+      "rows": 256
+    },
+    {
+      "archive_bytes": 84982,
+      "archive_sha256": "1535a69e593dcd58a43f3c89cddf78993bae2ea192e3d2b8889de6677ef8f7a5",
+      "label": "nllb_vi",
+      "member": "candidate_a_frozen_vi_to_en/selection_predictions.jsonl",
+      "member_bytes": 214550,
+      "member_sha256": "cc282937c41436aadb8c4ea7627d14532010a24cfaa9356fceb2a34a2cccad18",
+      "path": "test/model-bakeoff-20261005/selection-reports/mt/mt_nllb_600m_a/candidate_a_frozen_vi_to_en.tar.gz",
+      "provenance_member": "candidate_a_frozen_vi_to_en/selection_predictions.jsonl.provenance.json",
+      "provenance_sha256": "89a234f5bbe653d9b0806f3c88831b54bf078e4236548a216f327e7808f728e0",
+      "rows": 256
+    }
+  ],
+  "schema_version": 1,
+  "source_list": {
+    "bytes": 1869,
+    "path": "configs/terminology_challenge_sources.txt",
+    "sha256": "8176d61fdf88a05d9b9968aa612a257fdd39b1183a5cb7b8203c7a815f79b435",
+    "sources": 12
+  },
+  "status": "awaiting_human_review"
+}

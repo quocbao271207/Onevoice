@@ -22,6 +22,8 @@ Baseline đang dùng làm mốc: ASR Việt WER 20,87%, ASR Anh WER 25,54%, MT B
 
 Các ngưỡng máy đọc được nằm ở `configs/accuracy_program.yaml`. Mục tiêu vòng kế tiếp là ASR Việt WER ≤ 19%, ASR Anh WER ≤ 23%, MT BLEU ≥ 25, chrF2 ≥ 46, code-switch WER ≤ 21%, và 0 lỗi phát hiện được trên mọi slice safety. Ngưỡng 0 lỗi không chứng minh hệ thống an toàn; nó chỉ là điều kiện tối thiểu để tiếp tục human review.
 
+Challenge set thuật ngữ riêng gồm 128 lỗi validation đã xác minh: 110 lỗi MT có safety issue máy phát hiện và 18 lỗi ASR có word error thật, cân bằng hai chiều MT. Artifact `data/eval/terminology_challenge_set.jsonl` chỉ dùng để đánh giá; toàn bộ hàng mới luôn là `review_status=pending`, `evaluation_only=true` và `auto_correction_eligible=false`. `data/eval/terminology_challenge_set.report.json` khóa manifest, prediction source, archive/member provenance, số hàng và SHA-256. Human review có thể xác nhận hoặc loại từng candidate về sau, nhưng không được biến alias/hypothesis chưa duyệt thành post-correction.
+
 ## Lệnh local đã chuẩn hóa
 
 ```powershell
@@ -35,6 +37,7 @@ Các ngưỡng máy đọc được nằm ở `configs/accuracy_program.yaml`. M
 # Benchmark safety và gate tổng hợp
 .venv\Scripts\python.exe scripts/run_baseline_benchmarks.py --task mt --manifest data/eval/medical_safety_mt.jsonl --samples 32 --batch-size 2 --num-beams 1 --name mt_clinical_base --output-dir data/reports/accuracy
 .venv\Scripts\python.exe scripts/run_accuracy_gates.py
+.venv\Scripts\python.exe scripts/build_terminology_challenge_set.py
 
 # Sau full-run: chấm adapter trên toàn bộ test khóa + toàn bộ suite lâm sàng,
 # điều tiết GPU theo policy thống nhất rolling 70% / hard 74%, rồi đóng gói report có SHA-256.

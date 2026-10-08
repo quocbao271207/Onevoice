@@ -1,0 +1,15 @@
+# Validation-only predictions used to mine the review-only terminology challenge set.
+# Archive inputs require an adjacent .provenance.json member and are checked against
+# the current validation manifest SHA-256 before any row is accepted.
+asr_greedy=data/reports/experiments/decoding/asr_vi_val_greedy_predictions.jsonl
+asr_beam4=data/reports/experiments/decoding/asr_vi_val_beam4_predictions.jsonl
+asr_medical_prompt=data/reports/experiments/decoding/asr_vi_val_medical_prompt_predictions.jsonl
+m2m_en_zero=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/zero_shot.tar.gz::zero_shot/selection_predictions.jsonl
+m2m_en_r8=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/pilot_r8_lr1e4.tar.gz::pilot_r8_lr1e4/selection_predictions.jsonl
+m2m_en_r16=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/pilot_r16_lr5e5.tar.gz::pilot_r16_lr5e5/selection_predictions.jsonl
+m2m_en_r32=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__en_to_vi/pilot_r32_lr2e5.tar.gz::pilot_r32_lr2e5/selection_predictions.jsonl
+m2m_vi_zero=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__vi_to_en/zero_shot.tar.gz::zero_shot/selection_predictions.jsonl
+m2m_vi_r8=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__vi_to_en/pilot_r8_lr1e4.tar.gz::pilot_r8_lr1e4/selection_predictions.jsonl
+m2m_vi_r16=test/model-bakeoff-20261005/selection-reports/mt/mt_m2m100_418m__vi_to_en/pilot_r16_lr5e5.tar.gz::pilot_r16_lr5e5/selection_predictions.jsonl
+nllb_en=test/model-bakeoff-20261005/selection-reports/mt/mt_nllb_600m_a/candidate_a_frozen_en_to_vi.tar.gz::candidate_a_frozen_en_to_vi/selection_predictions.jsonl
+nllb_vi=test/model-bakeoff-20261005/selection-reports/mt/mt_nllb_600m_a/candidate_a_frozen_vi_to_en.tar.gz::candidate_a_frozen_vi_to_en/selection_predictions.jsonl

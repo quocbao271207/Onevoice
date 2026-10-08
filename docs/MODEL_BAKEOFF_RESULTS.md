@@ -53,6 +53,7 @@ License metadata được pin cùng revision trong `configs/model_bakeoff.yaml`.
 
 - Train: giữ nguyên manifest train đã audit.
 - Model selection: `data/eval/mt_selection_dev.jsonl` (256 cặp) và `data/eval/asr_selection_dev.jsonl` (384 câu), chỉ sinh từ validation. Bake-off preflight tự tính lại fingerprint từ payload, khóa uniqueness và kiểm tra ID/cặp dịch/transcript/audio hash/speaker/recording group không giao cả train lẫn mọi locked test hay safety manifest trước khi dùng GPU.
+- Terminology challenge set: `data/eval/terminology_challenge_set.jsonl` khóa 128 lỗi validation có provenance (54 EN→VI, 56 VI→EN, 18 ASR). Builder chỉ nhận prediction khớp chính xác ID/reference/source trong manifest validation; archive MT còn phải khớp sidecar provenance và manifest SHA-256. Tất cả mục vẫn `pending`, evaluation-only và không đủ điều kiện auto-correction cho tới human review.
 - Blind locked test v2: `data/eval/blind_test_v2.lock.json` hiện là `awaiting_unseen_data`. Không tự chế blind set từ dữ liệu model đã nhìn thấy. Schema v2 yêu cầu tối thiểu **256 cặp MT** và **384 clip ASR** thật sự unseen; các hàng có thể thuộc nhiều lát nhưng không được nhân bản để tăng đếm.
 - Test/safety cũ không được mở lặp lại để chọn model.
 
@@ -105,6 +106,7 @@ Candidate A MT cũng được benchmark độc lập theo từng chiều; lỗi 
 
 ```bash
 python scripts/build_selection_dev.py
+python scripts/build_terminology_challenge_set.py
 python scripts/run_model_bakeoff.py --preflight
 
 # Chỉ chạy sau khi current program state complete. Process này có thể chờ mà không dùng GPU.

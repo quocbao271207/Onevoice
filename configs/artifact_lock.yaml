@@ -41,9 +41,16 @@ evaluation:
   mt_selection_dev_sha256: a073b05299128ed3131c8eb674c17e1b44e9d25ae1166c6b59feba5622d49f6c
   asr_selection_dev: data/eval/asr_selection_dev.jsonl
   asr_selection_dev_sha256: 87beeb2eb5bc048eb14e2aa2a01482860b0ff27b5b4a7c1b56f7d05bdb0db160
+  terminology_challenge_sources: configs/terminology_challenge_sources.txt
+  terminology_challenge_sources_sha256: 8176d61fdf88a05d9b9968aa612a257fdd39b1183a5cb7b8203c7a815f79b435
+  terminology_challenge_set: data/eval/terminology_challenge_set.jsonl
+  terminology_challenge_set_sha256: 0e06d223220c9fb04d7448f8b9ef0fce8c642be44c47dc5713f72ce4242287d2
+  terminology_challenge_report: data/eval/terminology_challenge_set.report.json
+  terminology_challenge_report_sha256: 740e28d84580619ec0c0a0c3fbbf2fc1067045ea7dc47f575939bbeac2b29c41
+  terminology_challenge_status: awaiting_human_review
   blind_test_v2_lock: data/eval/blind_test_v2.lock.json
   blind_test_v2_status: awaiting_unseen_data
-  rule: "Locked safety evaluation only; never train or select checkpoints on this suite."
+  rule: "Locked safety evaluation only; never train or select checkpoints on safety suites. Challenge rows remain evaluation-only and cannot drive auto-correction before human review."
 
 constraints:
   commercial_use: false

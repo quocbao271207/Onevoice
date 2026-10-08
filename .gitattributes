@@ -1,0 +1,4 @@
+# Checksum-locked evaluation artifacts must be byte-identical on every platform.
+data/eval/*.json text eol=lf
+data/eval/*.jsonl text eol=lf
+configs/terminology_challenge_sources.txt text eol=lf

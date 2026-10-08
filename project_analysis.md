@@ -599,8 +599,8 @@ Mỗi phase có một mục tiêu rõ để tránh làm nhiều việc cùng lú
 - [x] Cloud GPU handoff hoàn tất; mặc định budget A40/RTX A6000 48 GB, có profile 24 GB và đo throughput trước rồi mới chốt chi phí.
 - [x] Ablation decoding local trên locked validation: giữ greedy cho ASR/MT; loại beam search và prompt y khoa tĩnh theo tiêu chí chất lượng, safety và tốc độ.
 - [x] Error mining mẫu khó: ASR nổi bật ở thuật ngữ hiếm/tên bệnh (`Bartholin`, `Bell`, `corticosteron`), audio điện thoại/sách và đảo/mất cụm; MT nổi bật ở tim mạch, viết tắt và thuật ngữ ghép. Đây là tín hiệu định hướng sampling/challenge set, chưa được coi là thống kê tổng thể vì mới 24 mẫu.
-- [ ] Khi vẫn chạy CPU: mở rộng validation stratified lên tối thiểu 100 mẫu mỗi task và lưu riêng artifact; không dùng test để chỉnh tham số.
-- [ ] Tạo terminology challenge set 100–200 câu từ lỗi thật, có cột mức nguy hiểm và trạng thái người duyệt; dùng để đánh giá, không tự động sửa output chưa duyệt.
+- [x] Validation stratified đã khóa riêng ở `data/eval/mt_selection_dev.jsonl` (256 cặp) và `data/eval/asr_selection_dev.jsonl` (384 câu), chỉ sinh từ validation; bake-off preflight kiểm tra lại disjoint train/test trước khi dùng.
+- [x] Terminology challenge set có 128 lỗi validation đã xác minh ở `data/eval/terminology_challenge_set.jsonl`: 110 lỗi MT safety và 18 lỗi ASR thật từ nhiều run. Mọi hàng có `hazard_level`, `review_status=pending`, `evaluation_only=true` và `auto_correction_eligible=false`; report provenance/hash nằm cạnh artifact và tuyệt đối không dùng hàng chưa duyệt để tự sửa output.
 
 ### Phase E — GPU fine-tune (điểm dừng hiện tại)
 
@@ -653,6 +653,8 @@ Mỗi phase có một mục tiêu rõ để tránh làm nhiều việc cùng lú
 .venv\Scripts\python.exe scripts\run_baseline_benchmarks.py --task asr --language en --samples 24
 .venv\Scripts\python.exe scripts\run_baseline_benchmarks.py --task mt --samples 24
 .venv\Scripts\python.exe scripts\run_base_e2e_pipeline.py
+.venv\Scripts\python.exe scripts\build_selection_dev.py
+.venv\Scripts\python.exe scripts\build_terminology_challenge_set.py
 .venv\Scripts\python.exe scripts\preflight_project.py --gate gpu --output data\reports\preflight_gpu_ready.json
 ```
 
