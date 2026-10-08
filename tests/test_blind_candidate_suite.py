@@ -44,7 +44,50 @@ def full_bakeoff_config() -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
+def write_valid_blind_manifests(mt: Path, asr: Path) -> None:
+    source = "Do not use penicillin 500 mg."
+    target = "Không dùng penicillin 500 mg."
+    mt.write_text(
+        json.dumps(
+            {
+                "id": "mt",
+                "source_language": "en",
+                "target_language": "vi",
+                "source_text": source,
+                "target_text": target,
+                "pair_fingerprint": fingerprint_text(source + "\x1f" + target),
+                "categories": [],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audio = asr.with_suffix(".flac")
+    audio.write_bytes(b"blind-audio-payload")
+    text = "Không dùng penicillin 500 mg."
+    asr.write_text(
+        json.dumps(
+            {
+                "id": "asr",
+                "language": "vi",
+                "text": text,
+                "text_fingerprint": fingerprint_text(text),
+                "audio_path": str(audio),
+                "audio_sha256": sha256(audio),
+                "speaker": "speaker-1",
+                "group": "group-1",
+                "categories": [],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_lock(path: Path, mt: Path, asr: Path) -> None:
+    write_valid_blind_manifests(mt, asr)
     mt_coverage = coverage_counts("mt", read_jsonl_fixture(mt))
     asr_coverage = coverage_counts("asr", read_jsonl_fixture(asr))
     path.write_text(
@@ -587,8 +630,9 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
 
     mt_manifest = tmp_path / "blind-mt.jsonl"
     asr_manifest = tmp_path / "blind-asr.jsonl"
-    mt_manifest.write_text('{"id":"mt"}\n', encoding="utf-8")
-    asr_manifest.write_text('{"id":"asr"}\n', encoding="utf-8")
+    write_valid_blind_manifests(mt_manifest, asr_manifest)
+    mt_coverage = coverage_counts("mt", read_jsonl_fixture(mt_manifest))
+    asr_coverage = coverage_counts("asr", read_jsonl_fixture(asr_manifest))
     comparison = tmp_path / "selection.json"
     lock_path = tmp_path / "lock.json"
     lock_path.write_text(
@@ -606,18 +650,13 @@ def test_blind_evaluate_resumes_only_verified_selected_report(tmp_path: Path):
                         "path": str(mt_manifest),
                         "rows": 1,
                         "sha256": sha256(mt_manifest),
-                        "coverage": {"rows": 1, "slice_samples": {}},
+                        "coverage": mt_coverage,
                     },
                     "asr": {
                         "path": str(asr_manifest),
                         "rows": 1,
                         "sha256": sha256(asr_manifest),
-                        "coverage": {
-                            "rows": 1,
-                            "slice_samples": {},
-                            "unique_speakers": 0,
-                            "unique_groups": 0,
-                        },
+                        "coverage": asr_coverage,
                     },
                 },
                 "selection": None,
@@ -932,6 +971,59 @@ def test_blind_asr_fingerprints_are_recomputed_from_text_and_audio(tmp_path: Pat
         validate_content_integrity("asr", [row])
 
 
+def test_blind_asr_rejects_linked_audio(tmp_path: Path):
+    target = tmp_path / "target.flac"
+    target.write_bytes(b"blind-audio-payload")
+    linked = tmp_path / "linked.flac"
+    try:
+        linked.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+    text = "Không dùng penicillin."
+    row = {
+        "language": "vi",
+        "text": text,
+        "text_fingerprint": fingerprint_text(text),
+        "audio_path": str(linked),
+        "audio_sha256": sha256(target),
+    }
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        validate_content_integrity("asr", [row])
+
+
+def test_blind_asr_rejects_audio_over_byte_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    audio = tmp_path / "oversized.flac"
+    audio.write_bytes(b"oversized-audio")
+    text = "Không dùng penicillin."
+    row = {
+        "language": "vi",
+        "text": text,
+        "text_fingerprint": fingerprint_text(text),
+        "audio_path": str(audio),
+        "audio_sha256": sha256(audio),
+    }
+    monkeypatch.setattr(blind, "MAX_BLIND_AUDIO_FILE_BYTES", 4)
+
+    with pytest.raises(ValueError, match="exceeds 4 bytes"):
+        validate_content_integrity("asr", [row])
+
+
+def test_blind_lock_revalidates_audio_content_on_resume(tmp_path: Path):
+    mt = tmp_path / "mt.jsonl"
+    asr = tmp_path / "asr.jsonl"
+    lock = tmp_path / "lock.json"
+    write_lock(lock, mt, asr)
+    audio_path = Path(read_jsonl_fixture(asr)[0]["audio_path"])
+    audio_path.write_bytes(b"changed-after-lock")
+
+    with pytest.raises(ValueError, match="audio_sha256 does not match"):
+        verify_lock(lock)
+
+
 def test_blind_asr_requires_existing_audio(tmp_path: Path):
     text = "Không dùng penicillin."
     row = {
@@ -939,7 +1031,7 @@ def test_blind_asr_requires_existing_audio(tmp_path: Path):
         "text": text,
         "text_fingerprint": fingerprint_text(text),
         "audio_path": str(tmp_path / "missing.flac"),
-        "audio_sha256": "declared",
+        "audio_sha256": "d" * 64,
     }
     with pytest.raises(FileNotFoundError, match="audio is missing"):
         validate_content_integrity("asr", [row])

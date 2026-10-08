@@ -12,7 +12,9 @@ from scripts.prepare_deployment_benchmark import (
     finalize_report,
     selected_winner_specs,
 )
+from scripts.run_blind_candidate_suite import coverage_counts
 from scripts.run_model_bakeoff import QUANTIZATION_PARITY_SLICES, sha256, tree_manifest
+from src.data.quality import fingerprint_text
 from src.pipeline.license_policy import license_decisions
 from src.pipeline.selection_policy import selection_policy_record
 
@@ -142,8 +144,41 @@ def deployment_fixture(
     blind_dir.mkdir()
     mt_manifest = blind_dir / "mt.jsonl"
     asr_manifest = blind_dir / "asr.jsonl"
-    mt_manifest.write_text('{"id":"mt"}\n', encoding="utf-8")
-    asr_manifest.write_text('{"id":"asr"}\n', encoding="utf-8")
+    source = "Do not use penicillin 500 mg."
+    target = "Không dùng penicillin 500 mg."
+    mt_row = {
+        "id": "mt",
+        "source_language": "en",
+        "target_language": "vi",
+        "source_text": source,
+        "target_text": target,
+        "pair_fingerprint": fingerprint_text(source + "\x1f" + target),
+        "categories": [],
+    }
+    mt_manifest.write_text(
+        json.dumps(mt_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    audio = blind_dir / "asr.flac"
+    audio.write_bytes(b"blind-audio-payload")
+    transcript = "Không dùng penicillin 500 mg."
+    asr_row = {
+        "id": "asr",
+        "language": "vi",
+        "text": transcript,
+        "text_fingerprint": fingerprint_text(transcript),
+        "audio_path": str(audio),
+        "audio_sha256": sha256(audio),
+        "speaker": "speaker-1",
+        "group": "group-1",
+        "categories": [],
+    }
+    asr_manifest.write_text(
+        json.dumps(asr_row, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    mt_coverage = coverage_counts("mt", [mt_row])
+    asr_coverage = coverage_counts("asr", [asr_row])
     manifest_paths = {"mt": mt_manifest, "asr": asr_manifest}
     candidate_config = {
         candidate["id"]: candidate
@@ -194,10 +229,10 @@ def deployment_fixture(
                 "wer": 0.1,
                 "wer_bootstrap_95ci": [0.08, 0.12],
                 "wer_bootstrap_unit": "group",
-                "wer_bootstrap_clusters": 0,
+                "wer_bootstrap_clusters": 1,
                 "cer": 0.05,
-                "unique_speakers": 0,
-                "unique_groups": 0,
+                "unique_speakers": 1,
+                "unique_groups": 1,
                 "categories": {},
                 "slices": {"code_switch": {"True": {"wer": 0.1}}},
             }
@@ -264,18 +299,13 @@ def deployment_fixture(
                         "path": str(mt_manifest),
                         "rows": 1,
                         "sha256": sha256(mt_manifest),
-                        "coverage": {"rows": 1, "slice_samples": {}},
+                        "coverage": mt_coverage,
                     },
                     "asr": {
                         "path": str(asr_manifest),
                         "rows": 1,
                         "sha256": sha256(asr_manifest),
-                        "coverage": {
-                            "rows": 1,
-                            "slice_samples": {},
-                            "unique_speakers": 0,
-                            "unique_groups": 0,
-                        },
+                        "coverage": asr_coverage,
                     },
                 },
                 "selection": snapshot_record,

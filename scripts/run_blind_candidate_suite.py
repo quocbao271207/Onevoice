@@ -54,6 +54,7 @@ MAX_BLIND_ADAPTER_DIRECTORIES = 10_000
 MAX_BLIND_ADAPTER_ENTRIES = 20_000
 MAX_BLIND_ADAPTER_FILE_BYTES = 8_000_000_000
 MAX_BLIND_ADAPTER_TREE_BYTES = 16_000_000_000
+MAX_BLIND_AUDIO_FILE_BYTES = 64 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 BLIND_LOCK_ALLOWED_FIELDS = frozenset(
     {
@@ -419,11 +420,15 @@ def leakage_values(task: str, rows: list[dict[str, Any]]) -> set[str]:
             audio_path = Path(audio_value)
             if not audio_path.is_absolute():
                 audio_path = ROOT / audio_path
-            if not audio_path.is_file():
-                raise FileNotFoundError(
-                    f"ASR leakage comparison audio is missing on row {index}: {audio_path}"
-                )
-            audio_digest = sha256(audio_path)
+            audio_path = _resolve_blind_audio_path(
+                audio_path,
+                label=f"ASR leakage comparison audio on row {index}",
+            )
+            audio_digest, _ = sha256_stable_regular_file(
+                audio_path,
+                maximum_bytes=MAX_BLIND_AUDIO_FILE_BYTES,
+                label=f"ASR leakage comparison audio on row {index}",
+            )
         result.add(f"audio_sha256:{audio_digest}")
         for key in ("speaker", "group"):
             value = str(row.get(key) or "").strip()
@@ -466,6 +471,21 @@ def validate_identifiers(task: str, rows: list[dict[str, Any]]) -> None:
             )
 
 
+def _resolve_blind_audio_path(value: str | Path, *, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        path = ROOT / path
+    lexical = Path(os.path.abspath(path))
+    for component in reversed((lexical, *lexical.parents)):
+        if is_link_or_junction(component):
+            raise ValueError(f"{label} cannot traverse a symlink or junction: {component}")
+    return resolve_regular_file(
+        lexical,
+        label=label,
+        maximum_bytes=MAX_BLIND_AUDIO_FILE_BYTES,
+    )
+
+
 def validate_content_integrity(task: str, rows: list[dict[str, Any]]) -> None:
     """Recompute blind fingerprints from payloads instead of trusting metadata."""
     for index, row in enumerate(rows, start=1):
@@ -501,12 +521,24 @@ def validate_content_integrity(task: str, rows: list[dict[str, Any]]) -> None:
         audio_value = str(row.get("audio_path") or "").strip()
         if not audio_value:
             raise ValueError(f"Blind asr manifest is missing audio_path on row {index}")
-        audio_path = Path(audio_value)
-        if not audio_path.is_absolute():
-            audio_path = ROOT / audio_path
-        if not audio_path.is_file():
-            raise FileNotFoundError(f"Blind asr audio is missing on row {index}: {audio_path}")
-        if row["audio_sha256"] != sha256(audio_path):
+        declared_digest = str(row.get("audio_sha256") or "").strip()
+        if not SHA256_RE.fullmatch(declared_digest):
+            raise ValueError(f"Blind asr audio_sha256 is invalid on row {index}")
+        try:
+            audio_path = _resolve_blind_audio_path(
+                audio_value,
+                label=f"Blind asr audio on row {index}",
+            )
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Blind asr audio is missing on row {index}: {audio_value}"
+            ) from None
+        actual_digest, _ = sha256_stable_regular_file(
+            audio_path,
+            maximum_bytes=MAX_BLIND_AUDIO_FILE_BYTES,
+            label=f"Blind asr audio on row {index}",
+        )
+        if declared_digest != actual_digest:
             raise ValueError(
                 f"Blind asr audio_sha256 does not match audio content on row {index}"
             )
@@ -1045,6 +1077,9 @@ def verify_lock(lock_path: Path) -> dict[str, Any]:
             or hashlib.sha256(manifest_payload).hexdigest() != digest
         ):
             raise ValueError(f"Blind {task} checksum mismatch")
+        validate_identifiers(task, rows)
+        validate_content_integrity(task, rows)
+        validate_required_slices(task, rows, lock["required_slices"][task])
         coverage = validate_minimum_coverage(
             task,
             rows,
