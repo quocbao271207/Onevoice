@@ -575,6 +575,23 @@ def validate_resources(config: dict[str, Any]) -> None:
             or set(configured) != expected
         ):
             raise ValueError(f"Promotion gate {key} must contain exactly {sorted(expected)}")
+    deployment_metrics = config["promotion_gate"].get("deployment_metrics")
+    configured_deployment_metrics = {
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "peak_ram_bytes",
+        "peak_vram_bytes",
+        "model_bytes",
+    }
+    if (
+        not isinstance(deployment_metrics, list)
+        or len(deployment_metrics) != len(configured_deployment_metrics)
+        or set(deployment_metrics) != configured_deployment_metrics
+    ):
+        raise ValueError(
+            "Promotion gate deployment_metrics must contain exactly "
+            f"{sorted(configured_deployment_metrics)}"
+        )
     code_switch_limit = float(config["promotion_gate"].get("asr_code_switch_wer_max", math.nan))
     if not math.isfinite(code_switch_limit) or not 0.0 <= code_switch_limit <= 1.0:
         raise ValueError("ASR code-switch WER limit must be finite and in [0, 1]")
@@ -1045,6 +1062,16 @@ def qcs6490_identity_failures(identity: Any) -> list[str]:
     return failures
 
 
+def deployment_required_metrics(configured: list[str]) -> list[str]:
+    """Add code-mandatory physical metrics without changing active config SHA."""
+    mandatory = (
+        "power_avg_mw",
+        "power_p95_mw",
+        "temperature_peak_c",
+    )
+    return list(dict.fromkeys([*configured, *mandatory]))
+
+
 def validate_deployment_report(
     report: dict[str, Any],
     expected_winners: list[dict[str, Any]],
@@ -1053,6 +1080,7 @@ def validate_deployment_report(
     project_root: Path = ROOT,
 ) -> tuple[bool, list[str]]:
     """Validate fresh physical-board evidence for every selected winner."""
+    required_metrics = deployment_required_metrics(required_metrics)
     failures: list[str] = []
     if report.get("version") != 1:
         failures.append("version:invalid")
@@ -1198,6 +1226,39 @@ def validate_deployment_report(
             ):
                 failures.append(f"{label}:latency_sample_count_mismatch")
 
+        sensor_samples: dict[str, list[float]] = {}
+        sensor_contracts = {
+            "power": ("power_samples_mw", "power_sensor"),
+            "temperature": ("temperature_samples_c", "temperature_sensor"),
+        }
+        for sensor, (sample_key, source_key) in sensor_contracts.items():
+            source = record.get(source_key)
+            if not isinstance(source, str) or not source.strip():
+                failures.append(f"{label}:{source_key}_missing")
+            values = record.get(sample_key)
+            parsed: list[float] = []
+            if not isinstance(values, list):
+                failures.append(f"{label}:{sample_key}_missing")
+            else:
+                for value in values:
+                    try:
+                        sample = float(value)
+                    except (TypeError, ValueError):
+                        sample = math.nan
+                    invalid = not math.isfinite(sample)
+                    if sensor == "power":
+                        invalid = invalid or sample <= 0
+                    else:
+                        invalid = invalid or sample <= -273.15
+                    if invalid:
+                        parsed = []
+                        failures.append(f"{label}:{sample_key}_invalid")
+                        break
+                    parsed.append(sample)
+                if parsed and len(parsed) < min_runs:
+                    failures.append(f"{label}:{sample_key}_insufficient")
+            sensor_samples[sensor] = parsed
+
         numeric: dict[str, float] = {}
         for metric in required_metrics:
             value = record.get(metric)
@@ -1213,6 +1274,9 @@ def validate_deployment_report(
                 continue
             if metric == "peak_vram_bytes":
                 if number < 0:
+                    failures.append(f"{label}:{metric}_invalid")
+            elif metric == "temperature_peak_c":
+                if number <= -273.15:
                     failures.append(f"{label}:{metric}_invalid")
             elif number <= 0:
                 failures.append(f"{label}:{metric}_invalid")
@@ -1232,6 +1296,26 @@ def validate_deployment_report(
                 tolerance = max(1e-6, abs(expected_value) * 1e-6)
                 if abs(numeric[metric] - expected_value) > tolerance:
                     failures.append(f"{label}:{metric}_does_not_match_samples")
+        power_samples = sensor_samples["power"]
+        temperature_samples = sensor_samples["temperature"]
+        calculated_sensor_metrics: dict[str, float] = {}
+        if power_samples:
+            calculated_sensor_metrics.update(
+                {
+                    "power_avg_mw": sum(power_samples) / len(power_samples),
+                    "power_p95_mw": percentile_linear(power_samples, 0.95),
+                }
+            )
+        if temperature_samples:
+            calculated_sensor_metrics["temperature_peak_c"] = max(
+                temperature_samples
+            )
+        for metric, expected_value in calculated_sensor_metrics.items():
+            if metric not in numeric:
+                continue
+            tolerance = max(1e-6, abs(expected_value) * 1e-6)
+            if abs(numeric[metric] - expected_value) > tolerance:
+                failures.append(f"{label}:{metric}_does_not_match_samples")
 
         artifact_value = str(record.get("artifact_path") or "").strip()
         if not artifact_value:
@@ -1310,6 +1394,16 @@ def validate_deployment_draft(
             failures.append(f"{label}:candidate_mismatch")
         if record.get("adapter_manifest_sha256") != expected["adapter_manifest_sha256"]:
             failures.append(f"{label}:adapter_checksum_mismatch")
+        for sample_key in (
+            "latency_samples_ms",
+            "power_samples_mw",
+            "temperature_samples_c",
+        ):
+            if not isinstance(record.get(sample_key), list):
+                failures.append(f"{label}:{sample_key}_missing")
+        for source_key in ("power_sensor", "temperature_sensor"):
+            if not isinstance(record.get(source_key), str):
+                failures.append(f"{label}:{source_key}_missing")
     return not failures, failures
 
 

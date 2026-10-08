@@ -52,5 +52,5 @@ Kết quả regression gần nhất được ghi trong `project_analysis.md`; kh
 2. Resume M2M100 VI→EN r32 chỉ từ checkpoint 100 đã xác minh; tải và kiểm tra archive/manifest/sidecar/index ngay khi checkpoint 200/300/400 xuất hiện. Không biến lần dừng bất thường cũ thành benchmark evidence.
 3. Tiếp tục ASR challenger theo đúng thứ tự Whisper-small multilingual rồi PhoWhisper-base. VinAI AGPL vẫn khóa khi chưa có phê duyệt research-license rõ ràng và không đủ điều kiện production.
 4. Chỉ chọn winner sau hard safety gate và luật đa metric/95% CI; blind v2 chỉ được mở một lần trên dữ liệu chưa từng thấy và phải fail-closed khi dữ liệu chưa sẵn sàng.
-5. Sau khi có winner, chạy INT8 parity/QNN và đo deployment trên QCS6490 vật lý. Arduino, cloud host hoặc profile model tham chiếu không thay thế được evidence board thật.
+5. Sau khi có winner, chạy INT8 parity/QNN và đo latency, memory, power, thermal trên QCS6490 vật lý. Arduino, cloud host hoặc profile model tham chiếu không thay thế được evidence board thật.
 6. Giữ Piper CPU/text-only fallback an toàn trong khi hoàn thiện exporter; mọi fallback phải giữ ASR/MT safety bắt buộc và không tự phát audio lâm sàng khi chưa có xác nhận.

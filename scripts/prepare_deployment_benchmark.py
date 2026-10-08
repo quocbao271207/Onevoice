@@ -2,14 +2,16 @@
 
 The template action binds a measurement draft to the exact selected adapters.
 After board measurements and compiled artifacts have been copied back under
-``models/``, the finalize action computes immutable artifact identities and
-latency percentiles, validates the complete report, and writes it atomically.
+``models/``, the finalize action computes immutable artifact identities plus
+latency/power/thermal metrics, validates the complete report, and writes it
+atomically.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from copy import deepcopy
@@ -21,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.run_model_bakeoff import (  # noqa: E402
+    deployment_required_metrics,
     deployment_expectations,
     load_config,
     percentile_linear,
@@ -104,6 +107,10 @@ def build_template(
                 **winner,
                 "artifact_path": "",
                 "latency_samples_ms": [],
+                "power_sensor": "",
+                "power_samples_mw": [],
+                "temperature_sensor": "",
+                "temperature_samples_c": [],
                 "peak_ram_bytes": None,
                 "peak_vram_bytes": None,
             }
@@ -125,6 +132,31 @@ def _resolve_artifact(path_value: Any, project_root: Path) -> Path:
     if not path.is_absolute():
         path = project_root / path
     return path.resolve()
+
+
+def _parse_samples(
+    record: dict[str, Any],
+    key: str,
+    *,
+    minimum: float | None = None,
+) -> list[float]:
+    values = record.get(key)
+    if not isinstance(values, list):
+        raise ValueError(f"Deployment {key} are missing")
+    parsed: list[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid deployment {key}") from exc
+        if not math.isfinite(number) or (
+            minimum is not None and number <= minimum
+        ):
+            raise ValueError(f"Invalid deployment {key}")
+        parsed.append(number)
+    if not parsed:
+        raise ValueError(f"Deployment {key} are empty")
+    return parsed
 
 
 def finalize_report(
@@ -187,17 +219,21 @@ def finalize_report(
             raise ValueError(f"Deployment candidate binding changed: {key}")
         if record.get("adapter_manifest_sha256") != expected_record["adapter_manifest_sha256"]:
             raise ValueError(f"Deployment adapter binding changed: {key}")
-        samples = record.get("latency_samples_ms")
-        if not isinstance(samples, list):
-            raise ValueError(f"Deployment latency samples are missing: {key}")
-        parsed_samples: list[float] = []
-        for value in samples:
-            try:
-                parsed_samples.append(float(value))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid deployment latency sample: {key}") from exc
-        if not parsed_samples:
-            raise ValueError(f"Deployment latency samples are empty: {key}")
+        parsed_samples = _parse_samples(
+            record,
+            "latency_samples_ms",
+            minimum=0.0,
+        )
+        power_samples = _parse_samples(
+            record,
+            "power_samples_mw",
+            minimum=0.0,
+        )
+        temperature_samples = _parse_samples(
+            record,
+            "temperature_samples_c",
+            minimum=-273.15,
+        )
         artifact = _resolve_artifact(record.get("artifact_path"), project_root)
         if not artifact.is_file():
             raise FileNotFoundError(f"Deployment artifact is missing: {artifact}")
@@ -207,20 +243,28 @@ def finalize_report(
                 "latency_samples_ms": parsed_samples,
                 "latency_p50_ms": percentile_linear(parsed_samples, 0.50),
                 "latency_p95_ms": percentile_linear(parsed_samples, 0.95),
+                "power_samples_mw": power_samples,
+                "power_avg_mw": sum(power_samples) / len(power_samples),
+                "power_p95_mw": percentile_linear(power_samples, 0.95),
+                "temperature_samples_c": temperature_samples,
+                "temperature_peak_c": max(temperature_samples),
                 "artifact_sha256": sha256(artifact),
                 "model_bytes": artifact.stat().st_size,
             }
         )
 
     gate = config["promotion_gate"]
+    required_metrics = deployment_required_metrics(
+        list(gate["deployment_metrics"])
+    )
     final["deployment_gate"] = {
-        "required_metrics": list(gate["deployment_metrics"]),
+        "required_metrics": required_metrics,
         "minimum_measurement_runs": int(gate["deployment_min_runs"]),
     }
     passed, failures = validate_deployment_report(
         final,
         expected,
-        list(gate["deployment_metrics"]),
+        required_metrics,
         int(gate["deployment_min_runs"]),
         project_root,
     )

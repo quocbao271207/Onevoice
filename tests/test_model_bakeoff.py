@@ -492,6 +492,11 @@ def test_bakeoff_metric_policy_rejects_duplicates_and_invalid_code_switch_limit(
     with pytest.raises(ValueError, match="code-switch WER limit"):
         validate_resources(data)
 
+    data = config()
+    data["promotion_gate"]["deployment_metrics"].remove("model_bytes")
+    with pytest.raises(ValueError, match="deployment_metrics"):
+        validate_resources(data)
+
 
 def test_bakeoff_rejects_hard_memory_limit_below_process_limit():
     data = config()
@@ -1746,6 +1751,8 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"compiled-qnn-artifact")
     latency_samples = [200.0 + index for index in range(100)]
+    power_samples = [2500.0 + index * 2.0 for index in range(100)]
+    temperature_samples = [45.0 + index * 0.05 for index in range(100)]
     expected = [
         {
             "task": "mt",
@@ -1762,6 +1769,13 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "latency_samples_ms": latency_samples,
         "latency_p50_ms": bakeoff.percentile_linear(latency_samples, 0.50),
         "latency_p95_ms": bakeoff.percentile_linear(latency_samples, 0.95),
+        "power_sensor": "sysfs:ina231/system_power",
+        "power_samples_mw": power_samples,
+        "power_avg_mw": sum(power_samples) / len(power_samples),
+        "power_p95_mw": bakeoff.percentile_linear(power_samples, 0.95),
+        "temperature_sensor": "sysfs:thermal_zone0/temp",
+        "temperature_samples_c": temperature_samples,
+        "temperature_peak_c": max(temperature_samples),
         "peak_ram_bytes": 100_000_000,
         "peak_vram_bytes": 0,
         "model_bytes": artifact.stat().st_size,
@@ -1785,6 +1799,9 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
     metrics = [
         "latency_p50_ms",
         "latency_p95_ms",
+        "power_avg_mw",
+        "power_p95_mw",
+        "temperature_peak_c",
         "peak_ram_bytes",
         "peak_vram_bytes",
         "model_bytes",
@@ -1802,6 +1819,8 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
     winner["adapter_manifest_sha256"] = "c" * 64
     winner["measurement_runs"] = 2
     winner["latency_p95_ms"] = 200.0
+    winner["power_samples_mw"][0] = 0.0
+    winner["temperature_peak_c"] = -300.0
     winner["peak_ram_bytes"] = float("nan")
     winner["model_bytes"] = 1.5
     passed, failures = validate_deployment_report(report, expected, metrics, 30, project_root)
@@ -1810,6 +1829,8 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
     assert "winner:mt/en_to_vi:candidate_mismatch" in failures
     assert "winner:mt/en_to_vi:adapter_checksum_mismatch" in failures
     assert "winner:mt/en_to_vi:insufficient_measurement_runs" in failures
+    assert "winner:mt/en_to_vi:power_samples_mw_invalid" in failures
+    assert "winner:mt/en_to_vi:temperature_peak_c_invalid" in failures
     assert "winner:mt/en_to_vi:peak_ram_bytes_invalid" in failures
     assert "winner:mt/en_to_vi:model_bytes_invalid" in failures
     assert "winner:mt/en_to_vi:latency_percentiles_reversed" in failures
@@ -1845,7 +1866,16 @@ def test_deployment_draft_is_bound_to_current_selection_and_winners(tmp_path: Pa
             "path": str(comparison.resolve()),
             "sha256": bakeoff.sha256(comparison),
         },
-        "winners": [{**expected[0], "latency_samples_ms": []}],
+        "winners": [
+            {
+                **expected[0],
+                "latency_samples_ms": [],
+                "power_sensor": "",
+                "power_samples_mw": [],
+                "temperature_sensor": "",
+                "temperature_samples_c": [],
+            }
+        ],
     }
 
     assert validate_deployment_draft(draft, expected, comparison) == (True, [])
@@ -1856,3 +1886,35 @@ def test_deployment_draft_is_bound_to_current_selection_and_winners(tmp_path: Pa
     assert passed is False
     assert "selection_comparison:checksum_mismatch" in failures
     assert "winner:mt/en_to_vi:candidate_mismatch" in failures
+
+
+def test_deployment_draft_rejects_legacy_template_without_sensor_fields(
+    tmp_path: Path,
+):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    comparison = tmp_path / "comparison.json"
+    comparison.write_text('{"status":"blind_complete"}', encoding="utf-8")
+    expected = deployment_expectations(
+        [("mt", "en_to_vi", {"candidate_id": "winner", "adapter": str(adapter)})]
+    )
+    draft = {
+        "version": 1,
+        "status": "pending_physical_measurement",
+        "target": "QCS6490",
+        "measurement_source": "physical_board",
+        "selection_comparison": {
+            "path": str(comparison.resolve()),
+            "sha256": bakeoff.sha256(comparison),
+        },
+        "winners": [{**expected[0], "latency_samples_ms": []}],
+    }
+
+    passed, failures = validate_deployment_draft(draft, expected, comparison)
+
+    assert passed is False
+    assert "winner:mt/en_to_vi:power_samples_mw_missing" in failures
+    assert "winner:mt/en_to_vi:temperature_samples_c_missing" in failures
+    assert "winner:mt/en_to_vi:power_sensor_missing" in failures
+    assert "winner:mt/en_to_vi:temperature_sensor_missing" in failures

@@ -100,6 +100,8 @@ def test_template_binds_all_selected_winners(tmp_path: Path):
         ("asr", None, "asr-vi"),
     }
     assert all(len(winner["adapter_manifest_sha256"]) == 64 for winner in report["winners"])
+    assert all(winner["power_samples_mw"] == [] for winner in report["winners"])
+    assert all(winner["temperature_samples_c"] == [] for winner in report["winners"])
 
 
 def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: Path):
@@ -122,6 +124,14 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
             {
                 "artifact_path": str(artifact.relative_to(project_root)),
                 "latency_samples_ms": [100.0 + index + run for run in range(30)],
+                "power_sensor": "sysfs:ina231/system_power",
+                "power_samples_mw": [
+                    2500.0 + index + run * 10.0 for run in range(30)
+                ],
+                "temperature_sensor": "sysfs:thermal_zone0/temp",
+                "temperature_samples_c": [
+                    45.0 + index + run * 0.1 for run in range(30)
+                ],
                 "peak_ram_bytes": 100_000_000 + index,
                 "peak_vram_bytes": 0,
             }
@@ -133,11 +143,19 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
     assert report["selection_comparison"]["sha256"] == sha256(selection)
     assert report["device"]["board"] == "Qualcomm QCS6490 RB3 Gen 2 Vision Kit"
     assert report["device"]["identity_evidence_sha256"] == sha256(identity)
+    assert set(report["deployment_gate"]["required_metrics"]) >= {
+        "power_avg_mw",
+        "power_p95_mw",
+        "temperature_peak_c",
+    }
     for index, winner in enumerate(report["winners"]):
         artifact = models / f"winner-{index}.bin"
         assert winner["measurement_runs"] == 30
         assert winner["latency_p50_ms"] == pytest.approx(114.5 + index)
         assert winner["latency_p95_ms"] == pytest.approx(127.55 + index)
+        assert winner["power_avg_mw"] == pytest.approx(2645.0 + index)
+        assert winner["power_p95_mw"] == pytest.approx(2775.5 + index)
+        assert winner["temperature_peak_c"] == pytest.approx(47.9 + index)
         assert winner["artifact_sha256"] == sha256(artifact)
         assert winner["model_bytes"] == artifact.stat().st_size
 
@@ -180,12 +198,49 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
             {
                 "artifact_path": str(outside),
                 "latency_samples_ms": [100.0 + run for run in range(30)],
+                "power_sensor": "sysfs:ina231/system_power",
+                "power_samples_mw": [2500.0 + run for run in range(30)],
+                "temperature_sensor": "sysfs:thermal_zone0/temp",
+                "temperature_samples_c": [45.0 + run * 0.1 for run in range(30)],
                 "peak_ram_bytes": 1,
                 "peak_vram_bytes": 0,
             }
         )
 
     with pytest.raises(ValueError, match="identity_evidence:board_model_not_qcs6490"):
+        finalize_report(selection, comparison, draft, config, project_root)
+
+
+def test_finalize_rejects_missing_power_or_thermal_samples(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    draft = build_template(selection, comparison)
+    draft["measured_at"] = "2026-10-06T12:00:00+07:00"
+    identity = write_identity_evidence(project_root)
+    draft["device"].update(
+        {
+            "os": "Qc_Linux 1.6",
+            "identity_evidence_path": str(identity.relative_to(project_root)),
+        }
+    )
+    models = project_root / "models"
+    models.mkdir()
+    for index, winner in enumerate(draft["winners"]):
+        artifact = models / f"winner-{index}.bin"
+        artifact.write_bytes(b"compiled")
+        winner.update(
+            {
+                "artifact_path": str(artifact.relative_to(project_root)),
+                "latency_samples_ms": [100.0 + run for run in range(30)],
+                "power_sensor": "sysfs:ina231/system_power",
+                "power_samples_mw": [],
+                "temperature_sensor": "sysfs:thermal_zone0/temp",
+                "temperature_samples_c": [45.0 + run * 0.1 for run in range(30)],
+                "peak_ram_bytes": 1,
+                "peak_vram_bytes": 0,
+            }
+        )
+
+    with pytest.raises(ValueError, match="power_samples_mw are empty"):
         finalize_report(selection, comparison, draft, config, project_root)
 
 
