@@ -86,6 +86,8 @@ def test_audio_frontend_load_is_offline_and_reports_explicit_status(monkeypatch)
         "vad_loaded": True,
         "noise_suppression_enabled": False,
         "noise_suppression_loaded": False,
+        "microphone_buffer_capacity_chunks": 4,
+        "microphone_stream_error": None,
     }
     assert frontend.vad.detect(np.zeros(160, dtype=np.float32), 16_000) == 0.0
 
@@ -99,6 +101,13 @@ def test_audio_config_restricts_webrtc_contract():
         AudioConfig(noise_suppression_enabled="false")
     with pytest.raises(ValueError, match="WebRTC VAD sample_rate"):
         AudioConfig(sample_rate=44_100)
+    with pytest.raises(ValueError, match="max_segment_duration_seconds"):
+        AudioConfig(max_segment_duration_seconds=float("inf"))
+    with pytest.raises(ValueError, match="at least one configured audio chunk"):
+        AudioConfig(
+            chunk_duration_ms=500,
+            max_segment_duration_seconds=0.25,
+        )
 
 
 def test_disabled_noise_suppression_is_explicit_pass_through(monkeypatch):
@@ -147,3 +156,170 @@ def test_pipeline_applies_explicit_audio_frontend_backends():
     assert pipeline.audio_frontend.config.vad_aggressiveness == 2
     assert pipeline.audio_frontend.config.noise_suppression_enabled is False
     assert pipeline.audio_frontend.denoiser.enabled is False
+    assert (
+        pipeline.audio_frontend.config.max_segment_duration_seconds
+        == pipeline.asr_engine.max_input_duration_seconds
+        == 30.0
+    )
+
+
+def test_frontend_bounds_continuous_speech_before_unbounded_accumulation(
+    monkeypatch,
+):
+    frontend = AudioFrontend(
+        AudioConfig(
+            chunk_duration_ms=1_000,
+            max_segment_duration_seconds=2.0,
+        )
+    )
+    chunk = np.zeros(frontend.config.chunk_size, dtype=np.float32)
+    monkeypatch.setattr(frontend.denoiser, "suppress", lambda audio, _rate: audio)
+    monkeypatch.setattr(frontend.vad, "is_speech", lambda *_args: True)
+
+    assert frontend.process_chunk(chunk) is None
+    assert frontend.process_chunk(chunk) is None
+    with pytest.raises(RuntimeError, match="segment exceeded 2.000s"):
+        frontend.process_chunk(chunk)
+
+    assert frontend._speech_chunks == []
+    assert frontend._speech_sample_count == 0
+
+
+def test_frontend_releases_segment_at_exact_duration_limit(monkeypatch):
+    frontend = AudioFrontend(
+        AudioConfig(
+            chunk_duration_ms=1_000,
+            silence_duration_ms=800,
+            max_segment_duration_seconds=2.0,
+        )
+    )
+    chunk = np.zeros(frontend.config.chunk_size, dtype=np.float32)
+    speech_decisions = iter((True, True, False))
+    monkeypatch.setattr(frontend.denoiser, "suppress", lambda audio, _rate: audio)
+    monkeypatch.setattr(
+        frontend.vad,
+        "is_speech",
+        lambda *_args: next(speech_decisions),
+    )
+
+    assert frontend.process_chunk(chunk) is None
+    assert frontend.process_chunk(chunk) is None
+    segment = frontend.process_chunk(chunk)
+
+    assert segment is not None
+    assert len(segment) == 2 * frontend.config.sample_rate
+
+
+def test_microphone_queue_overflow_and_status_fail_closed_without_dropping():
+    frontend = AudioFrontend(AudioConfig(chunk_duration_ms=1_000))
+    chunk = np.zeros(
+        (frontend.config.chunk_size, frontend.config.channels),
+        dtype=np.float32,
+    )
+
+    frontend._enqueue_microphone_chunk(
+        chunk,
+        frontend.config.chunk_size,
+        status=None,
+    )
+    frontend._enqueue_microphone_chunk(
+        chunk,
+        frontend.config.chunk_size,
+        status=None,
+    )
+    assert frontend._buffer.qsize() == 2
+
+    frontend._enqueue_microphone_chunk(
+        chunk,
+        frontend.config.chunk_size,
+        status=None,
+    )
+    assert frontend._buffer.qsize() == 2
+    with pytest.raises(RuntimeError, match="buffer overflow"):
+        frontend._raise_stream_error()
+
+    frontend._reset_microphone_stream_state()
+    frontend._enqueue_microphone_chunk(
+        chunk,
+        frontend.config.chunk_size,
+        status="input overflow",
+    )
+    assert frontend._buffer.empty()
+    with pytest.raises(RuntimeError, match="reported status"):
+        frontend._raise_stream_error()
+
+
+@pytest.mark.parametrize(
+    ("frames", "shape", "fill_value", "message"),
+    [
+        (8_000 - 1, (8_000, 1), 0.0, "frame count"),
+        (8_000, (8_000, 2), 0.0, "shape"),
+        (8_000, (8_000, 1), float("nan"), "finite"),
+        (8_000, (8_000, 1), 1.1, "normalized"),
+    ],
+)
+def test_microphone_callback_rejects_malformed_chunks(
+    frames,
+    shape,
+    fill_value,
+    message,
+):
+    frontend = AudioFrontend()
+    chunk = np.full(shape, fill_value, dtype=np.float32)
+
+    frontend._enqueue_microphone_chunk(chunk, frames, status=None)
+
+    assert frontend._buffer.empty()
+    with pytest.raises(RuntimeError, match=message):
+        frontend._raise_stream_error()
+
+
+def test_microphone_stream_preserves_channels_and_uses_bounded_queue(monkeypatch):
+    frontend = AudioFrontend(AudioConfig(channels=2))
+    frontend.load()
+    frames = frontend.config.chunk_size
+    stereo = np.column_stack(
+        (
+            np.zeros(frames, dtype=np.float32),
+            np.full(frames, 0.25, dtype=np.float32),
+        )
+    )
+    observed = {}
+
+    class FakeInputStream:
+        def __init__(self, **kwargs):
+            observed.update(kwargs)
+
+        def __enter__(self):
+            observed["callback"](stereo, frames, None, None)
+            return self
+
+        def __exit__(self, *_args):
+            observed["closed"] = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(InputStream=FakeInputStream),
+    )
+    monkeypatch.setattr(frontend, "process_chunk", lambda chunk: chunk)
+
+    stream = frontend.stream_from_microphone()
+    segment = next(stream)
+    stream.close()
+
+    assert np.array_equal(segment, stereo)
+    assert observed["channels"] == 2
+    assert observed["blocksize"] == frames
+    assert observed["closed"] is True
+
+
+def test_microphone_stream_requires_ready_frontend_and_sounddevice(monkeypatch):
+    frontend = AudioFrontend()
+    with pytest.raises(RuntimeError, match="not ready"):
+        next(frontend.stream_from_microphone())
+
+    frontend.load()
+    block_import(monkeypatch, "sounddevice")
+    with pytest.raises(RuntimeError, match="sounddevice"):
+        next(frontend.stream_from_microphone())

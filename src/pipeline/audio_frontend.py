@@ -11,7 +11,8 @@ import math
 from numbers import Integral, Real
 from typing import Optional, Generator
 from dataclasses import dataclass, field
-from collections import deque
+from queue import Empty, Full, Queue
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ MIN_SAMPLE_RATE = 8_000
 MAX_SAMPLE_RATE = 384_000
 WEBRTC_SAMPLE_RATES = {8_000, 16_000, 32_000, 48_000}
 WEBRTC_FRAME_DURATION_MS = 10
+MICROPHONE_MAX_BACKLOG_MS = 2_000
+MICROPHONE_QUEUE_POLL_SECONDS = 0.1
 
 
 def validate_audio_input(audio: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -71,9 +74,11 @@ class AudioConfig:
     vad_aggressiveness: int = 2
     noise_suppression_enabled: bool = False
     silence_duration_ms: int = 800
+    max_segment_duration_seconds: float = 30.0
     # Derived
     chunk_size: int = field(init=False)
     silence_chunks: int = field(init=False)
+    max_segment_samples: int = field(init=False)
 
     def __post_init__(self):
         integer_fields = {
@@ -119,7 +124,27 @@ class AudioConfig:
             or not 0.0 <= self.vad_threshold <= 1.0
         ):
             raise ValueError("vad_threshold must be finite and in [0, 1]")
+        if (
+            isinstance(self.max_segment_duration_seconds, bool)
+            or not isinstance(self.max_segment_duration_seconds, Real)
+            or not math.isfinite(float(self.max_segment_duration_seconds))
+            or float(self.max_segment_duration_seconds) <= 0.0
+        ):
+            raise ValueError(
+                "max_segment_duration_seconds must be finite and positive"
+            )
+        self.max_segment_duration_seconds = float(
+            self.max_segment_duration_seconds
+        )
         self.chunk_size = int(self.sample_rate * self.chunk_duration_ms / 1000)
+        self.max_segment_samples = int(
+            self.sample_rate * self.max_segment_duration_seconds
+        )
+        if self.max_segment_samples < self.chunk_size:
+            raise ValueError(
+                "max_segment_duration_seconds must cover at least one "
+                "configured audio chunk"
+            )
         # A partial chunk still requires one full observation. Rounding down can
         # terminate speech earlier than the configured silence duration.
         self.silence_chunks = max(1, math.ceil(self.silence_duration_ms / self.chunk_duration_ms))
@@ -312,10 +337,21 @@ class AudioFrontend:
         self.denoiser = NoiseSuppressor(
             enabled=self.config.noise_suppression_enabled,
         )
-        self._buffer = deque(maxlen=100)  # Rolling buffer of chunks
+        self._microphone_buffer_capacity_chunks = max(
+            2,
+            math.ceil(
+                MICROPHONE_MAX_BACKLOG_MS / self.config.chunk_duration_ms
+            ),
+        )
+        self._buffer: Queue[np.ndarray] = Queue(
+            maxsize=self._microphone_buffer_capacity_chunks
+        )
+        self._stream_error: Optional[str] = None
+        self._stream_error_lock = Lock()
         self._speech_active = False
         self._silence_count = 0
         self._speech_chunks = []
+        self._speech_sample_count = 0
         self._is_loaded = False
 
     def load(self):
@@ -336,7 +372,95 @@ class AudioFrontend:
             "vad_loaded": self.vad.is_ready,
             "noise_suppression_enabled": self.denoiser.enabled,
             "noise_suppression_loaded": self.denoiser._is_loaded,
+            "microphone_buffer_capacity_chunks": (
+                self._microphone_buffer_capacity_chunks
+            ),
+            "microphone_stream_error": self._stream_error,
         }
+
+    def _record_stream_error(self, message: str) -> None:
+        with self._stream_error_lock:
+            if self._stream_error is None:
+                self._stream_error = message
+
+    def _raise_stream_error(self) -> None:
+        with self._stream_error_lock:
+            message = self._stream_error
+        if message is not None:
+            raise RuntimeError(message)
+
+    def _reset_microphone_stream_state(self) -> None:
+        self._buffer = Queue(maxsize=self._microphone_buffer_capacity_chunks)
+        with self._stream_error_lock:
+            self._stream_error = None
+        self._speech_active = False
+        self._silence_count = 0
+        self._speech_chunks = []
+        self._speech_sample_count = 0
+
+    def _append_speech_chunk(self, chunk: np.ndarray) -> None:
+        next_sample_count = self._speech_sample_count + len(chunk)
+        if next_sample_count > self.config.max_segment_samples:
+            self._speech_active = False
+            self._silence_count = 0
+            self._speech_chunks = []
+            self._speech_sample_count = 0
+            raise RuntimeError(
+                "Speech segment exceeded "
+                f"{self.config.max_segment_duration_seconds:.3f}s; "
+                "refusing unbounded accumulation"
+            )
+        self._speech_chunks.append(chunk)
+        self._speech_sample_count = next_sample_count
+
+    def _enqueue_microphone_chunk(
+        self,
+        indata: np.ndarray,
+        frames: int,
+        status,
+    ) -> None:
+        """Validate a callback chunk and enqueue it without silent eviction."""
+        if status:
+            self._record_stream_error(
+                f"Microphone input reported status: {status}"
+            )
+            return
+        if (
+            isinstance(frames, bool)
+            or not isinstance(frames, Integral)
+            or int(frames) != self.config.chunk_size
+        ):
+            self._record_stream_error(
+                "Microphone frame count does not match configured chunk size"
+            )
+            return
+        try:
+            chunk = np.asarray(indata, dtype=np.float32)
+        except (TypeError, ValueError):
+            self._record_stream_error("Microphone chunk must be numeric")
+            return
+        expected_shape = (self.config.chunk_size, self.config.channels)
+        if chunk.shape != expected_shape:
+            self._record_stream_error(
+                "Microphone chunk shape does not match configured frames/channels"
+            )
+            return
+        if not np.isfinite(chunk).all():
+            self._record_stream_error(
+                "Microphone chunk must contain only finite samples"
+            )
+            return
+        if float(np.max(np.abs(chunk))) > 1.0 + 1e-6:
+            self._record_stream_error(
+                "Microphone chunk must be normalized to [-1, 1]"
+            )
+            return
+        try:
+            self._buffer.put_nowait(np.array(chunk, dtype=np.float32, copy=True))
+        except Full:
+            self._record_stream_error(
+                "Microphone input buffer overflow; refusing silent audio loss"
+            )
 
     def process_chunk(self, raw_chunk: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -355,7 +479,7 @@ class AudioFrontend:
         if is_speech:
             self._speech_active = True
             self._silence_count = 0
-            self._speech_chunks.append(clean_chunk)
+            self._append_speech_chunk(clean_chunk)
             return None  # Still speaking, wait for more
 
         elif self._speech_active:
@@ -364,6 +488,7 @@ class AudioFrontend:
                 # End of speech detected — return complete segment
                 speech_segment = np.concatenate(self._speech_chunks)
                 self._speech_chunks = []
+                self._speech_sample_count = 0
                 self._speech_active = False
                 self._silence_count = 0
                 logger.debug(
@@ -372,7 +497,7 @@ class AudioFrontend:
                 return speech_segment
             else:
                 # Short pause within speech — keep buffering
-                self._speech_chunks.append(clean_chunk)
+                self._append_speech_chunk(clean_chunk)
                 return None
 
         return None  # No speech
@@ -384,22 +509,24 @@ class AudioFrontend:
         Yields:
             Complete speech segments (numpy arrays) as they are detected.
         """
+        if not self.get_status()["ready"]:
+            raise RuntimeError("Audio frontend is not ready; call load() first")
         try:
             import sounddevice as sd
-        except ImportError:
-            logger.error("sounddevice not installed. Cannot stream from microphone.")
-            return
+        except ImportError as exc:
+            raise RuntimeError(
+                "sounddevice is required for microphone streaming"
+            ) from exc
 
         logger.info(
             f"Starting microphone stream "
             f"(SR={self.config.sample_rate}, chunk={self.config.chunk_duration_ms}ms)"
         )
 
-        def audio_callback(indata, frames, time, status):
-            if status:
-                logger.warning(f"Audio stream status: {status}")
-            chunk = indata.astype(np.float32, copy=True)
-            self._buffer.append(chunk)
+        self._reset_microphone_stream_state()
+
+        def audio_callback(indata, frames, _time_info, status):
+            self._enqueue_microphone_chunk(indata, frames, status)
 
         with sd.InputStream(
             samplerate=self.config.sample_rate,
@@ -410,11 +537,15 @@ class AudioFrontend:
         ):
             logger.info("Microphone stream active. Listening...")
             while True:
-                if self._buffer:
-                    chunk = self._buffer.popleft()
-                    segment = self.process_chunk(chunk)
-                    if segment is not None:
-                        yield segment
-                else:
-                    import time
-                    time.sleep(0.01)  # Avoid busy-waiting
+                self._raise_stream_error()
+                try:
+                    chunk = self._buffer.get(
+                        timeout=MICROPHONE_QUEUE_POLL_SECONDS
+                    )
+                except Empty:
+                    self._raise_stream_error()
+                    continue
+                self._raise_stream_error()
+                segment = self.process_chunk(chunk)
+                if segment is not None:
+                    yield segment

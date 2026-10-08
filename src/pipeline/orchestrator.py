@@ -218,6 +218,11 @@ class MediVoicePipeline:
 
         # Initialize pipeline stages
         audio_settings = self.config.get("audio", {})
+        asr_cfg = self.config.get("asr", {})
+        max_input_duration_seconds = asr_cfg.get(
+            "max_input_duration_seconds",
+            30.0,
+        )
         audio_cfg = AudioConfig(
             sample_rate=audio_settings.get("sample_rate", 16000),
             bit_depth=audio_settings.get("bit_depth", 16),
@@ -231,6 +236,7 @@ class MediVoicePipeline:
                 False,
             ),
             silence_duration_ms=audio_settings.get("silence_duration_ms", 800),
+            max_segment_duration_seconds=max_input_duration_seconds,
         )
 
         self.audio_frontend = AudioFrontend(config=audio_cfg)
@@ -238,15 +244,11 @@ class MediVoicePipeline:
         runtime_cfg = self.config.get("runtime", {})
         allow_base_fallback = runtime_cfg.get("allow_base_model_fallback", False)
 
-        asr_cfg = self.config.get("asr", {})
         self.asr_engine = ASREngine(
             vi_model_path=asr_cfg.get("vi", {}).get("model_path", "models/asr/phowhisper-small-medical"),
             en_model_path=asr_cfg.get("en", {}).get("model_path", "models/asr/distil-whisper-en"),
             allow_base_fallback=allow_base_fallback,
-            max_input_duration_seconds=asr_cfg.get(
-                "max_input_duration_seconds",
-                30.0,
-            ),
+            max_input_duration_seconds=max_input_duration_seconds,
             max_new_tokens=asr_cfg.get("max_new_tokens", 225),
         )
 
