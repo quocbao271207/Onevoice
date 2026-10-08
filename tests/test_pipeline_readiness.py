@@ -154,6 +154,15 @@ def test_pipeline_runtime_operations_share_one_critical_section(monkeypatch):
         stop_after_nested_stats,
         raising=False,
     )
+
+    def validate_playback_while_locked(*_args, **_kwargs):
+        assert lock.depth == 1
+
+    monkeypatch.setattr(
+        pipeline,
+        "_validate_playback_result",
+        validate_playback_while_locked,
+    )
     with pytest.raises(ExpectedStop):
         pipeline.play(
             SimpleNamespace(

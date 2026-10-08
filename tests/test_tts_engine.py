@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from src.pipeline.orchestrator import MediVoicePipeline
-from src.pipeline.tts_engine import TTSEngine
+from src.pipeline.tts_engine import TTSEngine, TTSResult
 
 
 class FakeVoice:
@@ -161,52 +161,92 @@ def test_pipeline_audio_sink_rechecks_safety_before_device_dispatch(monkeypatch)
     )
     audio = np.zeros(8, dtype=np.float32)
 
+    def playback_result(**overrides):
+        values = {
+            "asr_text": "Check the pulse",
+            "translated_text": "Kiểm tra mạch",
+            "asr_language": "en",
+            "target_language": "vi",
+            "output_audio": audio,
+            "output_sample_rate": 22_050,
+            "safety_passed": True,
+            "safety_issues": [],
+            "requires_confirmation": False,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
     with pytest.raises(RuntimeError, match="clinical safety gate"):
-        pipeline.play(
-            SimpleNamespace(
-                output_audio=audio,
-                output_sample_rate=22_050,
-                safety_passed=False,
-                requires_confirmation=False,
-            )
-        )
-    with pytest.raises(RuntimeError, match="explicit confirmation"):
-        pipeline.play(
-            SimpleNamespace(
-                output_audio=audio,
-                output_sample_rate=22_050,
-                safety_passed=True,
-                requires_confirmation=True,
-            )
-        )
+        pipeline.play(playback_result(safety_passed=False))
+    with pytest.raises(RuntimeError, match="confirmation state"):
+        pipeline.play(playback_result(requires_confirmation=True))
     with pytest.raises(RuntimeError, match="clinical safety gate"):
+        pipeline.play(playback_result(safety_passed="true"))
+    with pytest.raises(RuntimeError, match="confirmation state"):
+        pipeline.play(playback_result(requires_confirmation="false"))
+    with pytest.raises(RuntimeError, match="no longer matches"):
         pipeline.play(
-            SimpleNamespace(
-                output_audio=audio,
-                output_sample_rate=22_050,
-                safety_passed="true",
-                requires_confirmation=False,
-            )
-        )
-    with pytest.raises(RuntimeError, match="explicit confirmation"):
-        pipeline.play(
-            SimpleNamespace(
-                output_audio=audio,
-                output_sample_rate=22_050,
-                safety_passed=True,
-                requires_confirmation="false",
+            playback_result(
+                asr_text="Give aspirin 5 mg",
+                translated_text="Cho aspirin 50 mg",
             )
         )
 
     assert dispatched == []
-    pipeline.play(
-        SimpleNamespace(
-            output_audio=audio,
-            output_sample_rate=22_050,
-            safety_passed=True,
-            requires_confirmation=False,
-        )
+    pipeline.play(playback_result())
+    assert len(dispatched) == 1
+    assert np.array_equal(dispatched[0][0], audio)
+    assert dispatched[0][1] == 22_050
+
+
+def test_confirmed_clinical_action_is_synthesized_only_after_explicit_consent(
+    monkeypatch,
+):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    audio = np.array([0.0, 0.25], dtype=np.float32)
+    synthesized = TTSResult(
+        audio=audio,
+        sample_rate=22_050,
+        duration_s=len(audio) / 22_050,
+        latency_ms=2.0,
+        rtf=0.1,
+        language="vi",
     )
+    synthesize_calls = []
+    dispatched = []
+    monkeypatch.setattr(
+        pipeline.tts_engine,
+        "synthesize",
+        lambda text, language: (
+            synthesize_calls.append((text, language)) or synthesized
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline.tts_engine,
+        "play_audio",
+        lambda value, rate: dispatched.append((value.copy(), rate)),
+    )
+    result = SimpleNamespace(
+        asr_text="Check the pulse",
+        translated_text="Kiểm tra mạch",
+        asr_language="en",
+        target_language="vi",
+        output_audio=None,
+        output_sample_rate=22_050,
+        safety_passed=True,
+        safety_issues=[],
+        requires_confirmation=True,
+    )
+
+    with pytest.raises(RuntimeError, match="explicit confirmation is required"):
+        pipeline.confirm_and_play(result, confirmed=False)
+    assert synthesize_calls == []
+    assert dispatched == []
+
+    returned = pipeline.confirm_and_play(result, confirmed=True)
+
+    assert returned is synthesized
+    assert synthesize_calls == [("Kiểm tra mạch", "vi")]
     assert len(dispatched) == 1
     assert np.array_equal(dispatched[0][0], audio)
     assert dispatched[0][1] == 22_050

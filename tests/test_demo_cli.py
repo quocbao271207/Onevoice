@@ -9,6 +9,7 @@ from demo.demo_cli import (
     format_translation_for_display,
     load_audio_file,
     print_speech_result,
+    run_file_translation,
     run_interactive,
 )
 
@@ -70,6 +71,58 @@ def test_interactive_cli_displays_blocked_result_before_clean_shutdown(capsys):
     assert "BLOCKED BY CLINICAL SAFETY GATE" in output
     assert "PATIENT_SECRET_UNSAFE_OUTPUT" not in output
     assert "Goodbye" in output
+
+
+@pytest.mark.parametrize(
+    ("operator_input", "expected_confirmations"),
+    [("PLAY", [True]), ("y", [])],
+)
+def test_file_cli_requires_exact_confirmation_before_clinical_playback(
+    operator_input,
+    expected_confirmations,
+    monkeypatch,
+    capsys,
+):
+    result = SimpleNamespace(
+        asr_language="en",
+        asr_text="Check the pulse",
+        target_language="vi",
+        translated_text="Kiểm tra mạch",
+        safety_passed=True,
+        safety_issues=[],
+        total_latency_ms=25.0,
+        overall_rtf=0.25,
+        asr_confidence=0.5,
+        from_cache=True,
+        requires_confirmation=True,
+        output_audio=None,
+    )
+    confirmations = []
+
+    class FakePipeline:
+        def translate_speech(self, *_args, **_kwargs):
+            return result
+
+        def confirm_and_play(self, received, *, confirmed):
+            assert received is result
+            confirmations.append(confirmed)
+
+        def play(self, _result):
+            raise AssertionError("Confirmation-gated audio must not use auto-play")
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: operator_input)
+
+    run_file_translation(
+        FakePipeline(),
+        "unused.wav",
+        "en",
+        prepared_audio=(np.zeros(160, dtype=np.float32), 16_000),
+    )
+
+    assert confirmations == expected_confirmations
+    output = capsys.readouterr().out
+    if operator_input != "PLAY":
+        assert "Playback cancelled" in output
 
 
 def test_cli_audio_preflight_rejects_overlength_before_decode(

@@ -918,21 +918,80 @@ class MediVoicePipeline:
 
         return result
 
-    @_serialized_runtime
-    def play(self, result: PipelineResult):
-        """Play the translated audio output."""
+    def _validate_playback_result(
+        self,
+        result: PipelineResult,
+        *,
+        confirmation_required: bool,
+    ) -> None:
+        """Revalidate text safety and confirmation state at the audio sink."""
         if result.safety_passed is not True:
             raise RuntimeError(
                 "Refusing playback: translation failed clinical safety gate"
             )
-        if result.requires_confirmation is not False:
+        expected_confirmation = True if confirmation_required else False
+        if result.requires_confirmation is not expected_confirmation:
             raise RuntimeError(
-                "Refusing playback: explicit confirmation is required"
+                "Refusing playback: explicit confirmation state is invalid"
             )
+        try:
+            source_text = result.asr_text
+            translated_text = result.translated_text
+            source_language = result.asr_language
+            target_language = result.target_language
+            recorded_issues = result.safety_issues
+        except AttributeError as exc:
+            raise TypeError("Playback requires a complete PipelineResult") from exc
+        if (
+            not isinstance(source_text, str)
+            or not isinstance(translated_text, str)
+            or not isinstance(source_language, str)
+            or not isinstance(target_language, str)
+            or not isinstance(recorded_issues, list)
+        ):
+            raise TypeError("Playback requires a complete PipelineResult")
+        safety = self._translation_safety(
+            source_text,
+            translated_text,
+            source_language,
+            target_language,
+        )
+        if not safety.safe or recorded_issues != safety.issues:
+            raise RuntimeError(
+                "Refusing playback: translation no longer matches clinical safety evidence"
+            )
+
+    @_serialized_runtime
+    def play(self, result: PipelineResult):
+        """Play an automatically approved translated audio output."""
+        self._validate_playback_result(result, confirmation_required=False)
         if result.output_audio is not None:
             self.tts_engine.play_audio(result.output_audio, result.output_sample_rate)
         else:
             logger.warning("No audio to play.")
+
+    @_serialized_runtime
+    def confirm_and_play(
+        self,
+        result: PipelineResult,
+        *,
+        confirmed: bool,
+    ) -> TTSResult:
+        """Synthesize and play a reviewed cache action after explicit consent."""
+        if confirmed is not True:
+            raise RuntimeError("Refusing playback: explicit confirmation is required")
+        self._validate_playback_result(result, confirmation_required=True)
+        if result.output_audio is not None:
+            raise RuntimeError(
+                "Refusing playback: confirmation-gated result already contains audio"
+            )
+        synthesized = self.tts_engine.synthesize(
+            result.translated_text,
+            language=result.target_language,
+        )
+        audio = validate_tts_audio(synthesized.audio, synthesized.sample_rate)
+        self.tts_engine.play_audio(audio, synthesized.sample_rate)
+        return synthesized
 
     @_serialized_runtime
     def translate_text(

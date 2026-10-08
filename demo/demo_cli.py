@@ -237,8 +237,15 @@ def run_file_translation(
 
     print_speech_result(result)
 
-    # Play audio if available
-    if result.output_audio is not None:
+    if result.requires_confirmation and result.safety_passed:
+        confirmation = input(
+            "⚠️  Type PLAY to confirm this clinical action and synthesize audio: "
+        ).strip()
+        if confirmation == "PLAY":
+            pipeline.confirm_and_play(result, confirmed=True)
+        else:
+            print("🔇 Playback cancelled; no audio was synthesized.")
+    elif result.output_audio is not None:
         play = input("🔊 Play translated audio? (y/n): ").strip().lower()
         if play == 'y':
             pipeline.play(result)
