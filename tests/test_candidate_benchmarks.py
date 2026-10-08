@@ -10,8 +10,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import scripts.run_baseline_benchmarks as benchmark
+import scripts.candidate_evidence as candidate_evidence
 import scripts.run_asr_candidate_suite as asr_suite
+import scripts.run_baseline_benchmarks as benchmark
 import scripts.run_mt_candidate_suite as mt_suite
 from scripts.candidate_evidence import (
     archive_evidence,
@@ -591,6 +592,60 @@ def test_candidate_evidence_verification_rejects_duplicate_manifest_paths(tmp_pa
 
     with pytest.raises(ValueError, match="duplicate paths"):
         verify_evidence_archive(archive)
+
+
+def test_candidate_evidence_verification_rejects_duplicate_json_key(
+    tmp_path: Path,
+):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+    _, manifest_path = evidence_sidecars(archive)
+    payload = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        payload.replace(
+            '{\n  "schema_version"',
+            '{\n  "schema_version": 1,\n  "schema_version"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        verify_evidence_archive(archive)
+
+
+def test_candidate_evidence_verification_enforces_archive_byte_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+    monkeypatch.setattr(candidate_evidence, "MAX_EVIDENCE_ARCHIVE_BYTES", 1)
+
+    with pytest.raises(ValueError, match="exceeds 1 bytes"):
+        verify_evidence_archive(archive)
+
+
+def test_candidate_evidence_verification_rejects_linked_archive(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, _ = archive_evidence(output)
+    link = archive.with_name("linked.tar.gz")
+    checksum, manifest = evidence_sidecars(archive)
+    linked_checksum, linked_manifest = evidence_sidecars(link)
+    try:
+        link.symlink_to(archive.name)
+        linked_checksum.symlink_to(checksum.name)
+        linked_manifest.symlink_to(manifest.name)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        verify_evidence_archive(link)
 
 
 def test_legacy_evidence_manifest_is_forensic_and_not_resume_eligible(tmp_path: Path):

@@ -11,6 +11,21 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
+from src.pipeline.evidence_paths import resolve_regular_file_without_links
+from src.pipeline.stable_json import read_stable_json_mapping
+from src.utils.bounded_file import (
+    read_stable_regular_file,
+    sha256_stable_regular_file,
+)
+
+
+MAX_EVIDENCE_ARCHIVE_BYTES = 16_000_000_000
+MAX_EVIDENCE_MANIFEST_BYTES = 100_000_000
+MAX_EVIDENCE_CHECKSUM_BYTES = 4_096
+MAX_EVIDENCE_REPORT_BYTES = 100_000_000
+MAX_EVIDENCE_MEMBERS = 100_000
+MAX_EVIDENCE_CONTENT_BYTES = 64_000_000_000
+
 
 def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     digest = hashlib.sha256()
@@ -57,7 +72,11 @@ def adapter_identity(adapter: Path | None) -> dict[str, Any] | None:
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_stable_json_mapping(
+        path,
+        maximum_bytes=MAX_EVIDENCE_REPORT_BYTES,
+        label="Candidate evidence JSON",
+    ).mapping
 
 
 def evidence_sidecars(archive_path: Path) -> tuple[Path, Path]:
@@ -95,27 +114,42 @@ def _archive_files(output_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _verify_payload(archive_path: Path, expected_files: list[dict[str, Any]]) -> None:
-    paths = [str(item.get("path", "")) for item in expected_files]
-    if len(paths) != len(set(paths)):
-        raise ValueError("Evidence content manifest contains duplicate paths")
-    for item, path in zip(expected_files, paths):
+def _verify_payload(
+    archive_path: Path,
+    expected_files: list[dict[str, Any]],
+) -> int:
+    if len(expected_files) > MAX_EVIDENCE_MEMBERS:
+        raise ValueError("Evidence content manifest has too many files")
+    paths: list[str] = []
+    content_bytes = 0
+    for item in expected_files:
+        if not isinstance(item, dict) or set(item) != {"path", "bytes", "sha256"}:
+            raise ValueError("Invalid evidence content record")
+        path = item.get("path")
+        size = item.get("bytes")
         digest = item.get("sha256")
-        try:
-            size = int(item.get("bytes", -1))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid evidence content size: {path}") from exc
         if (
-            not _safe_member_name(path)
+            not isinstance(path, str)
+            or not _safe_member_name(path)
+            or isinstance(size, bool)
+            or not isinstance(size, int)
             or size < 0
             or not isinstance(digest, str)
             or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest.lower())
+            or any(character not in "0123456789abcdef" for character in digest)
         ):
             raise ValueError(f"Invalid evidence content record: {path!r}")
+        paths.append(path)
+        content_bytes += size
+    if len(paths) != len(set(paths)):
+        raise ValueError("Evidence content manifest contains duplicate paths")
+    if content_bytes > MAX_EVIDENCE_CONTENT_BYTES:
+        raise ValueError("Evidence content manifest exceeds the byte limit")
     expected = {str(item["path"]): item for item in expected_files}
     with tarfile.open(archive_path, "r:gz") as archive:
         members = archive.getmembers()
+        if len(members) > MAX_EVIDENCE_MEMBERS:
+            raise ValueError("Evidence archive has too many members")
         names = [member.name for member in members]
         if len(names) != len(set(names)):
             raise ValueError("Evidence archive contains duplicate member paths")
@@ -123,7 +157,13 @@ def _verify_payload(archive_path: Path, expected_files: list[dict[str, Any]]) ->
             raise ValueError("Evidence archive contains an unsafe or non-file member")
         if set(names) != set(expected):
             raise ValueError("Evidence archive members do not match the content manifest")
+        if sum(member.size for member in members) != content_bytes:
+            raise ValueError("Evidence archive content byte count does not match")
         for member in members:
+            if member.size != int(expected[member.name]["bytes"]):
+                raise ValueError(
+                    f"Evidence archive member size does not match: {member.name}"
+                )
             handle = archive.extractfile(member)
             if handle is None:
                 raise ValueError(f"Cannot read evidence archive member: {member.name}")
@@ -135,33 +175,120 @@ def _verify_payload(archive_path: Path, expected_files: list[dict[str, Any]]) ->
             record = expected[member.name]
             if size != int(record["bytes"]) or member_digest.hexdigest() != record["sha256"]:
                 raise ValueError(f"Evidence archive member verification failed: {member.name}")
+    return content_bytes
 
 
 def verify_evidence_archive(archive_path: Path) -> dict[str, Any]:
     """Verify archive bytes, checksum sidecar, and every manifest member."""
     checksum_path, manifest_path = evidence_sidecars(archive_path)
-    if not archive_path.is_file() or not checksum_path.is_file() or not manifest_path.is_file():
-        raise FileNotFoundError(f"Incomplete evidence bundle for {archive_path}")
-    fields = checksum_path.read_text(encoding="utf-8").split()
+    try:
+        archive_path = resolve_regular_file_without_links(
+            archive_path,
+            label="Evidence archive",
+            maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+        )
+        checksum_path = resolve_regular_file_without_links(
+            checksum_path,
+            label="Evidence checksum sidecar",
+            maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+        )
+        manifest_path = resolve_regular_file_without_links(
+            manifest_path,
+            label="Evidence content manifest",
+            maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+        )
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Incomplete evidence bundle for {archive_path}"
+        ) from None
+    checksum_payload = read_stable_regular_file(
+        checksum_path,
+        maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+        label="Evidence checksum sidecar",
+    )
+    try:
+        fields = checksum_payload.decode("utf-8", errors="strict").split()
+    except UnicodeDecodeError:
+        raise ValueError(f"Invalid evidence checksum sidecar: {checksum_path}") from None
     if len(fields) != 2 or fields[1] != archive_path.name:
         raise ValueError(f"Invalid evidence checksum sidecar: {checksum_path}")
-    digest = sha256(archive_path)
+    digest, archive_bytes = sha256_stable_regular_file(
+        archive_path,
+        maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+        label="Evidence archive",
+    )
     if fields[0].lower() != digest:
         raise ValueError(f"Evidence archive checksum mismatch: {archive_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_document = read_stable_json_mapping(
+        manifest_path,
+        maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+        label="Evidence content manifest",
+    )
+    manifest = manifest_document.mapping
+    if set(manifest) != {
+        "schema_version",
+        "created_at",
+        "archive",
+        "archive_bytes",
+        "archive_sha256",
+        "file_count",
+        "content_bytes",
+        "files",
+    }:
+        raise ValueError(f"Invalid evidence content manifest: {manifest_path}")
+    created_at = manifest.get("created_at")
+    try:
+        created_time = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if not isinstance(created_at, str) or created_time.tzinfo is None:
+            raise ValueError("timezone required")
+    except ValueError:
+        raise ValueError(f"Invalid evidence content manifest: {manifest_path}") from None
     if (
         manifest.get("schema_version") != 1
         or manifest.get("archive") != archive_path.name
-        or int(manifest.get("archive_bytes", -1)) != archive_path.stat().st_size
+        or isinstance(manifest.get("archive_bytes"), bool)
+        or not isinstance(manifest.get("archive_bytes"), int)
+        or manifest.get("archive_bytes") != archive_bytes
         or manifest.get("archive_sha256") != digest
     ):
         raise ValueError(f"Evidence archive metadata mismatch: {manifest_path}")
     files = manifest.get("files")
-    if not isinstance(files, list) or int(manifest.get("file_count", -1)) != len(files):
+    file_count = manifest.get("file_count")
+    content_bytes = manifest.get("content_bytes")
+    if (
+        not isinstance(files, list)
+        or isinstance(file_count, bool)
+        or not isinstance(file_count, int)
+        or file_count != len(files)
+    ):
         raise ValueError(f"Invalid evidence content manifest: {manifest_path}")
-    if int(manifest.get("content_bytes", -1)) != sum(int(item["bytes"]) for item in files):
+    if isinstance(content_bytes, bool) or not isinstance(content_bytes, int):
+        raise ValueError(f"Invalid evidence content manifest: {manifest_path}")
+    verified_content_bytes = _verify_payload(archive_path, files)
+    if content_bytes != verified_content_bytes:
         raise ValueError(f"Evidence content byte count mismatch: {manifest_path}")
-    _verify_payload(archive_path, files)
+    final_digest, final_bytes = sha256_stable_regular_file(
+        archive_path,
+        maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+        label="Evidence archive",
+    )
+    if final_digest != digest or final_bytes != archive_bytes:
+        raise RuntimeError("Evidence archive changed while verifying")
+    final_checksum_payload = read_stable_regular_file(
+        checksum_path,
+        maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+        label="Evidence checksum sidecar",
+    )
+    if final_checksum_payload != checksum_payload:
+        raise RuntimeError("Evidence checksum sidecar changed while verifying")
+    final_manifest = read_stable_json_mapping(
+        manifest_path,
+        maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+        label="Evidence content manifest",
+        expected_sha256=manifest_document.sha256,
+    )
+    if final_manifest.bytes != manifest_document.bytes:
+        raise RuntimeError("Evidence content manifest changed while verifying")
     return manifest
 
 
