@@ -159,3 +159,105 @@ def test_tts_load_does_not_publish_one_language_when_second_fails(
 
     assert engine._voices == {}
     assert engine.is_ready is False
+
+
+def test_asr_load_does_not_publish_vietnamese_when_english_fails(
+    monkeypatch,
+):
+    class FakeModel:
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return None
+
+    class FakeProcessorFactory:
+        @staticmethod
+        def from_pretrained(_path, **_kwargs):
+            return object()
+
+    class FakeModelFactory:
+        @staticmethod
+        def from_pretrained(path, **_kwargs):
+            if path == "en-configured":
+                raise RuntimeError("English ASR failed")
+            return FakeModel()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: False),
+            float16=object(),
+            float32=object(),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoModelForSpeechSeq2Seq=FakeModelFactory,
+            AutoProcessor=FakeProcessorFactory,
+        ),
+    )
+    engine = ASREngine(
+        vi_model_path="vi-configured",
+        en_model_path="en-configured",
+        allow_base_fallback=False,
+    )
+
+    with pytest.raises(RuntimeError, match="configured ASR checkpoint for en"):
+        engine.load()
+
+    assert engine.device == "auto"
+    assert engine.models == {}
+    assert engine.processors == {}
+    assert engine.loaded_model_paths == {}
+    assert engine.is_ready is False
+
+
+def test_mt_load_does_not_publish_model_before_eval_succeeds(monkeypatch):
+    class FailingEvalModel:
+        def eval(self):
+            raise RuntimeError("MT eval failed")
+
+    class FakeTokenizerFactory:
+        @staticmethod
+        def from_pretrained(_path, **_kwargs):
+            return object()
+
+    class FakeModelFactory:
+        @staticmethod
+        def from_pretrained(_path, **_kwargs):
+            return FailingEvalModel()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: False),
+            float16=object(),
+            float32=object(),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoModelForSeq2SeqLM=FakeModelFactory,
+            AutoTokenizer=FakeTokenizerFactory,
+        ),
+    )
+    engine = MTEngine(
+        model_path="mt-configured",
+        allow_base_fallback=False,
+    )
+
+    with pytest.raises(RuntimeError, match="configured MT checkpoint"):
+        engine.load()
+
+    assert engine.device == "auto"
+    assert engine.model is None
+    assert engine.tokenizer is None
+    assert engine.loaded_model_path is None
+    assert engine.is_ready is False

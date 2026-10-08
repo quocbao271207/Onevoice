@@ -187,10 +187,32 @@ class ASREngine:
         import torch
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-        if self.device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        resolved_device = self.device
+        if resolved_device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        logger.info(f"Loading ASR models on device: {self.device}")
+        logger.info(f"Loading ASR models on device: {resolved_device}")
+        staged_processors: Dict[str, object] = {}
+        staged_models: Dict[str, object] = {}
+        staged_model_paths: Dict[str, str] = {}
+
+        def load_candidate(path: str, revision: Optional[str]):
+            processor = AutoProcessor.from_pretrained(
+                path,
+                revision=revision,
+            )
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                path,
+                revision=revision,
+                torch_dtype=(
+                    torch.float16
+                    if resolved_device == "cuda"
+                    else torch.float32
+                ),
+                low_cpu_mem_usage=True,
+            ).to(resolved_device)
+            model.eval()
+            return processor, model
 
         # Try loading fine-tuned models, fall back to base models
         for lang, model_path, fallback in [
@@ -202,15 +224,11 @@ class ASREngine:
             try:
                 logger.info(f"Loading ASR [{lang}] from: {model_path}")
                 revision = BASE_MODEL_REVISIONS.get(model_path)
-                self.processors[lang] = AutoProcessor.from_pretrained(model_path, revision=revision)
-                self.models[lang] = AutoModelForSpeechSeq2Seq.from_pretrained(
+                processor, model = load_candidate(
                     model_path,
-                    revision=revision,
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    low_cpu_mem_usage=True,
-                ).to(self.device)
-                self.models[lang].eval()
-                self.loaded_model_paths[lang] = model_path
+                    revision,
+                )
+                loaded_path = model_path
             except Exception as e:
                 if not self.allow_base_fallback:
                     raise RuntimeError(
@@ -222,16 +240,20 @@ class ASREngine:
                     f"Falling back to: {fallback}"
                 )
                 revision = BASE_MODEL_REVISIONS[fallback]
-                self.processors[lang] = AutoProcessor.from_pretrained(fallback, revision=revision)
-                self.models[lang] = AutoModelForSpeechSeq2Seq.from_pretrained(
+                processor, model = load_candidate(
                     fallback,
-                    revision=revision,
-                    torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                    low_cpu_mem_usage=True,
-                ).to(self.device)
-                self.models[lang].eval()
-                self.loaded_model_paths[lang] = fallback
+                    revision,
+                )
+                loaded_path = fallback
 
+            staged_processors[lang] = processor
+            staged_models[lang] = model
+            staged_model_paths[lang] = loaded_path
+
+        self.device = resolved_device
+        self.processors = staged_processors
+        self.models = staged_models
+        self.loaded_model_paths = staged_model_paths
         self._is_loaded = True
         logger.info("ASR engines loaded successfully (VI + EN)")
 

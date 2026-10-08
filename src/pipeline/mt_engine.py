@@ -278,23 +278,36 @@ class MTEngine:
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        if self.device == "auto":
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        resolved_device = self.device
+        if resolved_device == "auto":
+            resolved_device = "cuda" if torch.cuda.is_available() else "cpu"
 
         logger.info(f"Loading MT model from: {self.model_path}")
+
+        def load_candidate(path: str, revision: Optional[str]):
+            tokenizer = AutoTokenizer.from_pretrained(path, revision=revision)
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                path,
+                revision=revision,
+                torch_dtype=(
+                    torch.float16
+                    if resolved_device == "cuda"
+                    else torch.float32
+                ),
+                low_cpu_mem_usage=True,
+                device_map="auto" if resolved_device == "cuda" else None,
+            )
+            model.eval()
+            return tokenizer, model
 
         try:
             # Try loading fine-tuned model
             revision = NLLB_BASE_REVISION if self.model_path == "facebook/nllb-200-distilled-600M" else None
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, revision=revision)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            tokenizer, model = load_candidate(
                 self.model_path,
-                revision=revision,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                low_cpu_mem_usage=True,
-                device_map="auto" if self.device == "cuda" else None,
+                revision,
             )
-            self.loaded_model_path = self.model_path
+            loaded_model_path = self.model_path
         except Exception as e:
             if not self.allow_base_fallback:
                 raise RuntimeError(
@@ -307,20 +320,18 @@ class MTEngine:
                 f"Failed to load fine-tuned MT model: {e}. "
                 f"Falling back to: {fallback}"
             )
-            self.tokenizer = AutoTokenizer.from_pretrained(fallback, revision=NLLB_BASE_REVISION)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            tokenizer, model = load_candidate(
                 fallback,
-                revision=NLLB_BASE_REVISION,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                low_cpu_mem_usage=True,
-                device_map="auto" if self.device == "cuda" else None,
+                NLLB_BASE_REVISION,
             )
-            self.loaded_model_path = fallback
+            loaded_model_path = fallback
 
-        self.model.eval()
+        param_count = sum(p.numel() for p in model.parameters()) / 1e6
+        self.device = resolved_device
+        self.tokenizer = tokenizer
+        self.model = model
+        self.loaded_model_path = loaded_model_path
         self._is_loaded = True
-
-        param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
         logger.info(f"MT model loaded: {param_count:.0f}M parameters on {self.device}")
 
     def translate(
