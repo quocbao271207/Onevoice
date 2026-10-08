@@ -64,6 +64,7 @@ from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity_sha256,
     selection_policy_record,
 )
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 from src.utils.bounded_file import (  # noqa: E402
     read_stable_regular_file,
     sha256_stable_regular_file,
@@ -804,105 +805,14 @@ def bind_or_validate_invocation(
         raise ValueError("Bake-off invocation changed for the existing state directory")
 
 
-class _UniqueKeySafeLoader(yaml.SafeLoader):
-    def __init__(self, stream):
-        super().__init__(stream)
-        self._composition_depth = 0
-        self._composed_nodes = 0
-
-    def compose_node(self, parent, index):
-        if self.check_event(yaml.AliasEvent):
-            raise yaml.constructor.ConstructorError(
-                None,
-                None,
-                "model-bakeoff config aliases are not allowed",
-                self.peek_event().start_mark,
-            )
-        if self._composition_depth >= MAX_BAKEOFF_CONFIG_DEPTH:
-            raise yaml.constructor.ConstructorError(
-                None,
-                None,
-                "model-bakeoff config nesting is too deep",
-                self.peek_event().start_mark,
-            )
-        if self._composed_nodes >= MAX_BAKEOFF_CONFIG_NODES:
-            raise yaml.constructor.ConstructorError(
-                None,
-                None,
-                "model-bakeoff config contains too many nodes",
-                self.peek_event().start_mark,
-            )
-        self._composition_depth += 1
-        self._composed_nodes += 1
-        try:
-            return super().compose_node(parent, index)
-        finally:
-            self._composition_depth -= 1
-
-
-def _construct_unique_mapping(loader, node, deep=False):
-    mapping = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        try:
-            duplicate = key in mapping
-        except TypeError as exc:
-            raise yaml.constructor.ConstructorError(
-                "while constructing a mapping",
-                node.start_mark,
-                "found an unhashable mapping key",
-                key_node.start_mark,
-            ) from exc
-        if duplicate:
-            raise yaml.constructor.ConstructorError(
-                "while constructing a mapping",
-                node.start_mark,
-                "found a duplicate key",
-                key_node.start_mark,
-            )
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_UniqueKeySafeLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-    _construct_unique_mapping,
-)
-
-
-def _validate_config_tree(value: Any) -> None:
-    if value is None or isinstance(value, (str, bool, int)):
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("Model-bakeoff config contains a non-finite number")
-        return
-    if isinstance(value, dict):
-        if any(not isinstance(key, str) for key in value):
-            raise ValueError("Model-bakeoff config mapping keys must be strings")
-        for item in value.values():
-            _validate_config_tree(item)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _validate_config_tree(item)
-        return
-    raise ValueError("Model-bakeoff config contains an unsupported YAML type")
-
-
 def load_config(path: Path) -> dict[str, Any]:
-    payload = read_stable_regular_file(
+    config = read_stable_yaml_mapping(
         path,
         maximum_bytes=MAX_BAKEOFF_CONFIG_BYTES,
+        maximum_depth=MAX_BAKEOFF_CONFIG_DEPTH,
+        maximum_nodes=MAX_BAKEOFF_CONFIG_NODES,
         label="Model-bakeoff config",
-    )
-    try:
-        config = yaml.load(payload.decode("utf-8"), Loader=_UniqueKeySafeLoader)
-    except (UnicodeDecodeError, yaml.YAMLError, RecursionError):
-        raise ValueError("Model-bakeoff config is not valid strict YAML") from None
-    if not isinstance(config, dict):
-        raise ValueError("Model-bakeoff config root must be a mapping")
-    _validate_config_tree(config)
+    ).mapping
     if config.get("version") != 1:
         raise ValueError("Unsupported model-bakeoff config version")
     return config

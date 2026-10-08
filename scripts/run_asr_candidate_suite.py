@@ -15,8 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -32,6 +30,7 @@ from scripts.run_gpu_rounds import (  # noqa: E402
 )
 from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 
 BASE_MODEL = "vinai/PhoWhisper-small"
@@ -40,6 +39,7 @@ MAX_LOCKED_MANIFEST_BYTES = 250_000_000
 MAX_LOCKED_MANIFEST_LINE_BYTES = 2_000_000
 MAX_LOCKED_MANIFEST_ROWS = 100_000
 MAX_CANDIDATE_GATE_BYTES = 10_000_000
+MAX_CANDIDATE_CONFIG_BYTES = 1_000_000
 
 
 def read_locked_manifest(path: Path, *, label: str):
@@ -56,7 +56,11 @@ def validate_locked_inputs(
     config: dict[str, Any], test_path: Path, safety_path: Path, lock_path: Path
 ) -> dict[str, str]:
     """Verify hashes and prove the clinical suite is an exact test-set subset."""
-    lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+    lock = read_stable_yaml_mapping(
+        lock_path,
+        maximum_bytes=MAX_CANDIDATE_CONFIG_BYTES,
+        label="Candidate artifact lock",
+    ).mapping
     test_document = read_locked_manifest(test_path, label="Locked ASR test manifest")
     safety_document = read_locked_manifest(
         safety_path,
@@ -291,8 +295,16 @@ def main() -> int:
         args.output_dir or ROOT / "data/reports/candidates" / f"asr-vi-{stamp}"
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    utilization_limits = yaml.safe_load(args.resource_config.read_text(encoding="utf-8"))["limits"]
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_CANDIDATE_CONFIG_BYTES,
+        label="Candidate accuracy config",
+    ).mapping
+    utilization_limits = read_stable_yaml_mapping(
+        args.resource_config,
+        maximum_bytes=MAX_CANDIDATE_CONFIG_BYTES,
+        label="Candidate resource config",
+    ).mapping["limits"]
     if float(utilization_limits["gpu_memory_fraction"]) != args.gpu_memory_fraction:
         raise ValueError(
             "Candidate memory fraction must match the centrally configured GPU resource limit"

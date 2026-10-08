@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -31,6 +29,7 @@ from scripts.run_gpu_rounds import (  # noqa: E402
 )
 from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 
 BASE_MODEL = "facebook/nllb-200-distilled-600M"
@@ -40,6 +39,7 @@ MAX_LOCKED_SUITE_BYTES = 250_000_000
 MAX_LOCKED_SUITE_LINE_BYTES = 2_000_000
 MAX_LOCKED_SUITE_ROWS = 100_000
 MAX_CANDIDATE_GATE_BYTES = 10_000_000
+MAX_CANDIDATE_CONFIG_BYTES = 1_000_000
 
 
 def _read_locked_manifest(path: Path, *, label: str):
@@ -58,7 +58,11 @@ def validate_locked_inputs(
     suite_path: Path,
     lock_path: Path,
 ) -> dict[str, str]:
-    lock = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+    lock = read_stable_yaml_mapping(
+        lock_path,
+        maximum_bytes=MAX_CANDIDATE_CONFIG_BYTES,
+        label="Candidate artifact lock",
+    ).mapping
     test_document = _read_locked_manifest(
         test_path,
         label="Locked MT test manifest",
@@ -252,8 +256,16 @@ def main() -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = (args.output_dir or ROOT / "data" / "reports" / "candidates" / f"mt-{stamp}").resolve()
     output_dir.mkdir(parents=True, exist_ok=False)
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    utilization_limits = yaml.safe_load(args.resource_config.read_text(encoding="utf-8"))["limits"]
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_CANDIDATE_CONFIG_BYTES,
+        label="Candidate accuracy config",
+    ).mapping
+    utilization_limits = read_stable_yaml_mapping(
+        args.resource_config,
+        maximum_bytes=MAX_CANDIDATE_CONFIG_BYTES,
+        label="Candidate resource config",
+    ).mapping["limits"]
     if float(utilization_limits["gpu_memory_fraction"]) != args.gpu_memory_fraction:
         raise ValueError(
             "Candidate memory fraction must match the centrally configured GPU resource limit"

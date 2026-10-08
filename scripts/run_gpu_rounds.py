@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -32,11 +30,13 @@ from src.pipeline.durable_file import write_durable_bytes  # noqa: E402
 from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.evidence_paths import is_link_or_junction  # noqa: E402
 from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
+from src.pipeline.stable_yaml import read_stable_yaml_mapping  # noqa: E402
 
 
 MAX_GPU_SUMMARY_BYTES = 10_000_000
 MAX_TRAINING_REPORT_BYTES = 10_000_000
 MAX_ROUND_COMMAND_BYTES = 1_000_000
+MAX_GPU_CONFIG_BYTES = 1_000_000
 
 
 def write_round_summary(path: Path, summary: dict[str, Any]) -> None:
@@ -854,7 +854,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    config = read_stable_yaml_mapping(
+        args.config,
+        maximum_bytes=MAX_GPU_CONFIG_BYTES,
+        label="GPU rounds config",
+    ).mapping
     limits = config["limits"]
     validate_resource_limits(limits)
     task = config["tasks"][args.task]
