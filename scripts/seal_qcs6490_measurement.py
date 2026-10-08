@@ -24,12 +24,19 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.capture_qcs6490_identity import capture_identity
 from scripts.run_model_bakeoff import (
+    MAX_DEPLOYMENT_ARTIFACT_BYTES,
     MAX_DEPLOYMENT_MEASUREMENT_BYTES,
     MAX_IDENTITY_EVIDENCE_BYTES,
     SHA256_RE,
     qcs6490_identity_failures,
-    sha256,
+    read_json_mapping,
 )
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    is_link_or_junction,
+    resolve_regular_file,
+)
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 MIN_MEASUREMENT_RUNS = 30
@@ -54,18 +61,48 @@ STABLE_IDENTITY_FIELDS = (
 )
 
 
-def _load_json(path: Path, *, maximum_bytes: int, label: str) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
-    if path.stat().st_size > maximum_bytes:
-        raise ValueError(f"{label} exceeds {maximum_bytes} bytes")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{label} is not valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"{label} root must be an object")
-    return payload
+def _resolve_regular_input(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.parts[0])
+    for part in absolute.parts[1:]:
+        current /= part
+        if is_link_or_junction(current):
+            raise ValueError(f"{label} cannot traverse a symlink or junction")
+    return resolve_regular_file(
+        absolute,
+        label=label,
+        maximum_bytes=maximum_bytes,
+    )
+
+
+def _load_json(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> tuple[Path, dict[str, Any], str, int]:
+    resolved = _resolve_regular_input(
+        path,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    digest, size = sha256_stable_regular_file(
+        resolved,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    payload = read_json_mapping(
+        resolved,
+        maximum_bytes=maximum_bytes,
+        label=label,
+        expected_sha256=digest,
+    )
+    return resolved, payload, digest, size
 
 
 def _parse_timestamp(value: Any, *, label: str) -> datetime:
@@ -141,7 +178,7 @@ def seal_measurement(
     if not SHA256_RE.fullmatch(adapter_manifest_sha256):
         raise ValueError("adapter_manifest_sha256 is invalid")
 
-    identity = _load_json(
+    identity_path, identity, identity_sha256, _ = _load_json(
         identity_path,
         maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
         label="QCS6490 identity evidence",
@@ -160,11 +197,17 @@ def seal_measurement(
         if live_identity.get(field) != identity.get(field):
             raise ValueError(f"Live board identity differs from evidence: {field}")
 
-    if artifact_path.is_symlink() or not artifact_path.is_file():
-        raise FileNotFoundError(
-            f"Compiled deployment artifact is missing or not regular: {artifact_path}"
-        )
-    raw = _load_json(
+    artifact_path = _resolve_regular_input(
+        artifact_path,
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+        label="Compiled deployment artifact",
+    )
+    artifact_sha256, artifact_bytes = sha256_stable_regular_file(
+        artifact_path,
+        maximum_bytes=MAX_DEPLOYMENT_ARTIFACT_BYTES,
+        label="Compiled deployment artifact",
+    )
+    raw_measurement_path, raw, raw_sha256, _ = _load_json(
         raw_measurement_path,
         maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
         label="Raw QCS6490 measurement",
@@ -228,10 +271,10 @@ def seal_measurement(
         "direction": direction,
         "candidate_id": candidate_id,
         "adapter_manifest_sha256": adapter_manifest_sha256,
-        "identity_evidence_sha256": sha256(identity_path),
-        "artifact_sha256": sha256(artifact_path),
-        "artifact_bytes": artifact_path.stat().st_size,
-        "raw_measurement_sha256": sha256(raw_measurement_path),
+        "identity_evidence_sha256": identity_sha256,
+        "artifact_sha256": artifact_sha256,
+        "artifact_bytes": artifact_bytes,
+        "raw_measurement_sha256": raw_sha256,
         "latency_samples_ms": latency_samples,
         "power_sensor": power_sensor.strip(),
         "power_samples_mw": power_samples,
@@ -251,18 +294,17 @@ def seal_measurement(
 
 
 def write_exclusive(path: Path, payload: dict[str, Any]) -> None:
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite measurement evidence: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
     try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_durable_json_exclusive(
+            path,
+            payload,
+            maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+            label="QCS6490 measurement evidence",
+        )
+    except FileExistsError:
+        raise FileExistsError(
+            f"Refusing to overwrite measurement evidence: {path}"
+        ) from None
 
 
 def main() -> int:

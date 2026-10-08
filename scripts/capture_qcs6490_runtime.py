@@ -30,6 +30,7 @@ from scripts.capture_qcs6490_identity import capture_identity  # noqa: E402
 from scripts.run_model_bakeoff import (  # noqa: E402
     MAX_DEPLOYMENT_MEASUREMENT_BYTES,
 )
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
 
 
 MIN_MEASUREMENT_RUNS = 30
@@ -475,18 +476,15 @@ def capture_runtime(
 
 
 def write_exclusive(path: Path, payload: dict[str, object]) -> None:
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite raw measurement: {path}")
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    if len(serialized.encode("utf-8")) > MAX_DEPLOYMENT_MEASUREMENT_BYTES:
-        raise ValueError("Raw measurement exceeds the deployment evidence size limit")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(serialized, encoding="utf-8")
     try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_durable_json_exclusive(
+            path,
+            payload,
+            maximum_bytes=MAX_DEPLOYMENT_MEASUREMENT_BYTES,
+            label="Raw QCS6490 measurement",
+        )
+    except FileExistsError:
+        raise FileExistsError(f"Refusing to overwrite raw measurement: {path}") from None
 
 
 def main() -> int:

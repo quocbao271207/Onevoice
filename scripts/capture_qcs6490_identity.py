@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import sys
 from datetime import datetime, timezone
@@ -20,7 +19,11 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.run_model_bakeoff import qcs6490_identity_failures  # noqa: E402
+from scripts.run_model_bakeoff import (  # noqa: E402
+    MAX_IDENTITY_EVIDENCE_BYTES,
+    qcs6490_identity_failures,
+)
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
 
 
 DEFAULT_OUTPUT = (
@@ -70,18 +73,17 @@ def capture_identity(
 
 
 def write_exclusive(path: Path, payload: dict[str, Any]) -> None:
-    if path.exists():
-        raise FileExistsError(f"Refusing to overwrite board identity evidence: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
     try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_durable_json_exclusive(
+            path,
+            payload,
+            maximum_bytes=MAX_IDENTITY_EVIDENCE_BYTES,
+            label="QCS6490 identity evidence",
+        )
+    except FileExistsError:
+        raise FileExistsError(
+            f"Refusing to overwrite board identity evidence: {path}"
+        ) from None
 
 
 def main() -> int:

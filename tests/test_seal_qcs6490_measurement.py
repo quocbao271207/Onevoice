@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.seal_qcs6490_measurement as measurement_sealer
 from scripts.prepare_deployment_benchmark import _load_measurement_evidence
 from scripts.run_model_bakeoff import sha256
 from scripts.seal_qcs6490_measurement import (
@@ -152,7 +153,7 @@ def test_sealer_rejects_live_board_identity_mismatch(tmp_path: Path):
     ("overrides", "message"),
     [
         ({"latency_samples_ms": [1.0] * 29}, "at least 30 samples"),
-        ({"power_samples_mw": [1.0] * 29 + [float("nan")]}, "invalid sample"),
+        ({"power_samples_mw": [1.0] * 29 + [float("nan")]}, "strict JSON"),
         ({"temperature_sensor": ""}, "non-empty bounded string"),
         ({"peak_ram_bytes": True}, "must be an integer"),
         ({"captured_at": "2026-10-01T00:00:00+07:00"}, "not from the same session"),
@@ -188,3 +189,58 @@ def test_measurement_writer_is_immutable(tmp_path: Path):
     with pytest.raises(FileExistsError, match="Refusing to overwrite"):
         write_exclusive(output, {"version": 2})
     assert json.loads(output.read_text(encoding="utf-8"))["version"] == 1
+
+
+def test_sealer_rejects_duplicate_identity_fields(tmp_path: Path):
+    identity, artifact, raw, system_root = fixture(tmp_path)
+    identity.write_text(
+        '{"version":1,"capture_source":"linux_sysfs_device_tree",'
+        '"architecture":"aarch64","board_model":"Arduino Uno",'
+        '"board_model":"QCS6490 RB3 Gen 2"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="strict JSON"):
+        seal_measurement(
+            identity_path=identity,
+            artifact_path=artifact,
+            raw_measurement_path=raw,
+            task="asr",
+            direction=None,
+            candidate_id="asr-winner",
+            adapter_manifest_sha256="d" * 64,
+            system_root=system_root,
+            architecture="aarch64",
+            now=NOW,
+        )
+
+
+def test_sealer_caps_compiled_artifact_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    identity, artifact, raw, system_root = fixture(tmp_path)
+    monkeypatch.setattr(measurement_sealer, "MAX_DEPLOYMENT_ARTIFACT_BYTES", 4)
+
+    with pytest.raises(ValueError, match="exceeds 4 bytes"):
+        seal_measurement(
+            identity_path=identity,
+            artifact_path=artifact,
+            raw_measurement_path=raw,
+            task="mt",
+            direction="en_to_vi",
+            candidate_id="mt-winner",
+            adapter_manifest_sha256="e" * 64,
+            system_root=system_root,
+            architecture="aarch64",
+            now=NOW,
+        )
+
+
+def test_measurement_writer_rejects_non_finite_json(tmp_path: Path):
+    output = tmp_path / "measurement.json"
+
+    with pytest.raises(ValueError, match="not serializable"):
+        write_exclusive(output, {"latency_ms": float("nan")})
+
+    assert not output.exists()
