@@ -7,6 +7,7 @@ from src.pipeline.safety_guard import validate_translation
 from src.pipeline.asr_engine import ASREngine
 from src.pipeline.audio_frontend import AudioConfig
 from src.pipeline.orchestrator import MediVoicePipeline
+from src.pipeline.mt_engine import MTEngine, MTResult, NLLB_BASE_REVISION
 from src.utils.text_normalization import normalize_for_wer
 from scripts.merge_manifests import merge_task, source_records
 from scripts.download_datasets import download_dataset, load_registry
@@ -14,7 +15,6 @@ from scripts.qc_local_audio import dedupe_exact_audio, repair_dc_offsets
 from scripts.apply_listening_review import LANGUAGE_BY_SOURCE
 from src.pipeline.flash_cache import FlashCache
 from src.pipeline.asr_engine import BASE_MODEL_REVISIONS
-from src.pipeline.mt_engine import MTEngine, NLLB_BASE_REVISION
 from scripts.smoke_cpu_pipeline import build_base_asr, build_base_mt
 from scripts.aihub_workbench import (
     build_random_calibration,
@@ -158,6 +158,50 @@ def test_pipeline_rejects_invalid_direction_before_cache_lookup():
 
     with pytest.raises(ValueError, match="vi_to_vi"):
         pipeline.translate_text("Tiêm epinephrine ngay!", "vi", "vi")
+
+
+def test_text_only_pipeline_exposes_swapped_drug_dose_safety_failure(monkeypatch):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    monkeypatch.setattr(pipeline.flash_cache, "lookup", lambda *_: None)
+    monkeypatch.setattr(
+        pipeline.mt_engine,
+        "translate",
+        lambda text, source_lang, target_lang: MTResult(
+            source_text=text,
+            translated_text="Dùng aspirin 10 mg và warfarin 5 mg.",
+            source_lang=source_lang,
+            target_lang=target_lang,
+            latency_ms=1.0,
+            first_token_ms=None,
+            tokens_generated=10,
+            from_cache=False,
+        ),
+    )
+
+    result = pipeline.translate_text(
+        "Give aspirin 5 mg and warfarin 10 mg.",
+        "en",
+        "vi",
+    )
+
+    assert not result.safety_passed
+    assert any(
+        issue.startswith("quantity_binding_mismatch")
+        for issue in result.safety_issues
+    )
+
+
+def test_text_only_cache_hit_preserves_confirmation_and_safety_metadata():
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    pipeline.flash_cache.load()
+
+    result = pipeline.translate_text("Tiêm epinephrine ngay!", "vi", "en")
+
+    assert result.from_cache
+    assert result.safety_passed
+    assert result.requires_confirmation
 
 
 def test_wer_normalizer_preserves_vietnamese_diacritics():

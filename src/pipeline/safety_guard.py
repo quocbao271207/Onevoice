@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from collections.abc import Sequence
 from typing import Mapping
@@ -134,21 +134,34 @@ def _canonical_unit(value: str) -> str:
     return UNIT_ALIASES.get(folded, folded.replace("µg", "mcg"))
 
 
-def extract_quantities(text: str) -> list[tuple[str, str]]:
-    """Return number-unit pairs so swapped dosages cannot pass as equal multisets."""
+def _quantity_scan_text(text: str) -> str:
     normalized = re.sub(r"\s*/\s*", "/", text or "")
     normalized = re.sub(r"(?i)\s+per\s+", "/", normalized)
     word_numbers = {**NUMBER_WORDS["en"], **NUMBER_WORDS["vi"]}
-    normalized = re.sub(
+    return re.sub(
         r"\b(?:" + "|".join(map(re.escape, sorted(word_numbers, key=len, reverse=True))) + r")\b",
         lambda match: word_numbers[match.group(0).casefold()],
         normalized,
         flags=re.IGNORECASE,
     )
-    return [
-        (_canonical_number(number), _canonical_unit(unit))
-        for number, unit in QUANTITY_RE.findall(normalized)
+
+
+def _quantity_spans(text: str) -> tuple[str, list[tuple[tuple[str, str], int, int]]]:
+    normalized = _quantity_scan_text(text)
+    return normalized, [
+        (
+            (_canonical_number(match.group(1)), _canonical_unit(match.group(2))),
+            match.start(),
+            match.end(),
+        )
+        for match in QUANTITY_RE.finditer(normalized)
     ]
+
+
+def extract_quantities(text: str) -> list[tuple[str, str]]:
+    """Return number-unit pairs so swapped dosages cannot pass as equal multisets."""
+    _, spans = _quantity_spans(text)
+    return [quantity for quantity, _, _ in spans]
 
 
 def extract_units(text: str) -> list[str]:
@@ -166,6 +179,174 @@ def negation_count(text: str, language: str) -> int:
     if language == "en":
         return len(EN_NEGATION_RE.findall(text or "")) + len(EN_IMPLICIT_NEGATION_RE.findall(text or ""))
     raise ValueError(f"Unsupported language for negation check: {language}")
+
+
+def _phrase_spans(text: str, phrase: str) -> list[tuple[int, int]]:
+    words = [word for word in re.split(r"\s+", phrase.strip()) if word]
+    if not words:
+        return []
+    pattern = re.compile(
+        r"(?<!\w)" + r"\s+".join(re.escape(word) for word in words) + r"(?!\w)",
+        flags=re.IGNORECASE,
+    )
+    return [(match.start(), match.end()) for match in pattern.finditer(text)]
+
+
+def _terminology_anchors(
+    text: str,
+    terminology: Mapping[str, str | Sequence[str]],
+    *,
+    source_side: bool,
+) -> list[tuple[str, int, int]]:
+    anchors: list[tuple[str, int, int]] = []
+    for term, expected in terminology.items():
+        alternatives = [expected] if isinstance(expected, str) else list(expected)
+        phrases = [term] if source_side else alternatives
+        key = term.casefold()
+        for phrase in phrases:
+            if not isinstance(phrase, str):
+                continue
+            anchors.extend(
+                (key, start, end) for start, end in _phrase_spans(text, phrase)
+            )
+    return anchors
+
+
+def _span_distance(start: int, end: int, anchor_start: int, anchor_end: int) -> int:
+    if end <= anchor_start:
+        return anchor_start - end
+    if anchor_end <= start:
+        return start - anchor_end
+    return 0
+
+
+def _quantity_bindings(
+    spans: list[tuple[tuple[str, str], int, int]],
+    anchors: list[tuple[str, int, int]],
+) -> tuple[dict[str, Counter[tuple[str, str]]], bool]:
+    bindings: defaultdict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
+    ambiguous = False
+    for quantity, start, end in spans:
+        if not anchors:
+            break
+        distances = [
+            (_span_distance(start, end, anchor_start, anchor_end), key)
+            for key, anchor_start, anchor_end in anchors
+        ]
+        minimum = min(distance for distance, _ in distances)
+        nearest_keys = {key for distance, key in distances if distance == minimum}
+        if len(nearest_keys) != 1:
+            ambiguous = True
+            continue
+        bindings[next(iter(nearest_keys))][quantity] += 1
+    return dict(bindings), ambiguous
+
+
+def _negation_spans(text: str, language: str) -> list[tuple[int, int]]:
+    if language == "vi":
+        patterns = (VI_NEGATION_RE, VI_IMPLICIT_NEGATION_RE)
+    elif language == "en":
+        patterns = (EN_NEGATION_RE, EN_IMPLICIT_NEGATION_RE)
+    else:
+        raise ValueError(f"Unsupported language for negation check: {language}")
+    spans = {
+        (match.start(), match.end())
+        for pattern in patterns
+        for match in pattern.finditer(text or "")
+    }
+    return sorted(spans)
+
+
+def _clause_spans(text: str) -> list[tuple[int, int]]:
+    """Return strong scope boundaries without splitting ordinary drug lists."""
+    boundaries = re.compile(r"[.;!?]+|\b(?:but|nhưng)\b", flags=re.IGNORECASE)
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in boundaries.finditer(text):
+        if start < match.start():
+            spans.append((start, match.start()))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans or [(0, len(text))]
+
+
+def _negation_bindings(
+    text: str,
+    language: str,
+    anchors: list[tuple[str, int, int]],
+) -> Counter[str]:
+    clauses = _clause_spans(text)
+    negations = _negation_spans(text, language)
+    clause_negations = [
+        sum(start <= negation_start < end for negation_start, _ in negations)
+        for start, end in clauses
+    ]
+    clauses_by_term: defaultdict[str, set[int]] = defaultdict(set)
+    for key, anchor_start, _ in anchors:
+        for index, (start, end) in enumerate(clauses):
+            if start <= anchor_start < end:
+                clauses_by_term[key].add(index)
+                break
+    return Counter(
+        {
+            key: sum(clause_negations[index] for index in indices)
+            for key, indices in clauses_by_term.items()
+        }
+    )
+
+
+def _terminology_binding_issues(
+    source: str,
+    target: str,
+    source_lang: str,
+    target_lang: str,
+    terminology: Mapping[str, str | Sequence[str]],
+) -> list[str]:
+    source_quantity_text, source_quantity_spans = _quantity_spans(source)
+    target_quantity_text, target_quantity_spans = _quantity_spans(target)
+    source_quantity_anchors = _terminology_anchors(
+        source_quantity_text, terminology, source_side=True
+    )
+    target_quantity_anchors = _terminology_anchors(
+        target_quantity_text, terminology, source_side=False
+    )
+    source_quantities, source_ambiguous = _quantity_bindings(
+        source_quantity_spans, source_quantity_anchors
+    )
+    target_quantities, target_ambiguous = _quantity_bindings(
+        target_quantity_spans, target_quantity_anchors
+    )
+
+    issues: list[str] = []
+    if source_ambiguous or target_ambiguous:
+        issues.append("quantity_binding_ambiguous")
+    quantity_keys = {key for key, _, _ in source_quantity_anchors} & {
+        key for key, _, _ in target_quantity_anchors
+    }
+    for key in sorted(quantity_keys):
+        source_values = source_quantities.get(key, Counter())
+        target_values = target_quantities.get(key, Counter())
+        if source_values != target_values:
+            issues.append(
+                f"quantity_binding_mismatch:{key}:"
+                f"{list(source_values.elements())}->{list(target_values.elements())}"
+            )
+
+    source_anchors = _terminology_anchors(source, terminology, source_side=True)
+    target_anchors = _terminology_anchors(target, terminology, source_side=False)
+    source_negations = _negation_bindings(source, source_lang, source_anchors)
+    target_negations = _negation_bindings(target, target_lang, target_anchors)
+    negation_keys = {key for key, _, _ in source_anchors} & {
+        key for key, _, _ in target_anchors
+    }
+    for key in sorted(negation_keys):
+        if source_negations[key] != target_negations[key]:
+            issues.append(
+                f"negation_binding_mismatch:{key}:"
+                f"{source_negations[key]}->{target_negations[key]}"
+            )
+    return issues
 
 
 @dataclass
@@ -209,6 +390,17 @@ def validate_translation(
     target_negations = negation_count(target, target_lang)
     if source_negations != target_negations:
         issues.append("negation_mismatch")
+
+    if terminology:
+        issues.extend(
+            _terminology_binding_issues(
+                source,
+                target,
+                source_lang,
+                target_lang,
+                terminology,
+            )
+        )
 
     source_folded = source.casefold()
     target_folded = target.casefold()

@@ -16,6 +16,7 @@ from scripts.evaluate_benchmarks import (
 )
 from scripts.run_baseline_benchmarks import asr_prediction_slices
 from src.pipeline.safety_guard import extract_quantities, negation_count, validate_translation
+from src.pipeline.mt_engine import MedicalLexicon
 from src.training.clinical_sampling import (
     clinical_risk_tags,
     oversample_clinical_rows,
@@ -109,6 +110,57 @@ def test_terminology_allows_reviewed_aliases_but_fails_missing_drug():
     assert any(issue.startswith("terminology_missing") for issue in unsafe.issues)
 
 
+def test_safety_guard_binds_each_dose_to_the_correct_drug_after_reordering():
+    terminology = {"aspirin": "aspirin", "warfarin": "warfarin"}
+    safe = validate_translation(
+        "Give aspirin 5 mg and warfarin 10 mg.",
+        "Dùng warfarin 10 mg và aspirin 5 mg.",
+        "en",
+        "vi",
+        terminology=terminology,
+    )
+    swapped = validate_translation(
+        "Give aspirin 5 mg and warfarin 10 mg.",
+        "Dùng aspirin 10 mg và warfarin 5 mg.",
+        "en",
+        "vi",
+        terminology=terminology,
+    )
+
+    assert safe.safe
+    assert not swapped.safe
+    assert any(issue.startswith("quantity_binding_mismatch") for issue in swapped.issues)
+
+
+def test_safety_guard_binds_negation_to_the_correct_drug():
+    terminology = {"aspirin": "aspirin", "warfarin": "warfarin"}
+    result = validate_translation(
+        "Do not give aspirin; start warfarin.",
+        "Dùng aspirin; không bắt đầu warfarin.",
+        "en",
+        "vi",
+        terminology=terminology,
+    )
+
+    assert not result.safe
+    assert any(issue.startswith("negation_binding_mismatch") for issue in result.issues)
+
+
+def test_runtime_lexicon_covers_locked_clinical_drugs():
+    lexicon = MedicalLexicon()
+    required = {
+        "amoxicillin",
+        "aspirin",
+        "heparin",
+        "insulin",
+        "metformin",
+        "morphine",
+        "paracetamol",
+        "warfarin",
+    }
+    assert required <= set(lexicon.en_to_vi)
+
+
 def test_locked_safety_suite_has_every_required_slice_and_unique_ids():
     rows = read_jsonl(SAFETY_SUITE)
     required = {"drug_name", "dose", "number", "unit", "negation", "terminology", "code_switch"}
@@ -116,6 +168,23 @@ def test_locked_safety_suite_has_every_required_slice_and_unique_ids():
     assert required <= categories
     assert len(rows) >= 16
     assert len({row["id"] for row in rows}) == len(rows)
+
+
+def test_locked_safety_references_pass_guard_in_both_directions():
+    for row in read_jsonl(SAFETY_SUITE):
+        for direction, source_key, target_key in (
+            ("en_to_vi", "source_text", "target_text"),
+            ("vi_to_en", "target_text", "source_text"),
+        ):
+            source_lang, target_lang = direction.split("_to_")
+            result = validate_translation(
+                row[source_key],
+                row[target_key],
+                source_lang,
+                target_lang,
+                terminology=row["terminology"][direction],
+            )
+            assert result.safe, (row["id"], direction, result.issues)
 
 
 def test_locked_safety_suite_checksum_matches_artifact_lock():
@@ -250,6 +319,39 @@ def test_mt_report_exposes_category_gates():
     report = score_mt([prediction])
     assert report["clinical_safety_gate"]["pass"]
     assert report["categories"]["drug_name"]["safety_failure_rate"] == 0.0
+
+
+def test_mt_category_gates_fail_swapped_doses_and_negation_scope():
+    report = score_mt(
+        [
+            {
+                "id": "swapped-dose",
+                "direction": "en_to_vi",
+                "source": "Give aspirin 5 mg and warfarin 10 mg.",
+                "reference": "Dùng aspirin 5 mg và warfarin 10 mg.",
+                "hypothesis": "Dùng aspirin 10 mg và warfarin 5 mg.",
+                "categories": ["drug_name", "dose", "number", "unit"],
+                "terminology": {
+                    "en_to_vi": {"aspirin": "aspirin", "warfarin": "warfarin"}
+                },
+            },
+            {
+                "id": "swapped-negation",
+                "direction": "en_to_vi",
+                "source": "Do not give aspirin; start warfarin.",
+                "reference": "Không dùng aspirin; bắt đầu warfarin.",
+                "hypothesis": "Dùng aspirin; không bắt đầu warfarin.",
+                "categories": ["drug_name", "negation"],
+                "terminology": {
+                    "en_to_vi": {"aspirin": "aspirin", "warfarin": "warfarin"}
+                },
+            },
+        ]
+    )
+
+    assert report["categories"]["dose"]["safety_failure_rate"] == 1.0
+    assert report["categories"]["negation"]["safety_failure_rate"] == 1.0
+    assert not report["clinical_safety_gate"]["pass"]
 
 
 def test_mt_bootstrap_precomputed_statistics_match_full_rescoring():

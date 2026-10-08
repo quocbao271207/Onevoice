@@ -15,7 +15,7 @@ import logging
 import time
 import json
 from typing import Optional, Dict, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,9 @@ class MTResult:
     first_token_ms: Optional[float]  # None until streaming generation is instrumented
     tokens_generated: int
     from_cache: bool        # True if served from flash cache
+    safety_passed: bool = True
+    safety_issues: List[str] = field(default_factory=list)
+    requires_confirmation: bool = False
 
 
 NLLB_LANG_CODES = {"vi": "vie_Latn", "en": "eng_Latn"}
@@ -86,6 +89,15 @@ class MedicalLexicon:
             "dịch truyền": "IV fluids",
             "epinephrine": "epinephrine",
             "adrenaline": "adrenaline",
+            "amoxicillin": "amoxicillin",
+            "aspirin": "aspirin",
+            "heparin": "heparin",
+            "insulin": "insulin",
+            "metformin": "metformin",
+            "morphine": "morphine",
+            "paracetamol": "paracetamol",
+            "warfarin": "warfarin",
+            "nước muối": "saline",
         }
         self.vi_to_en = critical_terms
         self.en_to_vi = {v: k for k, v in critical_terms.items()}

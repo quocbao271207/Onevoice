@@ -312,10 +312,16 @@ def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
     overall = score(rows)
     category_issue_prefixes = {
         "drug_name": {"terminology_missing"},
-        "dose": {"number_mismatch", "unit_mismatch", "quantity_mismatch"},
+        "dose": {
+            "number_mismatch",
+            "unit_mismatch",
+            "quantity_mismatch",
+            "quantity_binding_ambiguous",
+            "quantity_binding_mismatch",
+        },
         "number": {"number_mismatch"},
         "unit": {"unit_mismatch", "quantity_mismatch"},
-        "negation": {"negation_mismatch"},
+        "negation": {"negation_mismatch", "negation_binding_mismatch"},
         "terminology": {"terminology_missing"},
         "code_switch": {"identifier_mismatch", "terminology_missing"},
     }

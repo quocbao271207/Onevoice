@@ -157,6 +157,26 @@ class MediVoicePipeline:
             raise ValueError(f"Unsupported translation direction: {source_lang}_to_{resolved}")
         return resolved
 
+    def _translation_safety(
+        self,
+        source: str,
+        target: str,
+        source_lang: str,
+        target_lang: str,
+    ):
+        terminology = (
+            self.mt_engine.lexicon.vi_to_en
+            if source_lang == "vi"
+            else self.mt_engine.lexicon.en_to_vi
+        )
+        return validate_translation(
+            source,
+            target,
+            source_lang,
+            target_lang,
+            terminology,
+        )
+
     def load(self):
         """
         Load all pipeline components.
@@ -284,12 +304,11 @@ class MediVoicePipeline:
 
             # Use pre-synthesized audio if available
             if cached.audio is not None and not skip_tts:
-                safety = validate_translation(
+                safety = self._translation_safety(
                     asr_result.text,
                     translated_text,
                     asr_result.language,
                     target_lang,
-                    self.mt_engine.lexicon.vi_to_en if asr_result.language == "vi" else self.mt_engine.lexicon.en_to_vi,
                 )
                 if not safety.safe:
                     logger.error("Translation safety guard blocked cached TTS: %s", safety.issues)
@@ -342,12 +361,11 @@ class MediVoicePipeline:
         tts_latency = 0.0
         tts_rtf = 0.0
 
-        safety = validate_translation(
+        safety = self._translation_safety(
             asr_result.text,
             translated_text,
             asr_result.language,
             target_lang,
-            self.mt_engine.lexicon.vi_to_en if asr_result.language == "vi" else self.mt_engine.lexicon.en_to_vi,
         )
         if not safety.safe:
             logger.error("Translation safety guard blocked TTS: %s", safety.issues)
@@ -437,7 +455,7 @@ class MediVoicePipeline:
         # Check flash cache first
         cached = self.flash_cache.lookup(text, source_lang)
         if cached:
-            return MTResult(
+            result = MTResult(
                 source_text=text,
                 translated_text=cached.translated_text,
                 source_lang=source_lang,
@@ -446,9 +464,20 @@ class MediVoicePipeline:
                 first_token_ms=None,
                 tokens_generated=0,
                 from_cache=True,
+                requires_confirmation=cached.requires_confirmation,
             )
+        else:
+            result = self.mt_engine.translate(text, source_lang, target_lang)
 
-        return self.mt_engine.translate(text, source_lang, target_lang)
+        safety = self._translation_safety(
+            text,
+            result.translated_text,
+            source_lang,
+            target_lang,
+        )
+        result.safety_passed = safety.safe
+        result.safety_issues = safety.issues
+        return result
 
     def run_interactive(self):
         """
