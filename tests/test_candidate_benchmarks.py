@@ -567,6 +567,98 @@ def test_candidate_evidence_bundle_has_verified_content_manifest(tmp_path: Path)
     }
 
 
+def test_candidate_evidence_archive_is_idempotent_and_bound_to_live_tree(
+    tmp_path: Path,
+):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    gate = output / "candidate_gate.json"
+    gate.write_text('{"status":"pass"}', encoding="utf-8")
+
+    first_archive, first_digest = archive_evidence(output)
+    first_bytes = first_archive.read_bytes()
+    second_archive, second_digest = archive_evidence(output)
+
+    assert second_archive == first_archive
+    assert second_digest == first_digest
+    assert second_archive.read_bytes() == first_bytes
+
+    gate.write_text('{"status":"fail"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match live contents"):
+        archive_evidence(output)
+    assert first_archive.read_bytes() == first_bytes
+
+
+def test_candidate_evidence_recovers_missing_manifest_without_replacing_archive(
+    tmp_path: Path,
+):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive, digest = archive_evidence(output)
+    original_archive = archive.read_bytes()
+    _, manifest_path = evidence_sidecars(archive)
+    manifest_path.unlink()
+
+    recovered_archive, recovered_digest = archive_evidence(output)
+
+    assert recovered_archive == archive
+    assert recovered_digest == digest
+    assert archive.read_bytes() == original_archive
+    assert verify_evidence_archive(archive)["file_count"] == 1
+
+
+def test_candidate_evidence_refuses_to_replace_preexisting_archive(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    archive = output.with_suffix(".tar.gz")
+    archive.write_bytes(b"preexisting-untrusted-archive")
+
+    with pytest.raises((tarfile.ReadError, ValueError)):
+        archive_evidence(output)
+
+    assert archive.read_bytes() == b"preexisting-untrusted-archive"
+
+
+def test_candidate_evidence_detects_live_tree_change_during_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    gate = output / "candidate_gate.json"
+    gate.write_text('{"status":"pass"}', encoding="utf-8")
+    original_archive_files = candidate_evidence._archive_files
+    calls = 0
+
+    def mutating_archive_files(path: Path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            gate.write_text('{"status":"changed"}', encoding="utf-8")
+        return original_archive_files(path)
+
+    monkeypatch.setattr(candidate_evidence, "_archive_files", mutating_archive_files)
+
+    with pytest.raises(RuntimeError, match="changed while archiving"):
+        archive_evidence(output)
+
+
+def test_candidate_evidence_rejects_linked_source_directory(tmp_path: Path):
+    output = tmp_path / "candidate"
+    output.mkdir()
+    (output / "candidate_gate.json").write_text('{"status":"pass"}', encoding="utf-8")
+    link = tmp_path / "linked-candidate"
+    try:
+        link.symlink_to(output, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        archive_evidence(link)
+
+
 def test_candidate_evidence_verification_rejects_tampered_archive(tmp_path: Path):
     output = tmp_path / "candidate"
     output.mkdir()

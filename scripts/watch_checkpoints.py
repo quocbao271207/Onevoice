@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
 import sys
-import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,7 +16,19 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.candidate_evidence import evidence_sidecars, verify_evidence_archive  # noqa: E402
+from scripts.candidate_evidence import (  # noqa: E402
+    MAX_EVIDENCE_ARCHIVE_BYTES,
+    MAX_EVIDENCE_CONTENT_BYTES,
+    MAX_EVIDENCE_MEMBERS,
+    archive_evidence,
+    evidence_sidecars,
+    sha256,
+    verify_evidence_archive,
+)
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.evidence_paths import is_link_or_junction  # noqa: E402
+from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 CHECKPOINT_PATTERN = re.compile(r"checkpoint-(\d+)")
@@ -29,14 +39,8 @@ REQUIRED_TRAINER_FILES = {
     "rng_state.pth",
 }
 MODEL_FILES = {"adapter_model.safetensors", "model.safetensors", "pytorch_model.bin"}
-
-
-def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
+MAX_TRAINER_STATE_BYTES = 10_000_000
+MAX_CHECKPOINT_INDEX_BYTES = 100_000_000
 
 
 def checkpoint_step(path: Path) -> int | None:
@@ -46,75 +50,70 @@ def checkpoint_step(path: Path) -> int | None:
 
 def completed_checkpoint(path: Path) -> tuple[int, dict[str, Any]] | None:
     step = checkpoint_step(path)
-    if step is None or not path.is_dir():
+    if step is None or is_link_or_junction(path) or not path.is_dir():
         return None
-    names = {item.name for item in path.iterdir() if item.is_file()}
+    entries = list(path.iterdir())
+    if any(is_link_or_junction(item) for item in entries):
+        return None
+    names = {item.name for item in entries if item.is_file()}
     if not REQUIRED_TRAINER_FILES <= names or not MODEL_FILES & names:
         return None
     try:
-        trainer_state = json.loads((path / "trainer_state.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        trainer_state = read_stable_json_mapping(
+            path / "trainer_state.json",
+            maximum_bytes=MAX_TRAINER_STATE_BYTES,
+            label="Trainer checkpoint state",
+        ).mapping
+    except (FileNotFoundError, RuntimeError, ValueError):
         return None
-    if int(trainer_state.get("global_step", -1)) != step:
+    global_step = trainer_state.get("global_step")
+    if isinstance(global_step, bool) or not isinstance(global_step, int):
+        return None
+    if global_step != step:
         return None
     return step, trainer_state
 
 
 def verified_existing_archive(archive_path: Path, checksum_path: Path) -> bool:
-    if not archive_path.is_file() or not checksum_path.is_file():
+    expected_checksum, _ = evidence_sidecars(archive_path)
+    if Path(os.path.abspath(checksum_path)) != Path(os.path.abspath(expected_checksum)):
         return False
-    fields = checksum_path.read_text(encoding="utf-8").split()
-    return len(fields) >= 2 and fields[0].lower() == sha256(archive_path)
+    try:
+        verify_evidence_archive(archive_path)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+    return True
 
 
 def checkpoint_file_records(checkpoint: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    content_bytes = 0
     for path in sorted(checkpoint.rglob("*")):
-        if path.is_symlink():
+        if is_link_or_junction(path):
             raise ValueError(f"Checkpoint cannot contain symlinks: {path}")
         if not path.is_file():
             continue
+        digest, size = sha256_stable_regular_file(
+            path,
+            maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+            label="Checkpoint file",
+        )
         records.append(
             {
                 "path": (Path(checkpoint.name) / path.relative_to(checkpoint)).as_posix(),
-                "bytes": path.stat().st_size,
-                "sha256": sha256(path),
+                "bytes": size,
+                "sha256": digest,
                 "source": path,
             }
         )
+        content_bytes += size
+        if len(records) > MAX_EVIDENCE_MEMBERS:
+            raise ValueError("Checkpoint has too many files")
+        if content_bytes > MAX_EVIDENCE_CONTENT_BYTES:
+            raise ValueError("Checkpoint exceeds the content byte limit")
     if not records:
         raise ValueError(f"Checkpoint is empty: {checkpoint}")
     return records
-
-
-def write_atomic(path: Path, content: str) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def ensure_content_manifest(
-    archive_path: Path,
-    records: list[dict[str, Any]],
-) -> tuple[Path, dict[str, Any]]:
-    _, manifest_path = evidence_sidecars(archive_path)
-    if manifest_path.is_file():
-        return manifest_path, verify_evidence_archive(archive_path)
-    public_records = [
-        {key: record[key] for key in ("path", "bytes", "sha256")} for record in records
-    ]
-    manifest = {
-        "schema_version": 1,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "archive": archive_path.name,
-        "archive_bytes": archive_path.stat().st_size,
-        "archive_sha256": sha256(archive_path),
-        "file_count": len(public_records),
-        "content_bytes": sum(int(record["bytes"]) for record in public_records),
-        "files": public_records,
-    }
-    write_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-    return manifest_path, verify_evidence_archive(archive_path)
 
 
 def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
@@ -124,44 +123,22 @@ def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
     step, trainer_state = complete
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / f"{checkpoint.name}.tar.gz"
-    checksum_path = archive_dir / f"{checkpoint.name}.tar.gz.sha256"
-    records = checkpoint_file_records(checkpoint)
-    if verified_existing_archive(archive_path, checksum_path):
-        manifest_path, manifest = ensure_content_manifest(archive_path, records)
-        return {
-            "step": step,
-            "checkpoint": str(checkpoint.resolve()),
-            "archive": str(archive_path.resolve()),
-            "bytes": archive_path.stat().st_size,
-            "sha256": checksum_path.read_text(encoding="utf-8").split()[0].lower(),
-            "manifest": str(manifest_path.resolve()),
-            "manifest_bytes": manifest_path.stat().st_size,
-            "manifest_sha256": sha256(manifest_path),
-            "file_count": int(manifest["file_count"]),
-            "content_bytes": int(manifest["content_bytes"]),
-            "eval_loss": next(
-                (
-                    float(item["eval_loss"])
-                    for item in reversed(trainer_state.get("log_history", []))
-                    if "eval_loss" in item
-                ),
-                None,
-            ),
-            "status": "already_verified",
-        }
-
-    temporary = archive_dir / f".{checkpoint.name}.tar.gz.part"
-    temporary.unlink(missing_ok=True)
-    try:
-        with tarfile.open(temporary, "w:gz") as archive:
-            for record in records:
-                archive.add(record["source"], arcname=record["path"], recursive=False)
-        os.replace(temporary, archive_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    digest = sha256(archive_path)
-    write_atomic(checksum_path, f"{digest}  {archive_path.name}\n")
-    manifest_path, manifest = ensure_content_manifest(archive_path, records)
+    preexisting_archive = archive_path.exists() or is_link_or_junction(archive_path)
+    archive_path, digest = archive_evidence(checkpoint, archive_path)
+    _, manifest_path = evidence_sidecars(archive_path)
+    manifest = verify_evidence_archive(archive_path)
+    archive_digest, archive_bytes = sha256_stable_regular_file(
+        archive_path,
+        maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+        label="Checkpoint archive",
+    )
+    if archive_digest != digest:
+        raise RuntimeError("Checkpoint archive changed after publication")
+    manifest_digest, manifest_bytes = sha256_stable_regular_file(
+        manifest_path,
+        maximum_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+        label="Checkpoint content manifest",
+    )
     eval_loss = next(
         (
             float(item["eval_loss"])
@@ -173,16 +150,16 @@ def archive_checkpoint(checkpoint: Path, archive_dir: Path) -> dict[str, Any]:
     return {
         "step": step,
         "checkpoint": str(checkpoint.resolve()),
-        "archive": str(archive_path.resolve()),
-        "bytes": archive_path.stat().st_size,
+        "archive": str(archive_path),
+        "bytes": archive_bytes,
         "sha256": digest,
-        "manifest": str(manifest_path.resolve()),
-        "manifest_bytes": manifest_path.stat().st_size,
-        "manifest_sha256": sha256(manifest_path),
+        "manifest": str(manifest_path.resolve(strict=True)),
+        "manifest_bytes": manifest_bytes,
+        "manifest_sha256": manifest_digest,
         "file_count": int(manifest["file_count"]),
         "content_bytes": int(manifest["content_bytes"]),
         "eval_loss": eval_loss,
-        "status": "archived",
+        "status": "already_verified" if preexisting_archive else "archived",
     }
 
 
@@ -190,20 +167,38 @@ def write_manifest(archive_dir: Path, records: list[dict[str, Any]]) -> None:
     manifest_path = archive_dir / "checkpoint_archives.json"
     existing: dict[int, dict[str, Any]] = {}
     if manifest_path.is_file():
-        try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            existing = {int(item["step"]): item for item in payload.get("checkpoints", [])}
-        except (OSError, ValueError, json.JSONDecodeError):
-            existing = {}
+        payload = read_stable_json_mapping(
+            manifest_path,
+            maximum_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+            label="Checkpoint archive index",
+        ).mapping
+        checkpoints = payload.get("checkpoints")
+        if set(payload) != {"updated_at", "checkpoints"} or not isinstance(
+            checkpoints,
+            list,
+        ):
+            raise ValueError("Checkpoint archive index has an invalid schema")
+        for item in checkpoints:
+            if not isinstance(item, dict):
+                raise ValueError("Checkpoint archive index has an invalid record")
+            step = item.get("step")
+            if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+                raise ValueError("Checkpoint archive index has an invalid step")
+            if step in existing:
+                raise ValueError("Checkpoint archive index has duplicate steps")
+            existing[step] = item
     for record in records:
         existing[int(record["step"])] = record
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoints": [existing[step] for step in sorted(existing)],
     }
-    temporary = manifest_path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, manifest_path)
+    write_durable_json(
+        manifest_path,
+        payload,
+        maximum_bytes=MAX_CHECKPOINT_INDEX_BYTES,
+        label="Checkpoint archive index",
+    )
 
 
 def archive_ready_checkpoints(

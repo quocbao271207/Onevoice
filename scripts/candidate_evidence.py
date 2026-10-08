@@ -6,12 +6,23 @@ import hashlib
 import json
 import os
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
-from src.pipeline.evidence_paths import resolve_regular_file_without_links
+from src.pipeline.durable_file import (  # noqa: E402
+    publish_durable_file_exclusive,
+    write_durable_bytes_exclusive,
+)
+from src.pipeline.durable_json import write_durable_json_exclusive  # noqa: E402
+from src.pipeline.evidence_paths import (  # noqa: E402
+    is_link_or_junction,
+    prepare_new_file_destination_without_links,
+    resolve_regular_directory_without_links,
+    resolve_regular_file_without_links,
+)
 from src.pipeline.stable_json import read_stable_json_mapping
 from src.utils.bounded_file import (
     read_stable_regular_file,
@@ -93,25 +104,51 @@ def _safe_member_name(name: str) -> bool:
 
 def _archive_files(output_dir: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    content_bytes = 0
     for path in sorted(output_dir.rglob("*")):
-        if path.is_symlink():
+        if is_link_or_junction(path):
             raise ValueError(f"Evidence bundle cannot contain symlinks: {path}")
         if not path.is_file():
             continue
         archive_name = (Path(output_dir.name) / path.relative_to(output_dir)).as_posix()
         if not _safe_member_name(archive_name):
             raise ValueError(f"Unsafe evidence archive member: {archive_name!r}")
+        digest, size = sha256_stable_regular_file(
+            path,
+            maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+            label="Evidence source file",
+        )
         records.append(
             {
                 "path": archive_name,
-                "bytes": path.stat().st_size,
-                "sha256": sha256(path),
+                "bytes": size,
+                "sha256": digest,
                 "source": path,
             }
         )
+        content_bytes += size
+        if len(records) > MAX_EVIDENCE_MEMBERS:
+            raise ValueError("Evidence directory has too many files")
+        if content_bytes > MAX_EVIDENCE_CONTENT_BYTES:
+            raise ValueError("Evidence directory exceeds the content byte limit")
     if not records:
         raise ValueError(f"Evidence directory is empty: {output_dir}")
     return records
+
+
+def _public_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: record[key] for key in ("path", "bytes", "sha256")}
+        for record in records
+    ]
+
+
+def _assert_live_tree_unchanged(
+    output_dir: Path,
+    expected: list[dict[str, Any]],
+) -> None:
+    if _public_records(_archive_files(output_dir)) != expected:
+        raise RuntimeError("Evidence directory changed while archiving")
 
 
 def _verify_payload(
@@ -387,9 +424,11 @@ def derive_legacy_evidence_manifest(
         "files": records,
     }
     if derived_path.exists():
-        if not derived_path.is_file():
-            raise ValueError(f"Derived manifest output is not a regular file: {derived_path}")
-        existing = json.loads(derived_path.read_text(encoding="utf-8"))
+        existing = read_stable_json_mapping(
+            derived_path,
+            maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+            label="Derived evidence manifest",
+        ).mapping
         comparable_keys = {
             "schema_version",
             "evidence_status",
@@ -406,26 +445,174 @@ def derive_legacy_evidence_manifest(
         if any(existing.get(key) != payload.get(key) for key in comparable_keys):
             raise ValueError(f"Existing derived manifest does not match archive: {derived_path}")
         return derived_path, existing
-    derived_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(derived_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    write_durable_json_exclusive(
+        derived_path,
+        payload,
+        maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+        label="Derived evidence manifest",
+    )
     return derived_path, payload
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.replace(temporary, path)
+def _manifest_payload(
+    archive_path: Path,
+    *,
+    archive_bytes: int,
+    archive_sha256: str,
+    files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "archive": archive_path.name,
+        "archive_bytes": archive_bytes,
+        "archive_sha256": archive_sha256,
+        "file_count": len(files),
+        "content_bytes": sum(int(record["bytes"]) for record in files),
+        "files": files,
+    }
 
 
-def archive_evidence(output_dir: Path) -> tuple[Path, str]:
+def _existing_manifest_matches(
+    manifest_path: Path,
+    expected: dict[str, Any],
+) -> None:
+    existing = read_stable_json_mapping(
+        manifest_path,
+        maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+        label="Evidence content manifest",
+    ).mapping
+    comparable = set(expected) - {"created_at"}
+    if set(existing) != set(expected) or any(
+        existing.get(key) != expected.get(key) for key in comparable
+    ):
+        raise ValueError("Existing evidence manifest does not match archive contents")
+
+
+def _existing_checksum_matches(
+    checksum_path: Path,
+    *,
+    archive_path: Path,
+    digest: str,
+) -> None:
+    resolved = resolve_regular_file_without_links(
+        checksum_path,
+        label="Evidence checksum sidecar",
+        maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+    )
+    payload = read_stable_regular_file(
+        resolved,
+        maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+        label="Evidence checksum sidecar",
+    )
+    try:
+        fields = payload.decode("utf-8", errors="strict").split()
+    except UnicodeDecodeError:
+        raise ValueError("Existing evidence checksum sidecar is invalid") from None
+    if len(fields) != 2 or fields != [digest, archive_path.name]:
+        raise ValueError("Existing evidence checksum sidecar does not match archive")
+
+
+def _finish_existing_bundle(
+    archive_path: Path,
+    checksum_path: Path,
+    manifest_path: Path,
+    files: list[dict[str, Any]],
+) -> tuple[Path, str]:
+    archive_path = resolve_regular_file_without_links(
+        archive_path,
+        label="Evidence archive",
+        maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+    )
+    digest, archive_bytes = sha256_stable_regular_file(
+        archive_path,
+        maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+        label="Evidence archive",
+    )
+    _verify_payload(archive_path, files)
+    manifest = _manifest_payload(
+        archive_path,
+        archive_bytes=archive_bytes,
+        archive_sha256=digest,
+        files=files,
+    )
+    if checksum_path.exists() or is_link_or_junction(checksum_path):
+        _existing_checksum_matches(
+            checksum_path,
+            archive_path=archive_path,
+            digest=digest,
+        )
+    else:
+        write_durable_bytes_exclusive(
+            checksum_path,
+            f"{digest}  {archive_path.name}\n".encode("utf-8"),
+            maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+            label="Evidence checksum sidecar",
+        )
+    if manifest_path.exists() or is_link_or_junction(manifest_path):
+        _existing_manifest_matches(manifest_path, manifest)
+    else:
+        write_durable_json_exclusive(
+            manifest_path,
+            manifest,
+            maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+            label="Evidence content manifest",
+        )
+    verified = verify_evidence_archive(archive_path)
+    if verified["files"] != files:
+        raise ValueError("Existing evidence bundle does not match live contents")
+    return archive_path, digest
+
+
+def archive_evidence(
+    output_dir: Path,
+    archive_path: Path | None = None,
+) -> tuple[Path, str]:
     """Create and fully verify an immutable archive/checksum/manifest bundle."""
-    if not output_dir.is_dir():
-        raise FileNotFoundError(output_dir)
-    archive_path = output_dir.with_suffix(".tar.gz")
+    output_dir = resolve_regular_directory_without_links(
+        output_dir,
+        label="Evidence directory",
+    )
+    archive_path = (
+        archive_path if archive_path is not None else output_dir.with_suffix(".tar.gz")
+    )
+    archive_path = Path(os.path.abspath(archive_path))
     checksum_path, manifest_path = evidence_sidecars(archive_path)
     records = _archive_files(output_dir)
-    temporary = archive_path.with_name(f".{archive_path.name}.part")
-    temporary.unlink(missing_ok=True)
+    public_records = _public_records(records)
+    existing = [
+        path.exists() or is_link_or_junction(path)
+        for path in (archive_path, checksum_path, manifest_path)
+    ]
+    if all(existing):
+        verified = verify_evidence_archive(archive_path)
+        if verified["files"] != public_records:
+            raise ValueError("Existing evidence bundle does not match live contents")
+        _assert_live_tree_unchanged(output_dir, public_records)
+        return archive_path.resolve(strict=True), str(verified["archive_sha256"])
+    if any(existing):
+        if not existing[0]:
+            raise ValueError("Evidence sidecar exists without its archive")
+        result = _finish_existing_bundle(
+            archive_path,
+            checksum_path,
+            manifest_path,
+            public_records,
+        )
+        _assert_live_tree_unchanged(output_dir, public_records)
+        return result
+
+    archive_path = prepare_new_file_destination_without_links(
+        archive_path,
+        label="Evidence archive",
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{archive_path.name}.",
+        suffix=".part",
+        dir=archive_path.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
     try:
         with tarfile.open(temporary, "w:gz") as archive:
             for record in records:
@@ -434,26 +621,42 @@ def archive_evidence(output_dir: Path) -> tuple[Path, str]:
                     arcname=record["path"],
                     recursive=False,
                 )
-        public_records = [
-            {key: record[key] for key in ("path", "bytes", "sha256")} for record in records
-        ]
+        with temporary.open("rb+") as handle:
+            os.fsync(handle.fileno())
         _verify_payload(temporary, public_records)
-        os.replace(temporary, archive_path)
+        staged_digest, _ = sha256_stable_regular_file(
+            temporary,
+            maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+            label="Staged evidence archive",
+        )
+        digest, archive_bytes = publish_durable_file_exclusive(
+            temporary,
+            archive_path,
+            maximum_bytes=MAX_EVIDENCE_ARCHIVE_BYTES,
+            label="Evidence archive",
+            expected_sha256=staged_digest,
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
-    digest = sha256(archive_path)
-    manifest = {
-        "schema_version": 1,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "archive": archive_path.name,
-        "archive_bytes": archive_path.stat().st_size,
-        "archive_sha256": digest,
-        "file_count": len(public_records),
-        "content_bytes": sum(int(record["bytes"]) for record in public_records),
-        "files": public_records,
-    }
-    _atomic_write(checksum_path, f"{digest}  {archive_path.name}\n")
-    _atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    manifest = _manifest_payload(
+        archive_path,
+        archive_bytes=archive_bytes,
+        archive_sha256=digest,
+        files=public_records,
+    )
+    write_durable_bytes_exclusive(
+        checksum_path,
+        f"{digest}  {archive_path.name}\n".encode("utf-8"),
+        maximum_bytes=MAX_EVIDENCE_CHECKSUM_BYTES,
+        label="Evidence checksum sidecar",
+    )
+    write_durable_json_exclusive(
+        manifest_path,
+        manifest,
+        maximum_bytes=MAX_EVIDENCE_MANIFEST_BYTES,
+        label="Evidence content manifest",
+    )
     verify_evidence_archive(archive_path)
+    _assert_live_tree_unchanged(output_dir, public_records)
     return archive_path, digest

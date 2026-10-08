@@ -110,3 +110,33 @@ def test_mismatched_trainer_step_is_not_archived(tmp_path: Path):
         json.dumps({"global_step": 999, "log_history": []}), encoding="utf-8"
     )
     assert completed_checkpoint(checkpoint) is None
+
+
+def test_non_integer_or_duplicate_trainer_step_is_not_archived(tmp_path: Path):
+    checkpoint = make_checkpoint(tmp_path, 1000)
+    trainer_state = checkpoint / "trainer_state.json"
+    trainer_state.write_text(
+        '{"global_step":"1000","log_history":[]}',
+        encoding="utf-8",
+    )
+    assert completed_checkpoint(checkpoint) is None
+
+    trainer_state.write_text(
+        '{"global_step":1000,"global_step":1000,"log_history":[]}',
+        encoding="utf-8",
+    )
+    assert completed_checkpoint(checkpoint) is None
+
+
+def test_corrupt_checkpoint_index_is_not_silently_replaced(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    make_checkpoint(model_dir, 500)
+    archive_dir = tmp_path / "archives"
+    archive_dir.mkdir()
+    index = archive_dir / "checkpoint_archives.json"
+    index.write_text('{"checkpoints":NaN}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        archive_ready_checkpoints(model_dir, archive_dir)
+
+    assert index.read_text(encoding="utf-8") == '{"checkpoints":NaN}'

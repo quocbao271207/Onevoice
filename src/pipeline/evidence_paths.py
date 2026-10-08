@@ -67,6 +67,28 @@ def resolve_regular_file_without_links(
     )
 
 
+def resolve_regular_directory_without_links(
+    value: Any,
+    *,
+    label: str,
+) -> Path:
+    """Resolve an arbitrary directory without link traversal in any component."""
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} path is missing")
+    path = Path(os.path.abspath(Path(raw)))
+    current = Path(path.parts[0])
+    for part in path.parts[1:]:
+        current /= part
+        if is_link_or_junction(current):
+            raise ValueError(
+                f"{label} cannot traverse a symlink or junction: {current}"
+            )
+    if not path.is_dir():
+        raise FileNotFoundError(f"{label} is missing or not a directory: {path}")
+    return path.resolve(strict=True)
+
+
 def prepare_new_file_destination_without_links(
     value: Any,
     *,
