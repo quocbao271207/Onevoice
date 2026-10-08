@@ -33,6 +33,7 @@ from scripts.run_baseline_benchmarks import (
     source_balanced_sample,
     validate_bakeoff_runner_generation,
     validate_mt_batch_source_lengths,
+    validate_mt_batch_generation_completed,
     write_prediction_checkpoint,
     write_predictions_checkpoint,
 )
@@ -185,6 +186,30 @@ def test_mt_benchmark_encoder_never_requests_truncation():
     ]
 
 
+def test_mt_benchmark_rejects_any_generation_without_eos():
+    generated = torch.tensor(
+        [
+            [1, 10, 1, 0],
+            [1, 11, 12, 0],
+        ]
+    )
+    rows = [{"id": "complete"}, {"id": "incomplete"}]
+
+    with pytest.raises(RuntimeError, match="incomplete.*did not produce EOS"):
+        validate_mt_batch_generation_completed(generated, rows, eos_token_id=1)
+
+    validate_mt_batch_generation_completed(generated[:1], rows[:1], eos_token_id=1)
+
+    malformed = torch.tensor([[1, 10, 1, 12]])
+    with pytest.raises(RuntimeError, match="produced tokens after EOS"):
+        validate_mt_batch_generation_completed(
+            malformed,
+            [{"id": "malformed"}],
+            eos_token_id=1,
+            pad_token_id=0,
+        )
+
+
 def test_canonical_selection_manifest_rejects_stale_waiter_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -253,6 +278,16 @@ def test_prediction_checkpoint_verifies_exact_inputs_and_payload(tmp_path: Path)
     predictions = [{"id": "pair", "hypothesis": "Không dùng 5 mg."}]
     specification = prediction_checkpoint_specification(args)
 
+    assert specification["mt_inference_contract"] == {
+        "max_source_tokens": 256,
+        "max_new_tokens": 256,
+        "source_truncation": False,
+        "require_eos": True,
+    }
+    args.task = "asr"
+    assert "mt_inference_contract" not in prediction_checkpoint_specification(args)
+    args.task = "mt"
+
     provenance = write_prediction_checkpoint(
         path,
         predictions,
@@ -266,6 +301,29 @@ def test_prediction_checkpoint_verifies_exact_inputs_and_payload(tmp_path: Path)
     assert loaded[0] == predictions
     assert loaded[1] == provenance
     assert prediction_provenance_path(path).is_file()
+
+
+def test_prediction_checkpoint_rejects_legacy_generation_contract(tmp_path: Path):
+    args = checkpoint_args(tmp_path)
+    path = tmp_path / "legacy_predictions.jsonl"
+    specification = prediction_checkpoint_specification(args)
+    write_prediction_checkpoint(
+        path,
+        [{"id": "pair", "hypothesis": "Dùng 5 mg."}],
+        specification,
+        {"num_beams": 4},
+        {"resolved_device": "cpu"},
+    )
+    provenance_path = prediction_provenance_path(path)
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["specification"].pop("mt_inference_contract")
+    provenance["specification_sha256"] = benchmark.canonical_sha256(
+        provenance["specification"]
+    )
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="specification mismatch"):
+        load_verified_prediction_checkpoint(path, specification)
 
 
 def test_prediction_checkpoint_fails_closed_on_tampering_and_spec_change(tmp_path: Path):

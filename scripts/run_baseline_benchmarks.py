@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.candidate_evidence import adapter_identity, canonical_sha256, sha256  # noqa: E402
 from scripts.evaluate_benchmarks import score_asr, score_mt  # noqa: E402
+from src.pipeline.mt_engine import require_completed_mt_generation  # noqa: E402
 from src.training.mt_model_adapter import (  # noqa: E402
     SUPPORTED_MT_FAMILIES,
     configure_tokenizer,
@@ -98,6 +99,25 @@ def encode_mt_source_batch(tokenizer: Any, texts: list[str]) -> dict[str, Any]:
         truncation=False,
         return_tensors="pt",
     )
+
+
+def validate_mt_batch_generation_completed(
+    generated: Any,
+    rows: list[dict[str, Any]],
+    *,
+    eos_token_id: Any,
+    pad_token_id: Any = None,
+) -> None:
+    """Reject an MT batch if any row stopped before its generated EOS."""
+    if len(generated) != len(rows):
+        raise RuntimeError("MT generated batch size does not match source rows")
+    for row, generated_tokens in zip(rows, generated):
+        require_completed_mt_generation(
+            generated_tokens,
+            eos_token_id,
+            pad_token_id=pad_token_id,
+            context=f"MT benchmark source {row.get('id', '<missing-id>')}",
+        )
 
 
 def stable_rank(seed: int, row: dict[str, Any]) -> str:
@@ -208,6 +228,18 @@ def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, A
         "asr_prompt": args.asr_prompt if args.task == "asr" else None,
         "mt_model_family": args.mt_model_family if args.task == "mt" else None,
         "mt_direction": args.mt_direction if args.task == "mt" else None,
+        **(
+            {
+                "mt_inference_contract": {
+                    "max_source_tokens": MT_MAX_SOURCE_TOKENS,
+                    "max_new_tokens": 256,
+                    "source_truncation": False,
+                    "require_eos": True,
+                }
+            }
+            if args.task == "mt"
+            else {}
+        ),
         "bakeoff_runner_sha256": getattr(args, "bakeoff_runner_sha256", None),
     }
 
@@ -522,6 +554,12 @@ def run_mt(
                 if bos_token_id is not None:
                     generation_kwargs["forced_bos_token_id"] = bos_token_id
                 generated = model.generate(**encoded, **generation_kwargs)
+                validate_mt_batch_generation_completed(
+                    generated,
+                    chunk,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
                 hypotheses = tokenizer.batch_decode(generated, skip_special_tokens=True)
                 for row, hypothesis in zip(chunk, hypotheses):
                     predictions.append(

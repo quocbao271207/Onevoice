@@ -265,6 +265,41 @@ def test_mt_engine_rejects_blank_and_overlength_source_without_truncation():
     assert engine.tokenizer.calls == [{"return_tensors": "pt", "truncation": False}]
 
 
+def test_mt_engine_rejects_generation_that_never_reaches_eos():
+    import numpy as np
+    import pytest
+
+    class FakeInputs(dict):
+        def to(self, _device):
+            return self
+
+    class FakeTokenizer:
+        src_lang = None
+        pad_token_id = 0
+        eos_token_id = 1
+
+        def __call__(self, *_args, **_kwargs):
+            return FakeInputs(input_ids=np.zeros((1, 3), dtype=np.int64))
+
+        def convert_tokens_to_ids(self, _value):
+            return 2
+
+        def decode(self, _tokens, **_kwargs):
+            raise AssertionError("Incomplete output must not be decoded")
+
+    class FakeModel:
+        def generate(self, **_kwargs):
+            return [[2, 3, 4]]
+
+    engine = MTEngine(device="cpu")
+    engine.tokenizer = FakeTokenizer()
+    engine.model = FakeModel()
+    engine._is_loaded = True
+
+    with pytest.raises(RuntimeError, match="did not produce EOS"):
+        engine.translate("Give aspirin now.", "en", "vi")
+
+
 def test_text_only_cache_hit_preserves_confirmation_and_safety_metadata():
     pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
     pipeline._is_loaded = True
