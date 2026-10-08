@@ -376,6 +376,10 @@ class ASREngine:
             )
             if transitions.numel():
                 confidence = float(transitions.mean().exp().item())
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            raise RuntimeError(
+                "ASR confidence proxy must be finite and in [0, 1]"
+            )
 
         latency_ms = (time.perf_counter() - start_time) * 1000
 

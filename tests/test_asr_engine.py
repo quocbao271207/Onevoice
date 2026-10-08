@@ -108,6 +108,30 @@ def test_asr_accepts_completed_generation_without_logging_transcript(
         )
 
 
+def test_asr_rejects_nonfinite_confidence_proxy():
+    class NonfiniteConfidenceModel(FakeModel):
+        def generate(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                sequences=self.sequence,
+                scores=[torch.zeros((1, 1), dtype=torch.float32)],
+            )
+
+        def compute_transition_scores(self, *_args, **_kwargs):
+            return torch.tensor([[float("nan")]], dtype=torch.float32)
+
+    engine = ASREngine(device="cpu")
+    engine.models = {"vi": NonfiniteConfidenceModel([2, 10, 1, 0])}
+    engine.processors = {"vi": FakeProcessor()}
+    engine._is_loaded = True
+
+    with pytest.raises(RuntimeError, match="confidence proxy"):
+        engine.transcribe(
+            np.zeros(1600, dtype=np.float32),
+            language="vi",
+            sample_rate=16000,
+        )
+
+
 def test_asr_constructor_rejects_unsafe_generation_contract():
     with pytest.raises(ValueError, match="max_input_duration_seconds"):
         ASREngine(max_input_duration_seconds=30.1)

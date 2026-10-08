@@ -18,8 +18,10 @@ Usage:
 
 import argparse
 import logging
+import math
 import sys
 import time
+from numbers import Integral, Real
 import numpy as np
 from pathlib import Path
 
@@ -27,6 +29,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.pipeline.audio_frontend import (
+    MAX_AUDIO_CHANNELS,
+    MAX_SAMPLE_RATE,
+    MIN_SAMPLE_RATE,
+)
 from src.pipeline.safety_guard import safety_issue_codes
 
 logging.basicConfig(
@@ -35,6 +42,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("MediVoice")
+
+MAX_CLI_AUDIO_FILE_BYTES = 64 * 1024 * 1024
+MAX_CLI_DECODED_AUDIO_BYTES = 64 * 1024 * 1024
 
 
 BANNER = r"""
@@ -66,6 +76,103 @@ def print_confirmation_warning(result) -> None:
         print("  ⚠️  Clinical action requires explicit confirmation before playback")
 
 
+def load_audio_file(
+    input_path: str | Path,
+    *,
+    max_duration_seconds: float,
+) -> tuple[np.ndarray, int]:
+    """Preflight bounded audio metadata before allocating decoded samples."""
+    import soundfile as sf
+
+    path = Path(input_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Audio input does not exist: {path}")
+    file_bytes = path.stat().st_size
+    if file_bytes > MAX_CLI_AUDIO_FILE_BYTES:
+        raise ValueError(
+            f"Audio file has {file_bytes} bytes; limit is "
+            f"{MAX_CLI_AUDIO_FILE_BYTES}"
+        )
+    if (
+        isinstance(max_duration_seconds, bool)
+        or not isinstance(max_duration_seconds, Real)
+        or not math.isfinite(float(max_duration_seconds))
+        or float(max_duration_seconds) <= 0.0
+    ):
+        raise ValueError("max_duration_seconds must be finite and positive")
+
+    try:
+        metadata = sf.info(path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"Unable to inspect audio input: {type(exc).__name__}"
+        ) from exc
+
+    frames = metadata.frames
+    sample_rate = metadata.samplerate
+    channels = metadata.channels
+    if isinstance(frames, bool) or not isinstance(frames, Integral) or frames <= 0:
+        raise ValueError("Audio input has no audio frames")
+    if (
+        isinstance(sample_rate, bool)
+        or not isinstance(sample_rate, Integral)
+        or not MIN_SAMPLE_RATE <= int(sample_rate) <= MAX_SAMPLE_RATE
+    ):
+        raise ValueError(
+            "Audio sample rate must be an integer in "
+            f"[{MIN_SAMPLE_RATE}, {MAX_SAMPLE_RATE}]"
+        )
+    if (
+        isinstance(channels, bool)
+        or not isinstance(channels, Integral)
+        or not 1 <= int(channels) <= MAX_AUDIO_CHANNELS
+    ):
+        raise ValueError(
+            "Audio channels must be an integer in "
+            f"[1, {MAX_AUDIO_CHANNELS}]"
+        )
+
+    duration_seconds = int(frames) / int(sample_rate)
+    if duration_seconds > float(max_duration_seconds):
+        raise ValueError(
+            f"Audio duration is {duration_seconds:.3f}s; limit is "
+            f"{float(max_duration_seconds):.3f}s"
+        )
+    decoded_bytes = int(frames) * int(channels) * np.dtype(np.float32).itemsize
+    if decoded_bytes > MAX_CLI_DECODED_AUDIO_BYTES:
+        raise ValueError(
+            f"Decoded audio requires {decoded_bytes} bytes; limit is "
+            f"{MAX_CLI_DECODED_AUDIO_BYTES}"
+        )
+
+    try:
+        audio, decoded_sample_rate = sf.read(
+            path,
+            dtype="float32",
+            always_2d=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"Unable to decode audio input: {type(exc).__name__}"
+        ) from exc
+    audio = np.asarray(audio, dtype=np.float32)
+    expected_shape = (
+        (int(frames),)
+        if int(channels) == 1
+        else (int(frames), int(channels))
+    )
+    if audio.shape != expected_shape:
+        raise ValueError(
+            f"Decoded audio shape {audio.shape} does not match metadata "
+            f"{expected_shape}"
+        )
+    if decoded_sample_rate != int(sample_rate):
+        raise ValueError(
+            "Decoded audio sample rate does not match inspected metadata"
+        )
+    return np.ascontiguousarray(audio, dtype=np.float32), int(sample_rate)
+
+
 def run_interactive(pipeline):
     """Run interactive microphone-based translation."""
     print("\n🎤 Interactive Mode — Speak into the microphone")
@@ -80,14 +187,12 @@ def run_interactive(pipeline):
 
 def run_file_translation(pipeline, input_path: str, source_lang: str = None):
     """Translate an audio file."""
-    import soundfile as sf
-
     print(f"\n📂 Translating file: {input_path}")
 
-    audio, sr = sf.read(input_path)
-    if audio.ndim > 1:
-        audio = audio[:, 0]  # Take first channel
-    audio = audio.astype(np.float32)
+    audio, sr = load_audio_file(
+        input_path,
+        max_duration_seconds=pipeline.asr_engine.max_input_duration_seconds,
+    )
 
     print(f"   Duration: {len(audio)/sr:.2f}s | Sample Rate: {sr} Hz\n")
 
@@ -104,7 +209,7 @@ def run_file_translation(pipeline, input_path: str, source_lang: str = None):
         f"{format_translation_for_display(result)}"
     )
     print(f"  ⏱️  Latency: {result.total_latency_ms:.0f}ms (RTF={result.overall_rtf:.2f})")
-    print(f"  📊 Confidence: {result.asr_confidence:.2%}")
+    print(f"  📊 ASR token-probability proxy (uncalibrated): {result.asr_confidence:.2%}")
     print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
     print_confirmation_warning(result)
     print(f"{'─'*60}\n")
