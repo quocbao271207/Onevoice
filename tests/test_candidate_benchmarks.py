@@ -22,6 +22,7 @@ from scripts.candidate_evidence import (
 )
 from scripts.run_baseline_benchmarks import (
     attach_adapter,
+    encode_mt_source_batch,
     load_verified_prediction_checkpoint,
     model_load_kwargs,
     prediction_checkpoint_specification,
@@ -31,6 +32,7 @@ from scripts.run_baseline_benchmarks import (
     resolve_device,
     source_balanced_sample,
     validate_bakeoff_runner_generation,
+    validate_mt_batch_source_lengths,
     write_prediction_checkpoint,
     write_predictions_checkpoint,
 )
@@ -146,6 +148,41 @@ def test_source_balanced_sample_can_take_full_manifest():
     ]
     selected = source_balanced_sample(rows, len(rows), seed=7)
     assert {row["id"] for row in selected} == {"a", "b", "c"}
+
+
+def test_mt_benchmark_rejects_overlength_sources_instead_of_truncating():
+    encoded = {
+        "attention_mask": torch.tensor(
+            [
+                [1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 1],
+            ]
+        )
+    }
+    rows = [{"id": "within-limit"}, {"id": "too-long"}]
+
+    with pytest.raises(ValueError, match="too-long.*5 tokens.*limit is 4"):
+        validate_mt_batch_source_lengths(encoded, rows, max_source_tokens=4)
+
+    validate_mt_batch_source_lengths(encoded, rows, max_source_tokens=5)
+
+
+def test_mt_benchmark_encoder_never_requests_truncation():
+    calls = []
+
+    def tokenizer(texts, **kwargs):
+        calls.append((texts, kwargs))
+        return {"attention_mask": torch.tensor([[1, 1]])}
+
+    encoded = encode_mt_source_batch(tokenizer, ["Do not give aspirin."])
+
+    assert encoded["attention_mask"].shape == (1, 2)
+    assert calls == [
+        (
+            ["Do not give aspirin."],
+            {"padding": True, "truncation": False, "return_tensors": "pt"},
+        )
+    ]
 
 
 def test_canonical_selection_manifest_rejects_stale_waiter_generation(

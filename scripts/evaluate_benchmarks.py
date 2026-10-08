@@ -241,6 +241,8 @@ def _bootstrap_mt_confidence_intervals(
 
 
 def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    always_relevant_issue_prefixes = {"empty_translation"}
+
     def score(
         group: list[dict[str, Any]],
         relevant_issue_prefixes: set[str] | None = None,
@@ -269,6 +271,7 @@ def score_mt(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 for issue in check.issues
                 if relevant_issue_prefixes is None
                 or issue.split(":", 1)[0] in relevant_issue_prefixes
+                or issue.split(":", 1)[0] in always_relevant_issue_prefixes
             ]
             if relevant_issues:
                 safety_failures += 1

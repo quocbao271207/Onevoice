@@ -203,7 +203,9 @@ def test_mt_engine_direct_api_exposes_clinical_safety_failure():
         eos_token_id = 1
 
         def __call__(self, *_args, **_kwargs):
-            return FakeInputs()
+            import numpy as np
+
+            return FakeInputs(input_ids=np.zeros((1, 3), dtype=np.int64))
 
         def convert_tokens_to_ids(self, _value):
             return 2
@@ -231,6 +233,36 @@ def test_mt_engine_direct_api_exposes_clinical_safety_failure():
         issue.startswith("quantity_binding_mismatch")
         for issue in result.safety_issues
     )
+
+
+def test_mt_engine_rejects_blank_and_overlength_source_without_truncation():
+    import numpy as np
+    import pytest
+
+    class FakeInputs(dict):
+        def to(self, _device):
+            return self
+
+    class FakeTokenizer:
+        src_lang = None
+        calls = []
+
+        def __call__(self, *_args, **kwargs):
+            self.calls.append(kwargs)
+            return FakeInputs(input_ids=np.zeros((1, 5), dtype=np.int64))
+
+    engine = MTEngine(device="cpu", max_source_tokens=4)
+    engine.tokenizer = FakeTokenizer()
+    engine.model = object()
+    engine._is_loaded = True
+
+    with pytest.raises(ValueError, match="must not be blank"):
+        engine.translate("   ", "en", "vi")
+    assert not engine.tokenizer.calls
+
+    with pytest.raises(ValueError, match="5 tokens.*limit is 4"):
+        engine.translate("Give aspirin now.", "en", "vi")
+    assert engine.tokenizer.calls == [{"return_tensors": "pt", "truncation": False}]
 
 
 def test_text_only_cache_hit_preserves_confirmation_and_safety_metadata():
@@ -502,7 +534,9 @@ def test_runtime_mt_decoding_matches_selected_validation_setting():
 
     pipeline = yaml.safe_load(open("configs/pipeline_config.yaml", encoding="utf-8"))
     assert pipeline["mt"]["num_beams"] == 1
+    assert pipeline["mt"]["max_source_tokens"] == 256
     assert MTEngine().num_beams == 1
+    assert MTEngine().max_source_tokens == 256
 
 
 def test_cpu_smoke_uses_fail_closed_engine_defaults():

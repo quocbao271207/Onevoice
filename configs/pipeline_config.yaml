@@ -45,6 +45,8 @@ mt:
   model_name: "nllb-200-distilled-600m-medical"
   model_path: "models/mt/nllb-medical"
   quantization: "int8"
+  max_source_tokens: 256   # Fail closed above the validated context; never truncate clinical text
+  max_source_characters: 4096
   max_new_tokens: 256
   num_beams: 1             # Selected on locked validation; beam-4 was slower and less accurate
   speculative_decoding: false

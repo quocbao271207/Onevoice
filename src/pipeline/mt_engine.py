@@ -41,6 +41,25 @@ class MTResult:
 
 NLLB_LANG_CODES = {"vi": "vie_Latn", "en": "eng_Latn"}
 NLLB_BASE_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
+DEFAULT_MAX_SOURCE_TOKENS = 256
+DEFAULT_MAX_SOURCE_CHARACTERS = 4096
+
+
+def validate_mt_source_text(
+    text: str,
+    *,
+    max_source_characters: int = DEFAULT_MAX_SOURCE_CHARACTERS,
+) -> None:
+    """Reject malformed or unbounded MT input before cache/model dispatch."""
+    if not isinstance(text, str):
+        raise TypeError("MT source text must be a string")
+    if not text.strip():
+        raise ValueError("MT source text must not be blank")
+    if len(text) > max_source_characters:
+        raise ValueError(
+            "MT source text has "
+            f"{len(text)} characters; limit is {max_source_characters}"
+        )
 
 
 class MedicalLexicon:
@@ -142,15 +161,25 @@ class MTEngine:
         device: str = "auto",
         lexicon_path: Optional[str] = None,
         max_new_tokens: int = 256,
+        max_source_tokens: int = DEFAULT_MAX_SOURCE_TOKENS,
+        max_source_characters: int = DEFAULT_MAX_SOURCE_CHARACTERS,
         num_beams: int = 1,
         temperature: float = 0.0,
         allow_base_fallback: bool = False,
     ):
         if num_beams < 1:
             raise ValueError("num_beams must be at least 1")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+        if max_source_tokens < 1:
+            raise ValueError("max_source_tokens must be at least 1")
+        if max_source_characters < 1:
+            raise ValueError("max_source_characters must be at least 1")
         self.model_path = model_path
         self.device = device
         self.max_new_tokens = max_new_tokens
+        self.max_source_tokens = max_source_tokens
+        self.max_source_characters = max_source_characters
         self.num_beams = num_beams
         self.temperature = temperature
         self.allow_base_fallback = allow_base_fallback
@@ -230,6 +259,11 @@ class MTEngine:
         if not self._is_loaded:
             raise RuntimeError("MT engine not loaded. Call load() first.")
 
+        validate_mt_source_text(
+            text,
+            max_source_characters=self.max_source_characters,
+        )
+
         if target_lang is None:
             target_lang = "en" if source_lang == "vi" else "vi"
 
@@ -245,9 +279,19 @@ class MTEngine:
         inputs = self.tokenizer(
             text,
             return_tensors="pt",
-            truncation=True,
-            max_length=256,
-        ).to(self.device)
+            truncation=False,
+        )
+        input_ids = inputs.get("input_ids")
+        if input_ids is None or not hasattr(input_ids, "shape") or len(input_ids.shape) < 2:
+            raise RuntimeError("MT tokenizer did not return batched input_ids")
+        source_tokens = int(input_ids.shape[-1])
+        if source_tokens > self.max_source_tokens:
+            raise ValueError(
+                "MT source has "
+                f"{source_tokens} tokens; limit is {self.max_source_tokens}. "
+                "Refusing to silently truncate clinical text."
+            )
+        inputs = inputs.to(self.device)
 
         # Generate translation
         first_token_time = None

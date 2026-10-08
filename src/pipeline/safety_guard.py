@@ -363,6 +363,8 @@ def validate_translation(
     terminology: Mapping[str, str | Sequence[str]] | None = None,
 ) -> SafetyCheck:
     issues: list[str] = []
+    if not target.strip():
+        issues.append("empty_translation")
     source_numbers, target_numbers = reconciled_number_counts(source, target, source_lang, target_lang)
     if source_numbers != target_numbers:
         issues.append(f"number_mismatch:{list(source_numbers.elements())}->{list(target_numbers.elements())}")

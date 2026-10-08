@@ -354,6 +354,36 @@ def test_mt_category_gates_fail_swapped_doses_and_negation_scope():
     assert not report["clinical_safety_gate"]["pass"]
 
 
+def test_empty_mt_hypothesis_fails_every_clinical_hard_gate():
+    categories = [
+        "drug_name",
+        "dose",
+        "number",
+        "unit",
+        "negation",
+        "terminology",
+        "code_switch",
+    ]
+    report = score_mt(
+        [
+            {
+                "id": "empty-output",
+                "direction": "en_to_vi",
+                "source": "Do not give aspirin 5 mg to patient T3.",
+                "reference": "Không dùng aspirin 5 mg cho bệnh nhân T3.",
+                "hypothesis": "",
+                "categories": categories,
+                "terminology": {"en_to_vi": {"aspirin": "aspirin"}},
+            }
+        ]
+    )
+
+    assert not report["clinical_safety_gate"]["pass"]
+    for category in categories:
+        assert report["categories"][category]["safety_failure_rate"] == 1.0
+        assert report["categories"][category]["safety_issue_counts"]["empty_translation"] == 1
+
+
 def test_mt_bootstrap_precomputed_statistics_match_full_rescoring():
     rows = [
         {"hypothesis": "Take aspirin daily.", "reference": "Take aspirin daily."},

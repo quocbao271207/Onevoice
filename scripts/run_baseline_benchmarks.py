@@ -53,11 +53,51 @@ CANONICAL_SELECTION_MANIFESTS = (
     "data/eval/mt_selection_dev.jsonl",
     "data/eval/asr_selection_dev.jsonl",
 )
+MT_MAX_SOURCE_TOKENS = 256
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def validate_mt_batch_source_lengths(
+    encoded: dict[str, Any],
+    rows: list[dict[str, Any]],
+    *,
+    max_source_tokens: int = MT_MAX_SOURCE_TOKENS,
+) -> None:
+    """Fail closed when benchmark inputs exceed the evaluated context window."""
+    attention_mask = encoded.get("attention_mask")
+    if attention_mask is None or not hasattr(attention_mask, "sum"):
+        raise RuntimeError("MT tokenizer did not return an attention_mask")
+    try:
+        token_lengths = attention_mask.sum(dim=1).tolist()
+    except TypeError:
+        token_lengths = attention_mask.sum(axis=1).tolist()
+    if len(token_lengths) != len(rows):
+        raise RuntimeError("MT tokenizer batch size does not match source rows")
+    over_limit = [
+        (str(row.get("id", "<missing-id>")), int(token_count))
+        for row, token_count in zip(rows, token_lengths)
+        if int(token_count) > max_source_tokens
+    ]
+    if over_limit:
+        row_id, token_count = over_limit[0]
+        raise ValueError(
+            f"MT benchmark source {row_id} has {token_count} tokens; "
+            f"limit is {max_source_tokens}. Refusing to silently truncate."
+        )
+
+
+def encode_mt_source_batch(tokenizer: Any, texts: list[str]) -> dict[str, Any]:
+    """Encode full MT sources so the explicit length gate sees every token."""
+    return tokenizer(
+        texts,
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+    )
 
 
 def stable_rank(seed: int, row: dict[str, Any]) -> str:
@@ -465,13 +505,11 @@ def run_mt(
             )
             configure_tokenizer(tokenizer, args.mt_model_family, direction)
             for chunk in batches(rows, args.batch_size):
-                encoded = tokenizer(
+                encoded = encode_mt_source_batch(
+                    tokenizer,
                     [row[source_field] for row in chunk],
-                    padding=True,
-                    truncation=True,
-                    max_length=256,
-                    return_tensors="pt",
                 )
+                validate_mt_batch_source_lengths(encoded, chunk)
                 encoded = {key: value.to(device) for key, value in encoded.items()}
                 generation_kwargs = {
                     "max_new_tokens": 256,

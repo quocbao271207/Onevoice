@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .audio_frontend import AudioFrontend, AudioConfig
 from .asr_engine import ASREngine, ASRResult
-from .mt_engine import MTEngine, MTResult
+from .mt_engine import MTEngine, MTResult, validate_mt_source_text
 from .tts_engine import TTSEngine, TTSResult
 from .flash_cache import FlashCache
 from .safety_guard import validate_translation
@@ -114,6 +114,8 @@ class MediVoicePipeline:
             model_path=mt_cfg.get("model_path", "models/mt/nllb-medical"),
             lexicon_path=mt_cfg.get("medical_lexicon_path"),
             max_new_tokens=mt_cfg.get("max_new_tokens", 256),
+            max_source_tokens=mt_cfg.get("max_source_tokens", 256),
+            max_source_characters=mt_cfg.get("max_source_characters", 4096),
             num_beams=mt_cfg.get("num_beams", 1),
             temperature=mt_cfg.get("temperature", 0.1),
             allow_base_fallback=allow_base_fallback,
@@ -287,6 +289,10 @@ class MediVoicePipeline:
 
         # Determine target language
         target_lang = self._resolve_target_language(asr_result.language, target_lang)
+        validate_mt_source_text(
+            asr_result.text,
+            max_source_characters=self.mt_engine.max_source_characters,
+        )
 
         # ===== STAGE 2.5: Flash Cache Check =====
         stage_start = time.perf_counter()
@@ -451,6 +457,10 @@ class MediVoicePipeline:
             raise RuntimeError("Pipeline not loaded. Call load() first.")
 
         target_lang = self._resolve_target_language(source_lang, target_lang)
+        validate_mt_source_text(
+            text,
+            max_source_characters=self.mt_engine.max_source_characters,
+        )
 
         # Check flash cache first
         cached = self.flash_cache.lookup(text, source_lang)
