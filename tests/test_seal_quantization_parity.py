@@ -6,9 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from scripts.candidate_evidence import canonical_sha256
+from scripts.capture_compiled_predictions import resolve_command_template
 from scripts.run_model_bakeoff import (
     QUANTIZATION_PARITY_SLICES,
     quantization_parity_evidence_failures,
+    sha256,
 )
 from scripts.seal_quantization_parity import (
     seal_quantization_parity,
@@ -24,6 +27,95 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
         "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
         encoding="utf-8",
     )
+
+
+def write_provenances(
+    *,
+    task: str,
+    direction: str | None,
+    candidate_id: str,
+    adapter_manifest_sha256: str,
+    artifact: Path,
+    manifest: Path,
+    reference: Path,
+    quantized: Path,
+) -> tuple[Path, Path]:
+    reference_rows = len(reference.read_text(encoding="utf-8").splitlines())
+    quantized_rows = len(quantized.read_text(encoding="utf-8").splitlines())
+    specification = {
+        "task": task,
+        "mt_direction": direction if task == "mt" else None,
+        "adapter": {"manifest_sha256": adapter_manifest_sha256},
+        "manifest": {
+            "path": str(manifest.resolve()),
+            "bytes": manifest.stat().st_size,
+            "sha256": sha256(manifest),
+        },
+        "num_beams": 1,
+    }
+    reference_payload = {
+        "schema_version": 1,
+        "specification": specification,
+        "specification_sha256": canonical_sha256(specification),
+        "predictions": {
+            "path": str(reference.resolve()),
+            "bytes": reference.stat().st_size,
+            "sha256": sha256(reference),
+            "rows": reference_rows,
+        },
+        "decoding": {"num_beams": 1},
+        "runtime": {"resolved_device": "cpu"},
+    }
+    reference_provenance = reference.with_suffix(".provenance.json")
+    reference_provenance.write_text(json.dumps(reference_payload), encoding="utf-8")
+
+    template = ("compiled-runtime", "{artifact}", "{manifest}", "{output_predictions}")
+    resolved = resolve_command_template(
+        template,
+        artifact_path=artifact,
+        manifest_path=manifest,
+        output_predictions_path=quantized,
+    )
+    quantized_payload = {
+        "schema_version": 1,
+        "evidence_source": "onevoice_compiled_prediction_capture",
+        "started_at": NOW.isoformat(),
+        "completed_at": NOW.isoformat(),
+        "duration_seconds": 1.0,
+        "runtime_kind": "qnn_context_binary",
+        "task": task,
+        "direction": direction,
+        "candidate_id": candidate_id,
+        "adapter_manifest_sha256": adapter_manifest_sha256,
+        "decoding": {"num_beams": 1, "do_sample": False},
+        "artifact": {
+            "path": str(artifact.resolve()),
+            "bytes": artifact.stat().st_size,
+            "sha256": sha256(artifact),
+        },
+        "manifest": {
+            "path": str(manifest.resolve()),
+            "bytes": manifest.stat().st_size,
+            "sha256": sha256(manifest),
+        },
+        "predictions": {
+            "path": str(quantized.resolve()),
+            "bytes": quantized.stat().st_size,
+            "sha256": sha256(quantized),
+            "rows": quantized_rows,
+        },
+        "command": {
+            "template": list(template),
+            "template_sha256": canonical_sha256(list(template)),
+            "resolved_argv": list(resolved),
+            "resolved_sha256": canonical_sha256(list(resolved)),
+            "executable": "compiled-runtime",
+        },
+        "return_code": 0,
+    }
+    quantized_provenance = quantized.with_suffix(".provenance.json")
+    quantized_provenance.write_text(json.dumps(quantized_payload), encoding="utf-8")
+    return reference_provenance, quantized_provenance
 
 
 def mt_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -65,6 +157,16 @@ def mt_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
 
 def seal_mt(tmp_path: Path, **overrides):
     manifest, reference, quantized, artifact = mt_fixture(tmp_path)
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
     arguments = {
         "task": "mt",
         "direction": "en_to_vi",
@@ -73,7 +175,9 @@ def seal_mt(tmp_path: Path, **overrides):
         "artifact_path": artifact,
         "manifest_path": manifest,
         "reference_predictions_path": reference,
+        "reference_provenance_path": reference_provenance,
         "quantized_predictions_path": quantized,
+        "quantized_provenance_path": quantized_provenance,
         "now": NOW,
     }
     arguments.update(overrides)
@@ -125,6 +229,16 @@ def test_sealer_rejects_quantized_quality_and_clinical_regression(tmp_path: Path
     for index, row in enumerate(rows):
         row["hypothesis"] = f"Bệnh nhân ổn định {index + 1}."
     write_jsonl(quantized, rows)
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
 
     with pytest.raises(ValueError, match="Quantization parity failed"):
         seal_quantization_parity(
@@ -135,7 +249,9 @@ def test_sealer_rejects_quantized_quality_and_clinical_regression(tmp_path: Path
             artifact_path=artifact,
             manifest_path=manifest,
             reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
             quantized_predictions_path=quantized,
+            quantized_provenance_path=quantized_provenance,
             now=NOW,
         )
 
@@ -145,6 +261,16 @@ def test_sealer_rejects_prediction_metadata_or_manifest_drift(tmp_path: Path):
     rows = [json.loads(line) for line in quantized.read_text(encoding="utf-8").splitlines()]
     rows[0]["source"] = "different input"
     write_jsonl(quantized, rows)
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
 
     with pytest.raises(ValueError, match="metadata differs"):
         seal_quantization_parity(
@@ -155,7 +281,41 @@ def test_sealer_rejects_prediction_metadata_or_manifest_drift(tmp_path: Path):
             artifact_path=artifact,
             manifest_path=manifest,
             reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
             quantized_predictions_path=quantized,
+            quantized_provenance_path=quantized_provenance,
+            now=NOW,
+        )
+
+
+def test_sealer_rejects_compiled_artifact_or_decoding_provenance_drift(tmp_path: Path):
+    manifest, reference, quantized, artifact = mt_fixture(tmp_path)
+    reference_provenance, quantized_provenance = write_provenances(
+        task="mt",
+        direction="en_to_vi",
+        candidate_id="mt-winner",
+        adapter_manifest_sha256="a" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
+    payload = json.loads(quantized_provenance.read_text(encoding="utf-8"))
+    payload["decoding"]["num_beams"] = 4
+    quantized_provenance.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Quantized prediction provenance failed"):
+        seal_quantization_parity(
+            task="mt",
+            direction="en_to_vi",
+            candidate_id="mt-winner",
+            adapter_manifest_sha256="a" * 64,
+            artifact_path=artifact,
+            manifest_path=manifest,
+            reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
+            quantized_predictions_path=quantized,
+            quantized_provenance_path=quantized_provenance,
             now=NOW,
         )
 
@@ -199,6 +359,16 @@ def test_asr_parity_requires_and_accepts_32_independent_groups(tmp_path: Path):
     write_jsonl(reference, predictions)
     write_jsonl(quantized, predictions)
     artifact.write_bytes(b"compiled-asr")
+    reference_provenance, quantized_provenance = write_provenances(
+        task="asr",
+        direction=None,
+        candidate_id="asr-winner",
+        adapter_manifest_sha256="b" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
 
     with pytest.raises(ValueError, match="at least 32 independent"):
         seal_quantization_parity(
@@ -209,7 +379,9 @@ def test_asr_parity_requires_and_accepts_32_independent_groups(tmp_path: Path):
             artifact_path=artifact,
             manifest_path=manifest,
             reference_predictions_path=reference,
+            reference_provenance_path=reference_provenance,
             quantized_predictions_path=quantized,
+            quantized_provenance_path=quantized_provenance,
             now=NOW,
         )
 
@@ -220,6 +392,16 @@ def test_asr_parity_requires_and_accepts_32_independent_groups(tmp_path: Path):
     write_jsonl(manifest, manifest_rows)
     write_jsonl(reference, predictions)
     write_jsonl(quantized, predictions)
+    reference_provenance, quantized_provenance = write_provenances(
+        task="asr",
+        direction=None,
+        candidate_id="asr-winner",
+        adapter_manifest_sha256="b" * 64,
+        artifact=artifact,
+        manifest=manifest,
+        reference=reference,
+        quantized=quantized,
+    )
     evidence = seal_quantization_parity(
         task="asr",
         direction=None,
@@ -228,7 +410,9 @@ def test_asr_parity_requires_and_accepts_32_independent_groups(tmp_path: Path):
         artifact_path=artifact,
         manifest_path=manifest,
         reference_predictions_path=reference,
+        reference_provenance_path=reference_provenance,
         quantized_predictions_path=quantized,
+        quantized_provenance_path=quantized_provenance,
         now=NOW,
     )
     assert evidence["bootstrap"]["unit"] == "group"

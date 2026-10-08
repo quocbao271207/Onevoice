@@ -1140,8 +1140,13 @@ def quantization_parity_evidence_failures(
         "manifest_bytes",
         "reference_predictions_sha256",
         "reference_predictions_bytes",
+        "reference_provenance_sha256",
+        "reference_provenance_bytes",
         "quantized_predictions_sha256",
         "quantized_predictions_bytes",
+        "quantized_provenance_sha256",
+        "quantized_provenance_bytes",
+        "decoding",
         "samples",
         "bootstrap",
         "metrics",
@@ -1149,7 +1154,7 @@ def quantization_parity_evidence_failures(
     }
     if set(evidence) != expected_fields:
         failures.append("fields_invalid")
-    if evidence.get("version") != 1:
+    if evidence.get("version") != 2:
         failures.append("version_invalid")
     if evidence.get("status") != "pass":
         failures.append("status_not_pass")
@@ -1190,7 +1195,9 @@ def quantization_parity_evidence_failures(
         "artifact_sha256",
         "manifest_sha256",
         "reference_predictions_sha256",
+        "reference_provenance_sha256",
         "quantized_predictions_sha256",
+        "quantized_provenance_sha256",
     ):
         if not SHA256_RE.fullmatch(str(evidence.get(field) or "")):
             failures.append(f"{field}_invalid")
@@ -1198,11 +1205,24 @@ def quantization_parity_evidence_failures(
         "artifact_bytes",
         "manifest_bytes",
         "reference_predictions_bytes",
+        "reference_provenance_bytes",
         "quantized_predictions_bytes",
+        "quantized_provenance_bytes",
     ):
         value = evidence.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             failures.append(f"{field}_invalid")
+
+    decoding = evidence.get("decoding")
+    if not isinstance(decoding, dict) or set(decoding) != {"num_beams", "do_sample"}:
+        failures.append("decoding_invalid")
+    elif (
+        isinstance(decoding.get("num_beams"), bool)
+        or not isinstance(decoding.get("num_beams"), int)
+        or decoding["num_beams"] < 1
+        or decoding.get("do_sample") is not False
+    ):
+        failures.append("decoding_invalid")
 
     samples = evidence.get("samples")
     if (
@@ -1537,9 +1557,16 @@ def validate_deployment_report(
                 "reference_predictions_sha256": (
                     "parity_reference_predictions_sha256"
                 ),
+                "reference_provenance_sha256": (
+                    "parity_reference_provenance_sha256"
+                ),
                 "quantized_predictions_sha256": (
                     "parity_quantized_predictions_sha256"
                 ),
+                "quantized_provenance_sha256": (
+                    "parity_quantized_provenance_sha256"
+                ),
+                "decoding": "parity_decoding",
                 "samples": "parity_samples",
                 "bootstrap": "parity_bootstrap",
                 "metrics": "parity_metrics",

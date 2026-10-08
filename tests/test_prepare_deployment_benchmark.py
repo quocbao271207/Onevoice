@@ -152,7 +152,7 @@ def write_parity_evidence(
     path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "status": "pass",
                 "evidence_source": "onevoice_quantization_parity",
                 "evaluated_at": "2026-10-06T11:00:00+07:00",
@@ -166,8 +166,13 @@ def write_parity_evidence(
                 "manifest_bytes": 1000,
                 "reference_predictions_sha256": "c" * 64,
                 "reference_predictions_bytes": 2000,
+                "reference_provenance_sha256": "e" * 64,
+                "reference_provenance_bytes": 1000,
                 "quantized_predictions_sha256": "d" * 64,
                 "quantized_predictions_bytes": 2000,
+                "quantized_provenance_sha256": "f" * 64,
+                "quantized_provenance_bytes": 1000,
+                "decoding": {"num_beams": 1, "do_sample": False},
                 "samples": 32,
                 "bootstrap": {
                     "unit": "row" if winner["task"] == "mt" else "group",

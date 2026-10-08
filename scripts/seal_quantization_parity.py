@@ -27,6 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.evaluate_benchmarks import score_asr, score_mt  # noqa: E402
+from scripts.candidate_evidence import canonical_sha256  # noqa: E402
+from scripts.capture_compiled_predictions import (  # noqa: E402
+    compiled_prediction_provenance_failures,
+)
 from scripts.run_model_bakeoff import (  # noqa: E402
     MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES,
     QUANTIZATION_PARITY_BOOTSTRAP_REPEATS,
@@ -42,6 +46,7 @@ from scripts.run_model_bakeoff import (  # noqa: E402
 MAX_PREDICTION_BYTES = 250_000_000
 MAX_PREDICTION_ROWS = 100_000
 MAX_JSONL_LINE_BYTES = 2_000_000
+MAX_PROVENANCE_BYTES = 2_000_000
 BOOTSTRAP_SEED = 20261005
 CANDIDATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -75,6 +80,118 @@ def _read_jsonl(path: Path, *, label: str) -> list[dict[str, Any]]:
     if not rows:
         raise ValueError(f"{label} is empty")
     return rows
+
+
+def _read_json(path: Path, *, label: str) -> dict[str, Any]:
+    _regular_file(path, label=label, maximum_bytes=MAX_PROVENANCE_BYTES)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return payload
+
+
+def _verify_reference_provenance(
+    path: Path,
+    *,
+    task: str,
+    direction: str | None,
+    adapter_manifest_sha256: str,
+    manifest_path: Path,
+    predictions_path: Path,
+    prediction_rows: int,
+) -> dict[str, Any]:
+    provenance = _read_json(path, label="Reference prediction provenance")
+    specification = provenance.get("specification")
+    prediction = provenance.get("predictions")
+    decoding = provenance.get("decoding")
+    runtime = provenance.get("runtime")
+    if (
+        provenance.get("schema_version") != 1
+        or not isinstance(specification, dict)
+        or provenance.get("specification_sha256")
+        != canonical_sha256(specification)
+        or not isinstance(prediction, dict)
+        or not isinstance(decoding, dict)
+        or not isinstance(runtime, dict)
+    ):
+        raise ValueError("Reference prediction provenance is inconsistent")
+    if specification.get("task") != task:
+        raise ValueError("Reference prediction provenance task mismatch")
+    expected_direction = direction if task == "mt" else None
+    if specification.get("mt_direction") != expected_direction:
+        raise ValueError("Reference prediction provenance direction mismatch")
+    adapter = specification.get("adapter")
+    if (
+        not isinstance(adapter, dict)
+        or adapter.get("manifest_sha256") != adapter_manifest_sha256
+    ):
+        raise ValueError("Reference prediction provenance adapter mismatch")
+    manifest = specification.get("manifest")
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("bytes") != manifest_path.stat().st_size
+        or manifest.get("sha256") != sha256(manifest_path)
+    ):
+        raise ValueError("Reference prediction provenance manifest mismatch")
+    if (
+        prediction.get("bytes") != predictions_path.stat().st_size
+        or prediction.get("sha256") != sha256(predictions_path)
+        or prediction.get("rows") != prediction_rows
+    ):
+        raise ValueError("Reference prediction provenance prediction mismatch")
+    num_beams = specification.get("num_beams")
+    if (
+        isinstance(num_beams, bool)
+        or not isinstance(num_beams, int)
+        or num_beams < 1
+        or decoding.get("num_beams") != num_beams
+    ):
+        raise ValueError("Reference prediction provenance decoding mismatch")
+    return {"num_beams": num_beams, "do_sample": False}
+
+
+def _verify_quantized_provenance(
+    path: Path,
+    *,
+    task: str,
+    direction: str | None,
+    candidate_id: str,
+    adapter_manifest_sha256: str,
+    decoding: dict[str, Any],
+    artifact_path: Path,
+    manifest_path: Path,
+    predictions_path: Path,
+    prediction_rows: int,
+) -> None:
+    provenance = _read_json(path, label="Quantized prediction provenance")
+    expected = {
+        "task": task,
+        "direction": direction,
+        "candidate_id": candidate_id,
+        "adapter_manifest_sha256": adapter_manifest_sha256,
+        "decoding": decoding,
+        "artifact": {
+            "bytes": artifact_path.stat().st_size,
+            "sha256": sha256(artifact_path),
+        },
+        "manifest": {
+            "bytes": manifest_path.stat().st_size,
+            "sha256": sha256(manifest_path),
+        },
+        "predictions": {
+            "bytes": predictions_path.stat().st_size,
+            "sha256": sha256(predictions_path),
+            "rows": prediction_rows,
+        },
+    }
+    failures = compiled_prediction_provenance_failures(provenance, expected=expected)
+    if failures:
+        raise ValueError(
+            "Quantized prediction provenance failed: " + ", ".join(failures)
+        )
 
 
 def _row_key(row: dict[str, Any], *, task: str, label: str) -> tuple[str, ...]:
@@ -406,7 +523,9 @@ def seal_quantization_parity(
     artifact_path: Path,
     manifest_path: Path,
     reference_predictions_path: Path,
+    reference_provenance_path: Path,
     quantized_predictions_path: Path,
+    quantized_provenance_path: Path,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Recompute and bind one locked quantization-parity result."""
@@ -450,6 +569,27 @@ def seal_quantization_parity(
         task=task,
         direction=direction,
     )
+    decoding = _verify_reference_provenance(
+        reference_provenance_path,
+        task=task,
+        direction=direction,
+        adapter_manifest_sha256=adapter_manifest_sha256,
+        manifest_path=manifest_path,
+        predictions_path=reference_predictions_path,
+        prediction_rows=len(reference_rows),
+    )
+    _verify_quantized_provenance(
+        quantized_provenance_path,
+        task=task,
+        direction=direction,
+        candidate_id=candidate_id,
+        adapter_manifest_sha256=adapter_manifest_sha256,
+        decoding=decoding,
+        artifact_path=artifact_path,
+        manifest_path=manifest_path,
+        predictions_path=quantized_predictions_path,
+        prediction_rows=len(quantized_rows),
+    )
 
     reference_report = score_mt(reference_rows) if task == "mt" else score_asr(reference_rows)
     quantized_report = score_mt(quantized_rows) if task == "mt" else score_asr(quantized_rows)
@@ -487,7 +627,7 @@ def seal_quantization_parity(
     if evaluated_at.tzinfo is None:
         raise ValueError("now must include a timezone")
     evidence = {
-        "version": 1,
+        "version": 2,
         "status": "pass",
         "evidence_source": "onevoice_quantization_parity",
         "evaluated_at": evaluated_at.isoformat(),
@@ -501,8 +641,13 @@ def seal_quantization_parity(
         "manifest_bytes": manifest_path.stat().st_size,
         "reference_predictions_sha256": sha256(reference_predictions_path),
         "reference_predictions_bytes": reference_predictions_path.stat().st_size,
+        "reference_provenance_sha256": sha256(reference_provenance_path),
+        "reference_provenance_bytes": reference_provenance_path.stat().st_size,
         "quantized_predictions_sha256": sha256(quantized_predictions_path),
         "quantized_predictions_bytes": quantized_predictions_path.stat().st_size,
+        "quantized_provenance_sha256": sha256(quantized_provenance_path),
+        "quantized_provenance_bytes": quantized_provenance_path.stat().st_size,
+        "decoding": decoding,
         "samples": len(reference_rows),
         "bootstrap": {
             "unit": bootstrap_unit,
@@ -543,7 +688,9 @@ def main() -> int:
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--reference-predictions", type=Path, required=True)
+    parser.add_argument("--reference-provenance", type=Path, required=True)
     parser.add_argument("--quantized-predictions", type=Path, required=True)
+    parser.add_argument("--quantized-provenance", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     evidence = seal_quantization_parity(
@@ -554,7 +701,9 @@ def main() -> int:
         artifact_path=args.artifact,
         manifest_path=args.manifest,
         reference_predictions_path=args.reference_predictions,
+        reference_provenance_path=args.reference_provenance,
         quantized_predictions_path=args.quantized_predictions,
+        quantized_provenance_path=args.quantized_provenance,
     )
     write_exclusive(args.output, evidence)
     print(json.dumps(evidence, ensure_ascii=False, indent=2))

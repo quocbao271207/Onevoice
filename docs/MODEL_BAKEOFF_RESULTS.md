@@ -136,7 +136,7 @@ Runner có resume theo command digest, checkpoint watcher, archive/checksum từ
 
 Dự án giữ immutable evidence QCS6490 đã đo ngày 26/09/2026. Tuy nhiên trang Qualcomm hiện tại được kiểm tra lại ngày 05/10/2026 không còn liệt kê QCS6490 cho Whisper-Small-Quantized. Vì vậy evidence cũ không bị xóa, nhưng promotion mới bắt buộc rerun trên board QCS6490 và báo latency p50/p95, power trung bình/p95, nhiệt độ peak, peak RAM/VRAM và model bytes. Không suy diễn khả năng deployment của winner fine-tuned chỉ từ reference OpenAI Whisper-small.
 
-`deployment_selected_winners.json` phải là schema version 1, ghi `measurement_source=physical_board`, timestamp có timezone và metadata board/chipset/OS. Metadata tự khai không đủ: phải chạy `scripts/capture_qcs6490_identity.py` ngay trên board, giữ JSON device-tree/sysfs bất biến dưới `data/reports/model_bakeoff/board-evidence/`, và để finalizer khóa SHA-256. Gate yêu cầu ARM64 cùng cả model board và chuỗi `qcom` compatible nhận dạng QCS6490/RB3 Gen 2; timestamp identity phải nằm trong 24 giờ của phiên benchmark. Arduino, cloud host, evidence cũ hoặc file ngoài thư mục evidence đều bị từ chối. Mỗi winner phải khớp task, chiều, candidate ID và SHA-256 manifest của đúng adapter; artifact triển khai phải nằm dưới `models/`, có path/SHA-256/byte size khớp file thật. Mỗi winner còn bắt buộc parity evidence bất biến dưới `board-evidence/parity/`: sealer đọc float/compiled prediction JSONL trên đúng cùng manifest, đối chiếu toàn bộ metadata ngoài hypothesis, tự chấm metric, paired-bootstrap 1.000 lần và khóa SHA-256 của manifest, hai prediction files cùng compiled artifact. Point estimate và cận trên 95% CI của relative degradation phải ≤2%; ASR cần ít nhất 32 group/speaker độc lập; float lẫn compiled output phải zero failure trên drug/dose/number/unit/negation/terminology/code-switch. Raw measurements không được tin từ draft: mỗi winner phải trỏ tới một JSON bất biến dưới `board-evidence/measurements/`, khóa version/capture source/timestamp, identity SHA, artifact SHA/bytes, candidate/adapter binding, latency/power/thermal samples, nguồn sensor và peak RAM/VRAM. Finalizer khóa SHA-256 parity/measurement artifacts rồi mới copy dữ liệu sang report. Report phải chứa ít nhất 30 mẫu riêng cho latency, power và thermal. Runner đọc lại evidence, tự tính latency p50/p95, power trung bình/p95 và nhiệt độ peak; artifact bị sửa, parity/measurement binding sai, metric không khớp mẫu, sensor thiếu, mẫu không hữu hạn/phi vật lý hoặc sample count thiếu đều fail-closed. VRAM được phép bằng 0 nếu chạy NPU/CPU. Report cloud cũ, report của model khác hoặc số đo giả/thiếu đều bị reject.
+`deployment_selected_winners.json` phải là schema version 1, ghi `measurement_source=physical_board`, timestamp có timezone và metadata board/chipset/OS. Metadata tự khai không đủ: phải chạy `scripts/capture_qcs6490_identity.py` ngay trên board, giữ JSON device-tree/sysfs bất biến dưới `data/reports/model_bakeoff/board-evidence/`, và để finalizer khóa SHA-256. Gate yêu cầu ARM64 cùng cả model board và chuỗi `qcom` compatible nhận dạng QCS6490/RB3 Gen 2; timestamp identity phải nằm trong 24 giờ của phiên benchmark. Arduino, cloud host, evidence cũ hoặc file ngoài thư mục evidence đều bị từ chối. Mỗi winner phải khớp task, chiều, candidate ID và SHA-256 manifest của đúng adapter; artifact triển khai phải nằm dưới `models/`, có path/SHA-256/byte size khớp file thật. Mỗi winner còn bắt buộc parity evidence schema 2 bất biến dưới `board-evidence/parity/`: sealer đọc float/compiled prediction JSONL trên đúng cùng manifest, bắt buộc provenance của float checkpoint và compiled capture, đối chiếu decoding cùng toàn bộ metadata ngoài hypothesis, tự chấm metric, paired-bootstrap 1.000 lần và khóa SHA-256 của manifest, hai prediction files, hai provenance files cùng compiled artifact. Point estimate và cận trên 95% CI của relative degradation phải ≤2%; ASR cần ít nhất 32 group/speaker độc lập; float lẫn compiled output phải zero failure trên drug/dose/number/unit/negation/terminology/code-switch. Raw measurements không được tin từ draft: mỗi winner phải trỏ tới một JSON bất biến dưới `board-evidence/measurements/`, khóa version/capture source/timestamp, identity SHA, artifact SHA/bytes, candidate/adapter binding, latency/power/thermal samples, nguồn sensor và peak RAM/VRAM. Finalizer khóa SHA-256 parity/measurement artifacts rồi mới copy dữ liệu sang report. Report phải chứa ít nhất 30 mẫu riêng cho latency, power và thermal. Runner đọc lại evidence, tự tính latency p50/p95, power trung bình/p95 và nhiệt độ peak; artifact bị sửa, parity/measurement/provenance binding sai, decoding khác nhau, metric không khớp mẫu, sensor thiếu, mẫu không hữu hạn/phi vật lý hoặc sample count thiếu đều fail-closed. VRAM được phép bằng 0 nếu chạy NPU/CPU. Report cloud cũ, report của model khác hoặc số đo giả/thiếu đều bị reject.
 
 Không soạn report cuối bằng tay. Khi blind v2 pass, state machine tự tạo draft đã khóa đúng ba winner, checksum cây adapter và checksum `comparison.json`; lệnh tương đương để phục hồi thủ công là:
 
@@ -159,7 +159,25 @@ python scripts/capture_qcs6490_runtime.py \
 
 Sampler xác minh device-tree/sysfs QCS6490 trước khi spawn command, không ghi stdout/stderr lâm sàng, dừng cả process group khi timeout/lỗi sensor, và fail nếu không quan sát được RSS dương. Power/thermal giữ toàn bộ mẫu poll; latency giữ một mẫu cho mỗi invocation; `peak_vram_bytes=0` cho đường NPU/CPU không có VRAM. Output schema 1 có `capture_source=qcs6490_runtime_sampler`, timestamp có timezone, nguồn sensor và peak RAM. Không tự đổi raw JSON thành evidence: dùng sealer để kiểm lại live board, timestamp, sample contract và artifact binding rồi ghi bất biến:
 
-Trước khi finalize, chạy lại cùng manifest khóa qua winner float và compiled artifact rồi seal parity. MT bắt buộc chỉ định chiều; ASR bỏ `--direction` và prediction metadata phải giữ group/speaker của blind set:
+Trước khi finalize, chạy lại cùng manifest khóa qua winner float và compiled artifact rồi seal parity. Float predictions phải giữ file `.provenance.json` do baseline runner tạo. Compiled predictions phải đi qua capture wrapper; ba placeholder là token argv độc lập, mỗi token xuất hiện đúng một lần, và command phải tự ghi JSONL vào `{output_predictions}`. Wrapper không dùng shell, không ghi stdout/stderr lâm sàng, timeout hữu hạn, từ chối overwrite và xóa output chưa hoàn tất khi runtime lỗi:
+
+```bash
+python scripts/capture_compiled_predictions.py \
+  --task mt --direction en_to_vi \
+  --candidate-id <winner-id> \
+  --adapter-manifest-sha256 <64-hex> \
+  --runtime-kind qnn_context_binary \
+  --artifact models/<winner-artifact> \
+  --manifest <locked-parity-manifest.jsonl> \
+  --output-predictions <compiled-predictions.jsonl> \
+  --output-provenance <compiled-predictions.provenance.json> \
+  --num-beams <same-as-float> --timeout-seconds 3600 \
+  -- /opt/onevoice/bin/infer-compiled \
+  --artifact '{artifact}' --manifest '{manifest}' \
+  --output '{output_predictions}'
+```
+
+MT bắt buộc chỉ định chiều; ASR bỏ `--direction` và prediction metadata phải giữ group/speaker của blind set:
 
 ```bash
 python scripts/seal_quantization_parity.py \
@@ -169,7 +187,9 @@ python scripts/seal_quantization_parity.py \
   --artifact models/<winner-artifact> \
   --manifest <locked-parity-manifest.jsonl> \
   --reference-predictions <float-predictions.jsonl> \
+  --reference-provenance <float-predictions.jsonl.provenance.json> \
   --quantized-predictions <compiled-predictions.jsonl> \
+  --quantized-provenance <compiled-predictions.provenance.json> \
   --output data/reports/model_bakeoff/board-evidence/parity/<winner>.json
 ```
 

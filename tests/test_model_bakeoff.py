@@ -1781,7 +1781,7 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "model_bytes": artifact.stat().st_size,
     }
     parity_payload = {
-        "version": 1,
+        "version": 2,
         "status": "pass",
         "evidence_source": "onevoice_quantization_parity",
         "evaluated_at": "2026-10-06T11:00:00+07:00",
@@ -1795,8 +1795,13 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
         "manifest_bytes": 1000,
         "reference_predictions_sha256": "c" * 64,
         "reference_predictions_bytes": 2000,
+        "reference_provenance_sha256": "e" * 64,
+        "reference_provenance_bytes": 1000,
         "quantized_predictions_sha256": "d" * 64,
         "quantized_predictions_bytes": 2000,
+        "quantized_provenance_sha256": "f" * 64,
+        "quantized_provenance_bytes": 1000,
+        "decoding": {"num_beams": 1, "do_sample": False},
         "samples": 32,
         "bootstrap": {
             "unit": "row",
@@ -1838,9 +1843,16 @@ def test_deployment_gate_requires_physical_qcs6490_and_valid_metrics(tmp_path: P
             "parity_reference_predictions_sha256": parity_payload[
                 "reference_predictions_sha256"
             ],
+            "parity_reference_provenance_sha256": parity_payload[
+                "reference_provenance_sha256"
+            ],
             "parity_quantized_predictions_sha256": parity_payload[
                 "quantized_predictions_sha256"
             ],
+            "parity_quantized_provenance_sha256": parity_payload[
+                "quantized_provenance_sha256"
+            ],
+            "parity_decoding": parity_payload["decoding"],
             "parity_samples": parity_payload["samples"],
             "parity_bootstrap": parity_payload["bootstrap"],
             "parity_metrics": parity_payload["metrics"],

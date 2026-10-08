@@ -372,9 +372,16 @@ def finalize_report(
                 "parity_reference_predictions_sha256": parity[
                     "reference_predictions_sha256"
                 ],
+                "parity_reference_provenance_sha256": parity[
+                    "reference_provenance_sha256"
+                ],
                 "parity_quantized_predictions_sha256": parity[
                     "quantized_predictions_sha256"
                 ],
+                "parity_quantized_provenance_sha256": parity[
+                    "quantized_provenance_sha256"
+                ],
+                "parity_decoding": deepcopy(parity["decoding"]),
                 "parity_samples": parity["samples"],
                 "parity_bootstrap": deepcopy(parity["bootstrap"]),
                 "parity_metrics": deepcopy(parity["metrics"]),
