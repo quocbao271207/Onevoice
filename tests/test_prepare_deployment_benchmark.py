@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -11,21 +12,117 @@ from scripts.prepare_deployment_benchmark import (
     finalize_report,
     selected_winner_specs,
 )
-from scripts.run_model_bakeoff import QUANTIZATION_PARITY_SLICES, sha256
+from scripts.run_model_bakeoff import QUANTIZATION_PARITY_SLICES, sha256, tree_manifest
+from src.pipeline.license_policy import license_decisions
+from src.pipeline.selection_policy import selection_policy_record
 
 
-def deployment_fixture(tmp_path: Path) -> tuple[Path, dict, dict, Path]:
+def deployment_fixture(
+    tmp_path: Path,
+    *,
+    shared_mt_candidate: bool = False,
+) -> tuple[Path, dict, dict, Path]:
     project_root = tmp_path / "project"
     adapters = project_root / "adapters"
     winners: dict[str, dict] = {}
+    candidate_ids = {
+        "mt-en": "mt-shared" if shared_mt_candidate else "mt-en",
+        "mt-vi": "mt-shared" if shared_mt_candidate else "mt-vi",
+        "asr-vi": "asr-vi",
+    }
     for name in ("mt-en", "mt-vi", "asr-vi"):
         adapter = adapters / name
         adapter.mkdir(parents=True)
         (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
         (adapter / "adapter_model.safetensors").write_bytes(name.encode())
-        winners[name] = {"candidate_id": name, "adapter": str(adapter)}
-    comparison = {
-        "status": "blind_complete",
+        winners[name] = {
+            "candidate_id": candidate_ids[name],
+            "adapter": str(adapter),
+            "adapter_manifest_sha256": tree_manifest(adapter)["manifest_sha256"],
+        }
+    accuracy = project_root / "accuracy.yaml"
+    accuracy.write_text(
+        "release_gates:\n"
+        "  aggregate:\n"
+        "    mt_sacrebleu_min: 25\n"
+        "    mt_chrf2_min: 46\n"
+        "    asr_vi_wer_max: 0.25\n",
+        encoding="utf-8",
+    )
+    config = {
+        "principles": {"candidate_a_auto_promotion_forbidden": True},
+        "candidates": {
+            "mt": [
+                {
+                    "id": candidate_id,
+                    "model": f"model/{candidate_id}",
+                    "revision": str(index + 1) * 40,
+                    "license": {
+                        "id": "mit",
+                        "source": f"https://example.invalid/{candidate_id}",
+                        "review_status": "approved",
+                        "production_eligible": True,
+                        "gpu_eligible": True,
+                    },
+                }
+                for index, candidate_id in enumerate(
+                    ("mt-shared",) if shared_mt_candidate else ("mt-en", "mt-vi")
+                )
+            ],
+            "asr": [
+                {
+                    "id": "asr-vi",
+                    "model": "model/asr-vi",
+                    "revision": "3" * 40,
+                    "license": {
+                        "id": "apache-2.0",
+                        "source": "https://example.invalid/asr-vi",
+                        "review_status": "approved",
+                        "production_eligible": True,
+                        "gpu_eligible": True,
+                    },
+                }
+            ],
+        },
+        "promotion_gate": {
+            "mt_metrics": ["sacrebleu", "chrf2"],
+            "asr_metrics": ["wer", "cer", "code_switch_wer"],
+            "asr_code_switch_wer_max": 0.21,
+            "critical_slices": [],
+            "policy_slices": [],
+            "deployment_metrics": [
+                "latency_p50_ms",
+                "latency_p95_ms",
+                "peak_ram_bytes",
+                "peak_vram_bytes",
+                "model_bytes",
+            ],
+            "deployment_min_runs": 30,
+        },
+        "data": {
+            "selection_dev": {
+                "mt": {"sha256": "a" * 64},
+                "asr": {"sha256": "b" * 64},
+            },
+            "accuracy_program": {
+                "path": str(accuracy),
+                "sha256": sha256(accuracy),
+            },
+        },
+    }
+    selection_comparison = {
+        "status": "selection_complete",
+        "scope": "research",
+        "candidate_a_freeze": "candidate-a-freeze.json",
+        "candidate_a_locked_evaluations": {},
+        "selection_sha256": {
+            "mt": "a" * 64,
+            "asr": "b" * 64,
+            "accuracy_program": sha256(accuracy),
+        },
+        "selection_policy": selection_policy_record(config),
+        "research_license_approvals": [],
+        "license_decisions": license_decisions(config, set()),
         "results": {
             "mt": {
                 "winners": {
@@ -36,21 +133,166 @@ def deployment_fixture(tmp_path: Path) -> tuple[Path, dict, dict, Path]:
             "asr": {"winners": {"vi": winners["asr-vi"]}},
         },
     }
-    selection = project_root / "selection.json"
-    selection.parent.mkdir(parents=True, exist_ok=True)
-    selection.write_text(json.dumps(comparison), encoding="utf-8")
-    config = {
-        "promotion_gate": {
-            "deployment_metrics": [
-                "latency_p50_ms",
-                "latency_p95_ms",
-                "peak_ram_bytes",
-                "peak_vram_bytes",
-                "model_bytes",
-            ],
-            "deployment_min_runs": 30,
-        }
+    snapshot = project_root / "selection-snapshot.json"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(json.dumps(selection_comparison), encoding="utf-8")
+    snapshot_record = {"path": str(snapshot), "sha256": sha256(snapshot)}
+
+    blind_dir = project_root / "blind"
+    blind_dir.mkdir()
+    mt_manifest = blind_dir / "mt.jsonl"
+    asr_manifest = blind_dir / "asr.jsonl"
+    mt_manifest.write_text('{"id":"mt"}\n', encoding="utf-8")
+    asr_manifest.write_text('{"id":"asr"}\n', encoding="utf-8")
+    manifest_paths = {"mt": mt_manifest, "asr": asr_manifest}
+    candidate_config = {
+        candidate["id"]: candidate
+        for task in ("mt", "asr")
+        for candidate in config["candidates"][task]
     }
+    results = []
+    opened = {"mt": {"en_to_vi": None, "vi_to_en": None}, "asr": None}
+    for task, direction, winner in (
+        ("mt", "en_to_vi", winners["mt-en"]),
+        ("mt", "vi_to_en", winners["mt-vi"]),
+        ("asr", None, winners["asr-vi"]),
+    ):
+        candidate = candidate_config[winner["candidate_id"]]
+        manifest = manifest_paths[task]
+        specification = {
+            "candidate": winner["candidate_id"],
+            "model": candidate["model"],
+            "revision": candidate["revision"],
+            "adapter": str(Path(winner["adapter"]).resolve()),
+            "adapter_manifest_sha256": winner["adapter_manifest_sha256"],
+            "selection_sha256": snapshot_record["sha256"],
+            "blind_manifest_sha256": sha256(manifest),
+            "direction": direction,
+            "scope": "research",
+        }
+        digest = hashlib.sha256(
+            json.dumps(specification, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        key = direction or "vi"
+        report = blind_dir / f"{task}-{key}.json"
+        if task == "mt":
+            report_payload = {
+                "directions": {
+                    str(direction): {
+                        "samples": 1,
+                        "sacrebleu": 30.0,
+                        "sacrebleu_bootstrap_95ci": [29.0, 31.0],
+                        "chrf2": 50.0,
+                        "chrf2_bootstrap_95ci": [49.0, 51.0],
+                    }
+                },
+                "categories": {},
+            }
+        else:
+            report_payload = {
+                "samples": 1,
+                "wer": 0.1,
+                "wer_bootstrap_95ci": [0.08, 0.12],
+                "wer_bootstrap_unit": "group",
+                "wer_bootstrap_clusters": 0,
+                "cer": 0.05,
+                "unique_speakers": 0,
+                "unique_groups": 0,
+                "categories": {},
+                "slices": {"code_switch": {"True": {"wer": 0.1}}},
+            }
+        report.write_text(json.dumps(report_payload), encoding="utf-8")
+        provenance = blind_dir / f"{task}-{key}.provenance.json"
+        provenance.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "created_at": "2026-10-06T12:00:00+07:00",
+                    "specification_sha256": digest,
+                    "blind_manifest_sha256": sha256(manifest),
+                    "selection_sha256": snapshot_record["sha256"],
+                    "report": str(report),
+                    "report_bytes": report.stat().st_size,
+                    "report_sha256": sha256(report),
+                    "resource_run": {"return_code": 0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = {
+            "evaluated_at": "2026-10-06T12:00:00+07:00",
+            "candidate": specification,
+            "manifest_sha256": sha256(manifest),
+            "selection_sha256": snapshot_record["sha256"],
+            "report": str(report),
+            "report_bytes": report.stat().st_size,
+            "report_sha256": sha256(report),
+            "report_provenance": str(provenance),
+            "critical_gate": "pass",
+            "failed_slices": [],
+            "coverage_gate": "pass",
+            "coverage_failures": [],
+            "quality_gate": "pass",
+            "quality_failures": [],
+            "promotion_allowed": True,
+        }
+        results.append(result)
+        record = {
+            **specification,
+            "candidate_sha256": digest,
+            "opened_at": "2026-10-06T12:00:00+07:00",
+            "result": result,
+        }
+        if task == "mt":
+            opened["mt"][str(direction)] = record
+        else:
+            opened["asr"] = record
+
+    lock = project_root / "blind-lock.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "status": "opened",
+                "required_slices": {"mt": [], "asr": []},
+                "minimum_coverage": {
+                    "mt": {"rows": 1, "slice_samples": {}},
+                    "asr": {"rows": 1, "slice_samples": {}},
+                },
+                "manifests": {
+                    "mt": {
+                        "path": str(mt_manifest),
+                        "rows": 1,
+                        "sha256": sha256(mt_manifest),
+                        "coverage": {"rows": 1, "slice_samples": {}},
+                    },
+                    "asr": {
+                        "path": str(asr_manifest),
+                        "rows": 1,
+                        "sha256": sha256(asr_manifest),
+                        "coverage": {
+                            "rows": 1,
+                            "slice_samples": {},
+                            "unique_speakers": 0,
+                            "unique_groups": 0,
+                        },
+                    },
+                },
+                "selection": snapshot_record,
+                "opened": opened,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config["data"]["blind_test_v2_lock"] = str(lock)
+    comparison = {
+        **selection_comparison,
+        "status": "blind_complete",
+        "selection_snapshot": snapshot_record,
+        "blind_test_v2": results,
+    }
+    selection = project_root / "selection.json"
+    selection.write_text(json.dumps(comparison), encoding="utf-8")
     return selection, comparison, config, project_root
 
 
@@ -206,9 +448,9 @@ def write_parity_evidence(
 
 
 def test_template_binds_all_selected_winners(tmp_path: Path):
-    selection, comparison, _, _ = deployment_fixture(tmp_path)
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
 
-    report = build_template(selection, comparison)
+    report = build_template(selection, comparison, config, project_root)
 
     assert report["status"] == "pending_physical_measurement"
     assert report["selection_comparison"]["sha256"] == sha256(selection)
@@ -227,9 +469,79 @@ def test_template_binds_all_selected_winners(tmp_path: Path):
     assert all(winner["temperature_samples_c"] == [] for winner in report["winners"])
 
 
+def test_template_allows_one_mt_candidate_to_win_both_directions(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(
+        tmp_path,
+        shared_mt_candidate=True,
+    )
+
+    report = build_template(selection, comparison, config, project_root)
+
+    assert {
+        (winner["task"], winner.get("direction"), winner["candidate_id"])
+        for winner in report["winners"]
+    } == {
+        ("mt", "en_to_vi", "mt-shared"),
+        ("mt", "vi_to_en", "mt-shared"),
+        ("asr", None, "asr-vi"),
+    }
+
+
+def test_template_rejects_blind_gate_or_snapshot_tampering(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    comparison["blind_test_v2"][0]["promotion_allowed"] = False
+    selection.write_text(json.dumps(comparison), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Blind completion gate did not pass"):
+        build_template(selection, comparison, config, project_root)
+
+    selection, comparison, config, project_root = deployment_fixture(tmp_path / "other")
+    comparison["results"]["mt"]["winners"]["en_to_vi"]["candidate_id"] = "other"
+    selection.write_text(json.dumps(comparison), encoding="utf-8")
+    with pytest.raises(ValueError, match="snapshot identity differs"):
+        build_template(selection, comparison, config, project_root)
+
+
+def test_finalize_rechecks_blind_report_provenance(tmp_path: Path):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    draft = build_template(selection, comparison, config, project_root)
+    report = Path(comparison["blind_test_v2"][0]["report"])
+    report.write_text('{"status":"tampered"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Blind report checksum mismatch"):
+        finalize_report(selection, comparison, draft, config, project_root)
+
+
+def test_template_recomputes_blind_quality_instead_of_trusting_pass_flags(
+    tmp_path: Path,
+):
+    selection, comparison, config, project_root = deployment_fixture(tmp_path)
+    result = comparison["blind_test_v2"][0]
+    report_path = Path(result["report"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["directions"]["en_to_vi"]["sacrebleu"] = 1.0
+    report["directions"]["en_to_vi"]["sacrebleu_bootstrap_95ci"] = [1.0, 1.0]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    result["report_bytes"] = report_path.stat().st_size
+    result["report_sha256"] = sha256(report_path)
+    provenance_path = Path(result["report_provenance"])
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["report_bytes"] = result["report_bytes"]
+    provenance["report_sha256"] = result["report_sha256"]
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    lock_path = Path(config["data"]["blind_test_v2_lock"])
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["opened"]["mt"]["en_to_vi"]["result"] = result
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    selection.write_text(json.dumps(comparison), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="gate recomputation mismatch"):
+        build_template(selection, comparison, config, project_root)
+
+
 def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: Path):
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
-    draft = build_template(selection, comparison)
+    draft = build_template(selection, comparison, config, project_root)
     draft["measured_at"] = "2026-10-06T12:00:00+07:00"
     identity = write_identity_evidence(project_root)
     draft["device"].update(
@@ -305,7 +617,7 @@ def test_finalize_computes_artifact_identity_and_latency_percentiles(tmp_path: P
 
 def test_finalize_rejects_changed_winner_binding(tmp_path: Path):
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
-    draft = build_template(selection, comparison)
+    draft = build_template(selection, comparison, config, project_root)
     identity = write_identity_evidence(project_root)
     draft["device"].update(
         {
@@ -321,7 +633,7 @@ def test_finalize_rejects_changed_winner_binding(tmp_path: Path):
 
 def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Path):
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
-    draft = build_template(selection, comparison)
+    draft = build_template(selection, comparison, config, project_root)
     draft["measured_at"] = "2026-10-06T12:00:00+07:00"
     identity = write_identity_evidence(
         project_root,
@@ -366,7 +678,7 @@ def test_finalize_fails_closed_before_publishing_invalid_board_data(tmp_path: Pa
 
 def test_finalize_rejects_missing_power_or_thermal_samples(tmp_path: Path):
     selection, comparison, config, project_root = deployment_fixture(tmp_path)
-    draft = build_template(selection, comparison)
+    draft = build_template(selection, comparison, config, project_root)
     draft["measured_at"] = "2026-10-06T12:00:00+07:00"
     identity = write_identity_evidence(project_root)
     draft["device"].update(

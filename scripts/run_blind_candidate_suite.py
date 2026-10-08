@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,8 +27,14 @@ from src.data.quality import fingerprint_text, normalize_text  # noqa: E402
 from src.pipeline.license_policy import license_decisions  # noqa: E402
 from src.pipeline.selection_policy import (  # noqa: E402
     configured_selection_hashes,
+    selection_identity,
     selection_policy_record,
 )
+
+
+MAX_BLIND_REPORT_BYTES = 50_000_000
+MAX_BLIND_PROVENANCE_BYTES = 5_000_000
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def utc_now() -> str:
@@ -539,9 +546,15 @@ def blind_quality_failures(
     return failures
 
 
-def load_locked_accuracy_config(config: dict[str, Any]) -> dict[str, Any]:
+def load_locked_accuracy_config(
+    config: dict[str, Any],
+    project_root: Path = ROOT,
+) -> dict[str, Any]:
     record = config["data"]["accuracy_program"]
-    path = (ROOT / record["path"]).resolve()
+    path = Path(record["path"])
+    if not path.is_absolute():
+        path = project_root / path
+    path = path.resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
     actual = sha256(path)
@@ -836,6 +849,336 @@ def verify_report_provenance(
     if any(provenance.get(key) != value for key, value in expected.items()):
         raise ValueError(f"Blind report provenance mismatch: {report_path}")
     return provenance
+
+
+def _load_bounded_json(path: Path, *, label: str, maximum_bytes: int) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"{label} is missing or not a regular file: {path}")
+    size = path.stat().st_size
+    if size < 2 or size > maximum_bytes:
+        raise ValueError(f"{label} size is outside the valid range")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return payload
+
+
+def _aware_timestamp(value: Any, *, label: str) -> None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{label} timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} timestamp is invalid")
+
+
+def _resolved_record_path(value: Any, project_root: Path, *, label: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} path is missing")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = project_root / path
+    if path.is_symlink():
+        raise ValueError(f"{label} path cannot be a symlink")
+    return path.resolve()
+
+
+def verify_completed_blind_selection(
+    selection_path: Path,
+    comparison: dict[str, Any],
+    config: dict[str, Any],
+    winner_specs: list[tuple[str, str | None, dict[str, Any]]],
+    project_root: Path = ROOT,
+) -> dict[str, Any]:
+    """Verify all immutable blind evidence before deployment work may begin."""
+    if selection_path.is_symlink():
+        raise ValueError("Deployment selection comparison cannot be a symlink")
+    selection_path = selection_path.resolve()
+    loaded_comparison = _load_bounded_json(
+        selection_path,
+        label="Deployment selection comparison",
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
+    if loaded_comparison != comparison:
+        raise ValueError("Deployment selection comparison changed while validating")
+    if comparison.get("status") not in {"blind_complete", "complete"}:
+        raise ValueError("Deployment evidence requires completed blind evaluation")
+    scope = comparison.get("scope")
+    if scope not in {"research", "production"}:
+        raise ValueError("Blind completion scope is invalid")
+    if comparison.get("selection_policy") != selection_policy_record(config):
+        raise ValueError("Blind completion selection policy is stale or mismatched")
+    if comparison.get("selection_sha256") != configured_selection_hashes(config):
+        raise ValueError("Blind completion selection inputs are stale or mismatched")
+    approvals = comparison.get("research_license_approvals")
+    if (
+        not isinstance(approvals, list)
+        or approvals != sorted(set(approvals))
+        or any(not isinstance(value, str) or not value for value in approvals)
+    ):
+        raise ValueError("Blind completion research license approvals are invalid")
+    decisions = license_decisions(config, set(approvals))
+    if comparison.get("license_decisions") != decisions:
+        raise ValueError("Blind completion license decisions are missing or mismatched")
+
+    snapshot_record = comparison.get("selection_snapshot")
+    if not isinstance(snapshot_record, dict) or set(snapshot_record) != {"path", "sha256"}:
+        raise ValueError("Blind completion selection snapshot is missing")
+    snapshot_path = _resolved_record_path(
+        snapshot_record.get("path"),
+        project_root,
+        label="Selection snapshot",
+    )
+    if snapshot_path.is_symlink() or not snapshot_path.is_file():
+        raise FileNotFoundError(f"Selection snapshot is missing: {snapshot_path}")
+    snapshot_sha256 = str(snapshot_record.get("sha256") or "")
+    if not SHA256_RE.fullmatch(snapshot_sha256) or sha256(snapshot_path) != snapshot_sha256:
+        raise ValueError("Selection snapshot checksum mismatch")
+    snapshot = _load_bounded_json(
+        snapshot_path,
+        label="Selection snapshot",
+        maximum_bytes=MAX_BLIND_REPORT_BYTES,
+    )
+    if snapshot.get("status") != "selection_complete":
+        raise ValueError("Selection snapshot status is invalid")
+    if selection_identity(snapshot) != selection_identity(comparison):
+        raise ValueError("Selection snapshot identity differs from deployment comparison")
+
+    lock_value = config.get("data", {}).get("blind_test_v2_lock")
+    lock_path = _resolved_record_path(
+        lock_value,
+        project_root,
+        label="Blind v2 lock",
+    )
+    lock = verify_lock(lock_path)
+    if lock.get("status") != "opened":
+        raise ValueError("Blind v2 lock is not fully opened")
+    lock_selection = lock.get("selection")
+    lock_selection_path = _resolved_record_path(
+        lock_selection.get("path") if isinstance(lock_selection, dict) else None,
+        project_root,
+        label="Blind lock selection",
+    )
+    if (
+        not isinstance(lock_selection, dict)
+        or lock_selection_path != snapshot_path
+        or lock_selection.get("sha256") != snapshot_sha256
+    ):
+        raise ValueError("Blind v2 lock selection binding mismatch")
+
+    expected_by_binding: dict[
+        tuple[str, str | None], tuple[str, str | None, dict[str, Any]]
+    ] = {}
+    for task, direction, winner in winner_specs:
+        candidate_id = str(winner.get("candidate_id") or "")
+        binding = (candidate_id, direction)
+        if not candidate_id or binding in expected_by_binding:
+            raise ValueError("Deployment winners contain duplicate or missing bindings")
+        expected_by_binding[binding] = (task, direction, winner)
+    results = comparison.get("blind_test_v2")
+    if not isinstance(results, list) or len(results) != len(expected_by_binding):
+        raise ValueError("Blind completion must contain one result for every winner")
+
+    result_fields = {
+        "evaluated_at",
+        "candidate",
+        "manifest_sha256",
+        "selection_sha256",
+        "report",
+        "report_bytes",
+        "report_sha256",
+        "report_provenance",
+        "critical_gate",
+        "failed_slices",
+        "coverage_gate",
+        "coverage_failures",
+        "quality_gate",
+        "quality_failures",
+        "promotion_allowed",
+    }
+    candidate_fields = {
+        "candidate",
+        "model",
+        "revision",
+        "adapter",
+        "adapter_manifest_sha256",
+        "selection_sha256",
+        "blind_manifest_sha256",
+        "direction",
+        "scope",
+    }
+    provenance_fields = {
+        "version",
+        "created_at",
+        "specification_sha256",
+        "blind_manifest_sha256",
+        "selection_sha256",
+        "report",
+        "report_bytes",
+        "report_sha256",
+        "resource_run",
+    }
+    accuracy_config = load_locked_accuracy_config(config, project_root)
+    required_slices = (
+        config["promotion_gate"]["critical_slices"]
+        + config["promotion_gate"]["policy_slices"]
+    )
+    observed: set[tuple[str, str | None]] = set()
+    for result in results:
+        if not isinstance(result, dict) or set(result) != result_fields:
+            raise ValueError("Blind completion result schema is invalid")
+        candidate_specification = result.get("candidate")
+        if (
+            not isinstance(candidate_specification, dict)
+            or set(candidate_specification) != candidate_fields
+        ):
+            raise ValueError("Blind completion candidate specification is invalid")
+        candidate_id = str(candidate_specification.get("candidate") or "")
+        candidate_direction = candidate_specification.get("direction")
+        binding = (candidate_id, candidate_direction)
+        expected = expected_by_binding.get(binding)
+        if expected is None or binding in observed:
+            raise ValueError("Blind completion candidate set is invalid")
+        observed.add(binding)
+        task, direction, winner = expected
+        decision = decisions.get(candidate_id)
+        if (
+            not isinstance(decision, dict)
+            or decision.get("task") != task
+            or decision.get("gpu_allowed") is not True
+            or (scope == "production" and decision.get("production_eligible") is not True)
+        ):
+            raise ValueError(f"Blind completion license gate failed: {candidate_id}")
+        configured = candidate_from_config(config, task, candidate_id)
+        if (
+            candidate_specification.get("model") != configured.get("model")
+            or candidate_specification.get("revision") != configured.get("revision")
+            or candidate_specification.get("direction") != direction
+            or candidate_specification.get("scope") != scope
+            or Path(str(candidate_specification.get("adapter") or "")).resolve()
+            != Path(str(winner.get("adapter") or "")).resolve()
+            or candidate_specification.get("adapter_manifest_sha256")
+            != winner.get("adapter_manifest_sha256")
+            or candidate_specification.get("selection_sha256") != snapshot_sha256
+        ):
+            raise ValueError(f"Blind completion winner binding mismatch: {candidate_id}")
+        manifest_sha256 = str(result.get("manifest_sha256") or "")
+        if (
+            not SHA256_RE.fullmatch(manifest_sha256)
+            or candidate_specification.get("blind_manifest_sha256") != manifest_sha256
+            or result.get("selection_sha256") != snapshot_sha256
+        ):
+            raise ValueError(f"Blind completion manifest binding mismatch: {candidate_id}")
+        if (
+            result.get("critical_gate") != "pass"
+            or result.get("coverage_gate") != "pass"
+            or result.get("quality_gate") != "pass"
+            or result.get("failed_slices") != []
+            or result.get("coverage_failures") != []
+            or result.get("quality_failures") != []
+            or result.get("promotion_allowed") is not True
+        ):
+            raise ValueError(f"Blind completion gate did not pass: {candidate_id}")
+        _aware_timestamp(result.get("evaluated_at"), label="Blind result")
+
+        report_path = _resolved_record_path(
+            result.get("report"),
+            project_root,
+            label="Blind report",
+        )
+        report_payload = _load_bounded_json(
+            report_path,
+            label="Blind report",
+            maximum_bytes=MAX_BLIND_REPORT_BYTES,
+        )
+        if (
+            result.get("report_bytes") != report_path.stat().st_size
+            or result.get("report_sha256") != sha256(report_path)
+        ):
+            raise ValueError(f"Blind report checksum mismatch: {candidate_id}")
+        manifest_record = lock["manifests"][task]
+        expected_slices = {
+            name: int(manifest_record["coverage"]["slice_samples"][name])
+            for name in lock["required_slices"][task]
+        }
+        recomputed_clinical = clinical_failures(report_payload, required_slices)
+        recomputed_coverage = blind_report_coverage_failures(
+            report_payload,
+            task,
+            direction,
+            int(manifest_record["rows"]),
+            expected_slices,
+            {
+                name: int(manifest_record["coverage"][name])
+                for name in ("unique_speakers", "unique_groups")
+                if name in manifest_record["coverage"]
+            }
+            if task == "asr"
+            else None,
+        )
+        recomputed_quality = blind_quality_failures(
+            report_payload,
+            task,
+            direction,
+            accuracy_config,
+            config,
+        )
+        if (
+            recomputed_clinical != result.get("failed_slices")
+            or recomputed_coverage != result.get("coverage_failures")
+            or recomputed_quality != result.get("quality_failures")
+        ):
+            raise ValueError(f"Blind report gate recomputation mismatch: {candidate_id}")
+        provenance_path = _resolved_record_path(
+            result.get("report_provenance"),
+            project_root,
+            label="Blind report provenance",
+        )
+        provenance = _load_bounded_json(
+            provenance_path,
+            label="Blind report provenance",
+            maximum_bytes=MAX_BLIND_PROVENANCE_BYTES,
+        )
+        resource_run = provenance.get("resource_run")
+        if (
+            set(provenance) != provenance_fields
+            or isinstance(provenance.get("version"), bool)
+            or provenance.get("version") != 1
+            or provenance.get("specification_sha256")
+            != hashlib.sha256(
+                json.dumps(
+                    candidate_specification,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            or provenance.get("blind_manifest_sha256") != manifest_sha256
+            or provenance.get("selection_sha256") != snapshot_sha256
+            or Path(str(provenance.get("report") or "")).resolve() != report_path
+            or provenance.get("report_bytes") != result.get("report_bytes")
+            or provenance.get("report_sha256") != result.get("report_sha256")
+            or not isinstance(resource_run, dict)
+            or isinstance(resource_run.get("return_code"), bool)
+            or resource_run.get("return_code") != 0
+        ):
+            raise ValueError(f"Blind report provenance mismatch: {candidate_id}")
+        _aware_timestamp(provenance.get("created_at"), label="Blind provenance")
+
+        lock_slot, lock_key = opening_slot(lock, task, direction)
+        lock_record = lock_slot.get(lock_key)
+        if not isinstance(lock_record, dict) or lock_record.get("result") != result:
+            raise ValueError(f"Blind lock result mismatch: {candidate_id}")
+    if observed != set(expected_by_binding):
+        raise ValueError("Blind completion winner set is incomplete")
+    return {
+        "selection_snapshot_sha256": snapshot_sha256,
+        "blind_lock_sha256": sha256(lock_path),
+        "winner_count": len(observed),
+    }
 
 
 def opening_slot(lock: dict[str, Any], task: str, direction: str | None) -> tuple[dict[str, Any], str]:

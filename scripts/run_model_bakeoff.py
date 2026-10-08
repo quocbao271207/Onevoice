@@ -45,7 +45,11 @@ from scripts.candidate_evidence import (  # noqa: E402
 )
 from src.data.quality import fingerprint_text  # noqa: E402
 from src.pipeline.license_policy import license_decisions, license_gate  # noqa: E402
-from src.pipeline.selection_policy import selection_policy_record  # noqa: E402
+from src.pipeline.selection_policy import (  # noqa: E402
+    selection_identity,
+    selection_identity_sha256,
+    selection_policy_record,
+)
 
 
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
@@ -2628,47 +2632,6 @@ def strongest_eligible_challenger(
     )
 
 
-def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
-    """Return only immutable winner bindings from a selection comparison."""
-    winners: dict[str, dict[str, dict[str, Any]]] = {}
-    for task in ("mt", "asr"):
-        task_winners = comparison.get("results", {}).get(task, {}).get("winners", {})
-        winners[task] = {
-            key: {
-                "candidate_id": winner.get("candidate_id"),
-                "adapter": winner.get("adapter"),
-                "adapter_manifest_sha256": winner.get("adapter_manifest_sha256"),
-                "direction": winner.get("direction"),
-                "profile": winner.get("profile"),
-            }
-            for key, winner in sorted(task_winners.items())
-        }
-    return {
-        "scope": comparison.get("scope"),
-        "candidate_a_freeze": comparison.get("candidate_a_freeze"),
-        "candidate_a_locked_evaluations": comparison.get(
-            "candidate_a_locked_evaluations"
-        ),
-        "selection_sha256": comparison.get("selection_sha256"),
-        "selection_policy": comparison.get("selection_policy"),
-        "research_license_approvals": comparison.get(
-            "research_license_approvals"
-        ),
-        "license_decisions": comparison.get("license_decisions"),
-        "winners": winners,
-    }
-
-
-def selection_identity_sha256(comparison: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            selection_identity(comparison),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-
-
 def run_task_bakeoff(
     *,
     task: str,
@@ -3132,6 +3095,10 @@ def main() -> int:
     else:
         selection_snapshot = deepcopy(comparison)
         atomic_json(selection_snapshot_path, selection_snapshot)
+    comparison["selection_snapshot"] = {
+        "path": str(selection_snapshot_path.resolve()),
+        "sha256": sha256(selection_snapshot_path),
+    }
     atomic_json(comparison_path, comparison)
 
     blind_lock_path = ROOT / config["data"]["blind_test_v2_lock"]
@@ -3204,6 +3171,38 @@ def main() -> int:
     comparison["blind_test_v2"] = blind_results
     comparison["status"] = "blind_complete"
     atomic_json(comparison_path, comparison)
+    blind_pass = all(item.get("promotion_allowed") is True for item in blind_results)
+    if not blind_pass:
+        comparison.update(
+            {
+                "status": "complete",
+                "deployment": None,
+                "deployment_gate_failures": ["not_run_blind_failed"],
+                "promotion_allowed": False,
+                "production_license_gate": False,
+            }
+        )
+        atomic_json(comparison_path, comparison)
+        state["stage"] = "promotion_or_reject"
+        state["execution_status"] = "complete"
+        state["promotion_allowed"] = False
+        state["decision"] = "reject"
+        atomic_json(state_path, state)
+        print(
+            json.dumps(
+                {
+                    **report,
+                    "state": str(state_path),
+                    "candidate_a_freeze": str(freeze_path),
+                    "comparison": str(comparison_path),
+                    "decision": state["decision"],
+                    "note": "Deployment was not run because the blind hard gate failed.",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
 
     expected_deployment = deployment_expectations(winner_specs)
     deployment_dir = ROOT / "data/reports/model_bakeoff"
@@ -3258,7 +3257,6 @@ def main() -> int:
         list(config["promotion_gate"]["deployment_metrics"]),
         int(config["promotion_gate"]["deployment_min_runs"]),
     )
-    blind_pass = all(item.get("promotion_allowed") for item in blind_results)
     winner_ids = {
         winner["candidate_id"]
         for _, _, winner in winner_specs
@@ -3272,7 +3270,7 @@ def main() -> int:
         )["license"].get("production_eligible")
         for winner_id in winner_ids
     )
-    promotion_allowed = blind_pass and deployment_pass and (
+    promotion_allowed = deployment_pass and (
         args.scope == "research" or production_licenses
     )
     comparison.update(

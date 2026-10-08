@@ -40,3 +40,45 @@ def configured_selection_hashes(config: dict[str, Any]) -> dict[str, str]:
         "asr": str(data["selection_dev"]["asr"]["sha256"]),
         "accuracy_program": str(data["accuracy_program"]["sha256"]),
     }
+
+
+def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
+    """Return immutable selection, license and winner bindings only."""
+    winners: dict[str, dict[str, dict[str, Any]]] = {}
+    for task in ("mt", "asr"):
+        task_winners = comparison.get("results", {}).get(task, {}).get("winners", {})
+        winners[task] = {
+            key: {
+                "candidate_id": winner.get("candidate_id"),
+                "adapter": winner.get("adapter"),
+                "adapter_manifest_sha256": winner.get("adapter_manifest_sha256"),
+                "direction": winner.get("direction"),
+                "profile": winner.get("profile"),
+            }
+            for key, winner in sorted(task_winners.items())
+        }
+    return {
+        "scope": comparison.get("scope"),
+        "candidate_a_freeze": comparison.get("candidate_a_freeze"),
+        "candidate_a_locked_evaluations": comparison.get(
+            "candidate_a_locked_evaluations"
+        ),
+        "selection_sha256": comparison.get("selection_sha256"),
+        "selection_policy": comparison.get("selection_policy"),
+        "research_license_approvals": comparison.get(
+            "research_license_approvals"
+        ),
+        "license_decisions": comparison.get("license_decisions"),
+        "winners": winners,
+    }
+
+
+def selection_identity_sha256(comparison: dict[str, Any]) -> str:
+    """Hash the canonical immutable selection identity."""
+    return hashlib.sha256(
+        json.dumps(
+            selection_identity(comparison),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()

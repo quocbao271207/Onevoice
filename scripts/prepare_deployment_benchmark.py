@@ -38,6 +38,9 @@ from scripts.run_model_bakeoff import (  # noqa: E402
     sha256,
     validate_deployment_report,
 )
+from scripts.run_blind_candidate_suite import (  # noqa: E402
+    verify_completed_blind_selection,
+)
 
 
 DEFAULT_CONFIG = ROOT / "configs/model_bakeoff.yaml"
@@ -91,8 +94,18 @@ def selected_winner_specs(comparison: dict[str, Any]) -> list[tuple[str, str | N
 def build_template(
     selection_path: Path,
     comparison: dict[str, Any],
+    config: dict[str, Any],
+    project_root: Path = ROOT,
 ) -> dict[str, Any]:
-    expected = deployment_expectations(selected_winner_specs(comparison))
+    winner_specs = selected_winner_specs(comparison)
+    verify_completed_blind_selection(
+        selection_path,
+        comparison,
+        config,
+        winner_specs,
+        project_root,
+    )
+    expected = deployment_expectations(winner_specs)
     return {
         "version": 1,
         "status": "pending_physical_measurement",
@@ -269,7 +282,15 @@ def finalize_report(
     config: dict[str, Any],
     project_root: Path = ROOT,
 ) -> dict[str, Any]:
-    expected = deployment_expectations(selected_winner_specs(comparison))
+    winner_specs = selected_winner_specs(comparison)
+    verify_completed_blind_selection(
+        selection_path,
+        comparison,
+        config,
+        winner_specs,
+        project_root,
+    )
+    expected = deployment_expectations(winner_specs)
     records = draft.get("winners")
     if not isinstance(records, list) or any(not isinstance(item, dict) for item in records):
         raise ValueError("Deployment draft winners are missing or invalid")
@@ -446,7 +467,7 @@ def main() -> int:
     comparison = json.loads(args.selection_comparison.read_text(encoding="utf-8"))
     config = load_config(args.config)
     if args.action == "template":
-        template = build_template(args.selection_comparison, comparison)
+        template = build_template(args.selection_comparison, comparison, config)
         atomic_json_exclusive(args.draft, template)
         print(json.dumps(template, ensure_ascii=False, indent=2))
         return 0
