@@ -33,6 +33,7 @@ def test_stable_json_returns_exact_payload_identity(tmp_path: Path):
     [
         b'{"status":"pass","status":"fail"}',
         b'{"score":NaN}',
+        b'{"score":1e400}',
         b'[{"status":"pass"}]',
     ],
 )

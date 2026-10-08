@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,18 @@ def _reject_json_constant(_value: str) -> object:
     raise ValueError("JSON document contains a non-finite number")
 
 
+def _reject_decoded_nonfinite_numbers(value: Any) -> None:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("JSON document contains a non-finite number")
+        if isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
 def read_stable_json_mapping(
     path: Path,
     *,
@@ -72,10 +85,14 @@ def read_stable_json_mapping(
             object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_json_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         raise ValueError(f"{label} is not valid strict UTF-8 JSON") from None
     if not isinstance(mapping, dict):
         raise ValueError(f"{label} root must be a mapping")
+    try:
+        _reject_decoded_nonfinite_numbers(mapping)
+    except ValueError:
+        raise ValueError(f"{label} is not valid strict UTF-8 JSON") from None
     return StableJsonDocument(
         path=resolved,
         mapping=mapping,

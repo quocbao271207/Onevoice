@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,18 @@ def _reject_json_constant(_value: str) -> object:
     raise ValueError("JSON document contains a non-finite number")
 
 
+def _reject_decoded_nonfinite_numbers(value: Any) -> None:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("JSON document contains a non-finite number")
+        if isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
 def _decode_row(
     raw_line: bytes,
     *,
@@ -47,7 +60,8 @@ def _decode_row(
             object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_json_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        _reject_decoded_nonfinite_numbers(row)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         raise ValueError(
             f"{label} line {line_number} is not valid strict UTF-8 JSONL"
         ) from None
