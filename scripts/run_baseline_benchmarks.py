@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 import time
 from collections import defaultdict
@@ -32,7 +31,12 @@ from src.pipeline.asr_engine import (  # noqa: E402
     WHISPER_MAX_INPUT_DURATION_SECONDS,
 )
 from src.pipeline.audio_frontend import validate_audio_input  # noqa: E402
+from src.pipeline.durable_file import write_durable_bytes  # noqa: E402
+from src.pipeline.durable_json import write_durable_json  # noqa: E402
+from src.pipeline.evidence_paths import is_link_or_junction  # noqa: E402
 from src.pipeline.generation_guard import require_completed_generation  # noqa: E402
+from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
+from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
 from src.training.mt_model_adapter import (  # noqa: E402
     SUPPORTED_MT_FAMILIES,
     configure_tokenizer,
@@ -41,6 +45,7 @@ from src.training.mt_model_adapter import (  # noqa: E402
     language_codes,
     requested_directions,
 )
+from src.utils.bounded_file import sha256_stable_regular_file  # noqa: E402
 
 
 MODEL_REVISIONS = {
@@ -60,11 +65,35 @@ CANONICAL_SELECTION_MANIFESTS = (
     "data/eval/asr_selection_dev.jsonl",
 )
 MT_MAX_SOURCE_TOKENS = 256
+MAX_BENCHMARK_JSONL_BYTES = 250_000_000
+MAX_BENCHMARK_JSONL_LINE_BYTES = 2_000_000
+MAX_BENCHMARK_JSONL_ROWS = 100_000
+MAX_PREDICTION_PROVENANCE_BYTES = 10_000_000
+MAX_BENCHMARK_REPORT_BYTES = 100_000_000
+PROVENANCE_KEYS = {
+    "schema_version",
+    "specification",
+    "specification_sha256",
+    "predictions",
+    "decoding",
+    "runtime",
+}
+PREDICTION_RECORD_KEYS = {"path", "bytes", "sha256", "rows"}
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+def read_jsonl(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> list[dict[str, Any]]:
+    return read_stable_jsonl_mappings(
+        path,
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        maximum_line_bytes=MAX_BENCHMARK_JSONL_LINE_BYTES,
+        maximum_rows=MAX_BENCHMARK_JSONL_ROWS,
+        label="Benchmark JSONL",
+        expected_sha256=expected_sha256,
+    ).rows
 
 
 def validate_mt_batch_source_lengths(
@@ -224,24 +253,43 @@ def batches(rows: list[Any], size: int):
 
 
 def write_predictions_checkpoint(path: Path, predictions: list[dict[str, Any]]) -> None:
-    """Atomically preserve inference output before potentially long scoring."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    temporary_path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=False) for row in predictions) + "\n",
-        encoding="utf-8",
+    """Durably preserve strict bounded inference output before long scoring."""
+    if not isinstance(predictions, list) or not predictions:
+        raise ValueError("Prediction checkpoint must contain at least one row")
+    if len(predictions) > MAX_BENCHMARK_JSONL_ROWS:
+        raise ValueError(
+            f"Prediction checkpoint exceeds {MAX_BENCHMARK_JSONL_ROWS} rows"
+        )
+    encoded_lines: list[bytes] = []
+    total_bytes = 0
+    for index, row in enumerate(predictions, start=1):
+        if not isinstance(row, dict):
+            raise ValueError(f"Prediction checkpoint row {index} must be an object")
+        try:
+            encoded = (
+                json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Prediction checkpoint row {index} is not strict JSON"
+            ) from None
+        if len(encoded) > MAX_BENCHMARK_JSONL_LINE_BYTES:
+            raise ValueError(
+                f"Prediction checkpoint row {index} exceeds "
+                f"{MAX_BENCHMARK_JSONL_LINE_BYTES} bytes"
+            )
+        encoded_lines.append(encoded)
+        total_bytes += len(encoded)
+        if total_bytes > MAX_BENCHMARK_JSONL_BYTES:
+            raise ValueError(
+                f"Prediction checkpoint exceeds {MAX_BENCHMARK_JSONL_BYTES} bytes"
+            )
+    write_durable_bytes(
+        path,
+        b"".join(encoded_lines),
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        label="Prediction checkpoint",
     )
-    temporary_path.replace(path)
-
-
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.tmp")
-    temporary_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_path, path)
 
 
 def prediction_provenance_path(prediction_path: Path) -> Path:
@@ -250,16 +298,22 @@ def prediction_provenance_path(prediction_path: Path) -> Path:
 
 def prediction_checkpoint_specification(args: argparse.Namespace) -> dict[str, Any]:
     """Bind resumable predictions to every input that can affect inference."""
-    manifest = args.manifest.resolve()
+    manifest_document = read_stable_jsonl_mappings(
+        args.manifest,
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        maximum_line_bytes=MAX_BENCHMARK_JSONL_LINE_BYTES,
+        maximum_rows=MAX_BENCHMARK_JSONL_ROWS,
+        label="Benchmark manifest",
+    )
     return {
         "task": args.task,
         "model": args.model,
         "model_revision": args.model_revision,
         "adapter": adapter_identity(args.adapter),
         "manifest": {
-            "path": str(manifest),
-            "bytes": manifest.stat().st_size,
-            "sha256": sha256(manifest),
+            "path": str(manifest_document.path),
+            "bytes": manifest_document.bytes,
+            "sha256": manifest_document.sha256,
         },
         "samples": args.samples,
         "seed": args.seed,
@@ -310,21 +364,33 @@ def write_prediction_checkpoint(
 ) -> dict[str, Any]:
     """Persist predictions plus immutable provenance before CPU scoring starts."""
     write_predictions_checkpoint(prediction_path, predictions)
+    prediction_document = read_stable_jsonl_mappings(
+        prediction_path,
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        maximum_line_bytes=MAX_BENCHMARK_JSONL_LINE_BYTES,
+        maximum_rows=MAX_BENCHMARK_JSONL_ROWS,
+        label="Prediction checkpoint",
+    )
     provenance = {
         "schema_version": PREDICTION_CHECKPOINT_SCHEMA_VERSION,
         "specification": specification,
         "specification_sha256": canonical_sha256(specification),
         "predictions": {
-            "path": str(prediction_path.resolve()),
-            "bytes": prediction_path.stat().st_size,
-            "sha256": sha256(prediction_path),
-            "rows": len(predictions),
+            "path": str(prediction_document.path),
+            "bytes": prediction_document.bytes,
+            "sha256": prediction_document.sha256,
+            "rows": len(prediction_document.rows),
         },
         "decoding": decoding,
         "runtime": runtime,
     }
     provenance_path = prediction_provenance_path(prediction_path)
-    _atomic_json(provenance_path, provenance)
+    write_durable_json(
+        provenance_path,
+        provenance,
+        maximum_bytes=MAX_PREDICTION_PROVENANCE_BYTES,
+        label="Prediction checkpoint provenance",
+    )
     verified = load_verified_prediction_checkpoint(prediction_path, specification)
     if verified is None:  # pragma: no cover - the files were just written above
         raise RuntimeError(f"Prediction checkpoint disappeared: {prediction_path}")
@@ -337,38 +403,102 @@ def load_verified_prediction_checkpoint(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
     """Return an exact checkpoint or fail closed on incomplete/tampered evidence."""
     provenance_path = prediction_provenance_path(prediction_path)
-    prediction_exists = prediction_path.is_file()
-    provenance_exists = provenance_path.is_file()
+    prediction_exists = prediction_path.exists() or is_link_or_junction(prediction_path)
+    provenance_exists = provenance_path.exists() or is_link_or_junction(provenance_path)
     if not prediction_exists and not provenance_exists:
         return None
     if not prediction_exists or not provenance_exists:
         raise ValueError(f"Incomplete prediction checkpoint: {prediction_path}")
-    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance_document = read_stable_json_mapping(
+        provenance_path,
+        maximum_bytes=MAX_PREDICTION_PROVENANCE_BYTES,
+        label="Prediction checkpoint provenance",
+    )
+    provenance = provenance_document.mapping
     expected_sha256 = canonical_sha256(expected_specification)
     if (
-        provenance.get("schema_version") != PREDICTION_CHECKPOINT_SCHEMA_VERSION
+        set(provenance) != PROVENANCE_KEYS
+        or isinstance(provenance.get("schema_version"), bool)
+        or provenance.get("schema_version") != PREDICTION_CHECKPOINT_SCHEMA_VERSION
         or provenance.get("specification") != expected_specification
         or provenance.get("specification_sha256") != expected_sha256
     ):
         raise ValueError(f"Prediction checkpoint specification mismatch: {prediction_path}")
     prediction_record = provenance.get("predictions")
-    if not isinstance(prediction_record, dict):
-        raise ValueError(f"Invalid prediction checkpoint provenance: {provenance_path}")
     if (
-        prediction_record.get("path") != str(prediction_path.resolve())
-        or int(prediction_record.get("bytes", -1)) != prediction_path.stat().st_size
-        or prediction_record.get("sha256") != sha256(prediction_path)
+        not isinstance(prediction_record, dict)
+        or set(prediction_record) != PREDICTION_RECORD_KEYS
+    ):
+        raise ValueError(f"Invalid prediction checkpoint provenance: {provenance_path}")
+    prediction_document = read_stable_jsonl_mappings(
+        prediction_path,
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        maximum_line_bytes=MAX_BENCHMARK_JSONL_LINE_BYTES,
+        maximum_rows=MAX_BENCHMARK_JSONL_ROWS,
+        label="Prediction checkpoint",
+    )
+    recorded_bytes = prediction_record.get("bytes")
+    recorded_rows = prediction_record.get("rows")
+    if (
+        prediction_record.get("path") != str(prediction_document.path)
+        or isinstance(recorded_bytes, bool)
+        or not isinstance(recorded_bytes, int)
+        or recorded_bytes != prediction_document.bytes
+        or prediction_record.get("sha256") != prediction_document.sha256
+        or isinstance(recorded_rows, bool)
+        or not isinstance(recorded_rows, int)
+        or recorded_rows != len(prediction_document.rows)
     ):
         raise ValueError(f"Prediction checkpoint checksum mismatch: {prediction_path}")
-    predictions = read_jsonl(prediction_path)
     if (
-        any(not isinstance(row, dict) for row in predictions)
-        or int(prediction_record.get("rows", -1)) != len(predictions)
-        or not isinstance(provenance.get("decoding"), dict)
+        not isinstance(provenance.get("decoding"), dict)
         or not isinstance(provenance.get("runtime"), dict)
     ):
         raise ValueError(f"Prediction checkpoint structure mismatch: {prediction_path}")
-    return predictions, provenance
+    persisted_provenance = read_stable_json_mapping(
+        provenance_path,
+        maximum_bytes=MAX_PREDICTION_PROVENANCE_BYTES,
+        label="Prediction checkpoint provenance",
+        expected_sha256=provenance_document.sha256,
+    )
+    persisted_digest, persisted_bytes = sha256_stable_regular_file(
+        prediction_document.path,
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        label="Prediction checkpoint",
+    )
+    if (
+        persisted_provenance.bytes != provenance_document.bytes
+        or persisted_digest != prediction_document.sha256
+        or persisted_bytes != prediction_document.bytes
+    ):
+        raise RuntimeError("Prediction checkpoint changed while verifying")
+    return prediction_document.rows, provenance
+
+
+def _manifest_rows_for_specification(
+    path: Path,
+    specification: dict[str, Any],
+) -> list[dict[str, Any]]:
+    record = specification.get("manifest")
+    if not isinstance(record, dict) or set(record) != {"path", "bytes", "sha256"}:
+        raise ValueError("Prediction specification has invalid manifest identity")
+    document = read_stable_jsonl_mappings(
+        path,
+        maximum_bytes=MAX_BENCHMARK_JSONL_BYTES,
+        maximum_line_bytes=MAX_BENCHMARK_JSONL_LINE_BYTES,
+        maximum_rows=MAX_BENCHMARK_JSONL_ROWS,
+        label="Benchmark manifest",
+        expected_sha256=record.get("sha256"),
+    )
+    recorded_bytes = record.get("bytes")
+    if (
+        record.get("path") != str(document.path)
+        or isinstance(recorded_bytes, bool)
+        or not isinstance(recorded_bytes, int)
+        or recorded_bytes != document.bytes
+    ):
+        raise ValueError("Prediction specification manifest identity changed")
+    return document.rows
 
 
 def resolve_device(requested: str) -> str:
@@ -468,7 +598,12 @@ def run_asr(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-    eligible = [row for row in read_jsonl(args.manifest) if str(row.get("language") or "").startswith(args.language)]
+    specification = checkpoint_specification or prediction_checkpoint_specification(args)
+    eligible = [
+        row
+        for row in _manifest_rows_for_specification(args.manifest, specification)
+        if str(row.get("language") or "").startswith(args.language)
+    ]
     rows = eligible if args.samples == 0 else source_balanced_sample(eligible, args.samples, args.seed)
     processor_source = str(args.adapter) if args.adapter else args.model
     processor_revision = None if args.adapter else args.model_revision
@@ -558,7 +693,7 @@ def run_asr(
         write_prediction_checkpoint(
             prediction_path,
             predictions,
-            checkpoint_specification or prediction_checkpoint_specification(args),
+            specification,
             decoding,
             {"resolved_device": device},
         )
@@ -575,7 +710,8 @@ def run_mt(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    manifest_rows = read_jsonl(args.manifest)
+    specification = checkpoint_specification or prediction_checkpoint_specification(args)
+    manifest_rows = _manifest_rows_for_specification(args.manifest, specification)
     pair_count = len(manifest_rows) if args.samples == 0 else max(1, args.samples // 2)
     rows = source_balanced_sample(manifest_rows, pair_count, args.seed)
     device = prepare_runtime(args)
@@ -650,7 +786,7 @@ def run_mt(
         write_prediction_checkpoint(
             prediction_path,
             predictions,
-            checkpoint_specification or prediction_checkpoint_specification(args),
+            specification,
             decoding,
             {"resolved_device": device},
         )
@@ -777,7 +913,12 @@ def main() -> int:
         }
     )
     report_path = args.output_dir / f"{stem}.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_durable_json(
+        report_path,
+        report,
+        maximum_bytes=MAX_BENCHMARK_REPORT_BYTES,
+        label="Benchmark report",
+    )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 

@@ -280,6 +280,20 @@ def test_predictions_checkpoint_is_utf8_jsonl_and_replaces_stale_file(tmp_path: 
     assert not path.with_suffix(".jsonl.tmp").exists()
 
 
+def test_predictions_checkpoint_preserves_previous_file_on_nonfinite_row(
+    tmp_path: Path,
+):
+    path = tmp_path / "candidate_predictions.jsonl"
+    path.write_text('{"id":"trusted"}\n', encoding="utf-8")
+    persisted = path.read_bytes()
+
+    with pytest.raises(ValueError, match="not strict JSON"):
+        write_predictions_checkpoint(path, [{"id": "unsafe", "score": float("nan")}])
+
+    assert path.read_bytes() == persisted
+    assert not list(tmp_path.glob(".candidate_predictions.jsonl.*.tmp"))
+
+
 def checkpoint_args(tmp_path: Path, *, adapter: bool = True) -> SimpleNamespace:
     manifest = tmp_path / "selection.jsonl"
     manifest.write_text('{"id":"pair"}\n', encoding="utf-8")
@@ -431,6 +445,40 @@ def test_prediction_checkpoint_fails_closed_on_tampering_and_spec_change(tmp_pat
             path,
             prediction_checkpoint_specification(args),
         )
+
+
+def test_prediction_checkpoint_rejects_non_strict_evidence(tmp_path: Path):
+    args = checkpoint_args(tmp_path)
+    path = tmp_path / "candidate_predictions.jsonl"
+    specification = prediction_checkpoint_specification(args)
+    write_prediction_checkpoint(
+        path,
+        [{"id": "pair", "hypothesis": "Dùng 5 mg."}],
+        specification,
+        {"num_beams": 4},
+        {"resolved_device": "cpu"},
+    )
+    provenance_path = prediction_provenance_path(path)
+    provenance_path.write_text(
+        '{"schema_version":1,"schema_version":1}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="strict UTF-8 JSON"):
+        load_verified_prediction_checkpoint(path, specification)
+
+    write_prediction_checkpoint(
+        path,
+        [{"id": "pair", "hypothesis": "Dùng 5 mg."}],
+        specification,
+        {"num_beams": 4},
+        {"resolved_device": "cpu"},
+    )
+    path.write_text(
+        '{"id":"pair","id":"duplicate"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="strict UTF-8 JSONL"):
+        load_verified_prediction_checkpoint(path, specification)
 
 
 def test_prediction_checkpoint_rejects_incomplete_pair(tmp_path: Path):

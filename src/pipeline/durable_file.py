@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from .evidence_paths import (
+    is_link_or_junction,
     prepare_new_file_destination_without_links,
     resolve_regular_file_without_links,
 )
@@ -35,6 +36,75 @@ def _sync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _checked_replace_destination(path: Path, *, label: str) -> Path:
+    absolute = Path(os.path.abspath(path))
+    for ancestor in reversed((absolute.parent, *absolute.parent.parents)):
+        if is_link_or_junction(ancestor):
+            raise ValueError(f"{label} destination cannot traverse a link: {ancestor}")
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    for ancestor in reversed((absolute.parent, *absolute.parent.parents)):
+        if is_link_or_junction(ancestor):
+            raise ValueError(f"{label} destination cannot traverse a link: {ancestor}")
+    if is_link_or_junction(absolute):
+        raise ValueError(f"{label} destination cannot be a link: {absolute}")
+    if absolute.exists() and not absolute.is_file():
+        raise ValueError(f"{label} destination must be a regular file: {absolute}")
+    return absolute
+
+
+def write_durable_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> None:
+    """Durably replace one bounded byte payload through an owned temp."""
+    _validate_arguments(maximum_bytes=maximum_bytes, label=label)
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError(f"{label} payload must be non-empty bytes")
+    if len(payload) > maximum_bytes:
+        raise ValueError(f"{label} payload exceeds {maximum_bytes} bytes")
+    destination = _checked_replace_destination(path, label=label)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            os.chmod(temporary, 0o600)
+        if read_stable_regular_file(
+            temporary,
+            maximum_bytes=maximum_bytes,
+            label=f"Staged {label}",
+        ) != payload:
+            raise RuntimeError(f"Staged {label} does not match its payload")
+        destination = _checked_replace_destination(destination, label=label)
+        os.replace(temporary, destination)
+        _sync_directory(destination.parent)
+        if read_stable_regular_file(
+            destination,
+            maximum_bytes=maximum_bytes,
+            label=f"Persisted {label}",
+        ) != payload:
+            raise RuntimeError(f"Persisted {label} does not match its payload")
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        temporary.unlink(missing_ok=True)
 
 
 def write_durable_bytes_exclusive(

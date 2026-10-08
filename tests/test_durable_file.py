@@ -6,8 +6,33 @@ import pytest
 
 from src.pipeline.durable_file import (
     publish_durable_file_exclusive,
+    write_durable_bytes,
     write_durable_bytes_exclusive,
 )
+
+
+def test_write_durable_bytes_replaces_atomically_and_preserves_on_validation_error(
+    tmp_path: Path,
+):
+    destination = tmp_path / "predictions.jsonl"
+    write_durable_bytes(
+        destination,
+        b'{"id":"one"}\n',
+        maximum_bytes=100,
+        label="Predictions",
+    )
+    persisted = destination.read_bytes()
+
+    with pytest.raises(ValueError, match="non-empty bytes"):
+        write_durable_bytes(
+            destination,
+            b"",
+            maximum_bytes=100,
+            label="Predictions",
+        )
+
+    assert destination.read_bytes() == persisted
+    assert not list(tmp_path.glob(".predictions.jsonl.*.tmp"))
 
 
 def test_write_durable_bytes_exclusive_refuses_overwrite(tmp_path: Path):
@@ -67,6 +92,13 @@ def test_durable_file_rejects_linked_destination_parent(tmp_path: Path):
     except OSError as exc:
         pytest.skip(f"Symlink creation is unavailable: {exc}")
 
+    with pytest.raises(ValueError, match="symlink or junction"):
+        write_durable_bytes(
+            link / "predictions.jsonl",
+            b'{"id":"one"}\n',
+            maximum_bytes=100,
+            label="Predictions",
+        )
     with pytest.raises(ValueError, match="symlink or junction"):
         write_durable_bytes_exclusive(
             link / "evidence.sha256",

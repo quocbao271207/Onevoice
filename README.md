@@ -13,7 +13,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/materialize_audio.py` — refresh URL từ đúng Hugging Face datasets-server ngay trước khi tải, chỉ nhận public HTTPS và loại URL khỏi local manifest
 - `scripts/sanitize_asr_report_urls.py` — dry-run mặc định để kiểm artifact EDA cũ; chỉ `--apply` mới loại nguyên tử đúng trường `audio_url`
 - `scripts/qc_local_audio.py` — decode, chuẩn hóa FLAC mono 16 kHz và loại near-silence/CPS bất khả thi
-- `scripts/run_baseline_benchmarks.py` — baseline ASR VI/EN và MT trên tập khóa
+- `scripts/run_baseline_benchmarks.py` — baseline/candidate ASR VI/EN và MT trên manifest strict/bounded đã khóa; prediction, provenance và report ghi crash-durable, resume-scoring chỉ dùng evidence exact-schema/path/bytes/SHA-256/rows đã đọc ổn định
 - `scripts/run_asr_candidate_suite.py` — chấm LoRA ASR Việt trên full test, code-switch và clinical audio suite, fail-closed
 - `scripts/run_mt_candidate_suite.py` — chấm LoRA MT trên full locked test + clinical suite, fail-closed
 - `scripts/verify_checkpoint_download.py` — xác minh lại archive checkpoint đã tải, sidecar, content manifest, checkpoint index và `trainer_state` mà không extract file; mọi input strict/bounded/no-link, identity được khóa ổn định trước/sau tar read và receipt chỉ publish crash-durable hoặc reuse khi bằng chứng khớp exact
@@ -32,9 +32,9 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `demo/demo_web.py` — UI web chỉ bind `127.0.0.1`, có Host/CSRF/CSP/no-store, request/audio bounded, không lộ candidate fail safety và không tự phát audio; playback dùng token one-time 120 giây và confirmation server-side
 - `src/utils/bounded_file.py` — boundary file dùng chung: chỉ nhận regular file có byte cap, không symlink/junction/reparse point; hỗ trợ đọc nhỏ hoặc SHA-256 streaming hai lượt và phát hiện file bị thay giữa lúc đọc/hash
 - `src/pipeline/adapter_evidence.py` — khóa một canonical adapter identity dùng chung cho Candidate A, bake-off và blind: chống link/junction/special file ở mọi cấp, cap directory/entry/file/bytes, ba lượt enumerate cùng hai lượt stable hash để bắt tree/content mutation
-- `src/pipeline/durable_file.py` — publish immutable byte/file evidence qua temp sở hữu riêng, `fsync`, hard-link độc quyền, persisted revalidation và không overwrite
+- `src/pipeline/durable_file.py` — ghi byte evidence crash-durable qua temp sở hữu riêng, `fsync` và persisted revalidation; hỗ trợ atomic replace cho checkpoint có thể tái tạo hoặc hard-link độc quyền không overwrite cho artifact bất biến
 - `src/pipeline/stable_json.py` — boundary JSON mapping dùng chung: strict UTF-8, cấm duplicate key/non-finite, stable bounded read, no-link path và optional SHA-256 binding
-- `src/pipeline/stable_jsonl.py` — boundary JSONL evidence dùng chung: streaming strict parser có byte/line/row cap, reject duplicate/non-finite/link và bind rows với stable SHA-256/bytes
+- `src/pipeline/stable_jsonl.py` — boundary JSONL evidence dùng chung: streaming strict parser có byte/line/row cap, reject duplicate/non-finite/link, bind rows với stable SHA-256/bytes và có thể bắt buộc khớp digest ngoài
 - `src/pipeline/flash_cache.py` — cache cụm cấp cứu exact-only; custom JSON bị giới hạn byte/entry, strict-schema, reject duplicate key/non-finite/link và chỉ publish nguyên tử sau safety validation
 - `src/training/` — preflight và fine-tune scripts; chỉ chạy training khi có GPU
 - `GPU_HANDOFF.md` — lệnh dry-run/full-run/resume, budget và shutdown checklist cho GPU thuê

@@ -63,6 +63,7 @@ def read_stable_jsonl_mappings(
     maximum_line_bytes: int,
     maximum_rows: int,
     label: str,
+    expected_sha256: str | None = None,
 ) -> StableJsonlDocument:
     """Read mappings from one unchanged JSONL file and return its identity."""
     for value, name in (
@@ -74,6 +75,12 @@ def read_stable_jsonl_mappings(
             raise ValueError(f"{name} must be a positive integer")
     if not isinstance(label, str) or not label:
         raise ValueError("label must be a non-empty string")
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("expected_sha256 must be a lowercase SHA-256 digest")
 
     resolved = resolve_regular_file_without_links(
         path,
@@ -85,6 +92,8 @@ def read_stable_jsonl_mappings(
         maximum_bytes=maximum_bytes,
         label=label,
     )
+    if expected_sha256 is not None and expected_digest != expected_sha256:
+        raise ValueError(f"{label} checksum does not match")
     rows: list[dict[str, Any]] = []
     digest = hashlib.sha256()
     observed_size = 0
