@@ -1778,7 +1778,17 @@ def test_regular_deployment_file_resolution_rejects_symlink(tmp_path: Path):
 
 
 def test_release_git_head_requires_clean_upstream(monkeypatch: pytest.MonkeyPatch):
-    outputs = iter(("a" * 40 + "\n", "a" * 40 + "\n", ""))
+    outputs = iter(
+        (
+            "a" * 40 + "\n",
+            "main\n",
+            "origin\n",
+            "refs/heads/main\n",
+            "a" * 40 + "\n",
+            "",
+            f"{'a' * 40}\trefs/heads/main\n",
+        )
+    )
     monkeypatch.setattr(
         bakeoff.subprocess,
         "check_output",
@@ -1786,13 +1796,63 @@ def test_release_git_head_requires_clean_upstream(monkeypatch: pytest.MonkeyPatc
     )
     assert verified_release_git_head() == "a" * 40
 
-    outputs = iter(("a" * 40 + "\n", "b" * 40 + "\n", ""))
+    outputs = iter(
+        (
+            "a" * 40 + "\n",
+            "main\n",
+            "origin\n",
+            "refs/heads/main\n",
+            "b" * 40 + "\n",
+            "",
+        )
+    )
     monkeypatch.setattr(
         bakeoff.subprocess,
         "check_output",
         lambda *args, **kwargs: next(outputs),
     )
     with pytest.raises(RuntimeError, match="match its upstream"):
+        verified_release_git_head()
+
+
+def test_release_git_head_rejects_dirty_or_stale_remote(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    outputs = iter(
+        (
+            "a" * 40 + "\n",
+            "main\n",
+            "origin\n",
+            "refs/heads/main\n",
+            "a" * 40 + "\n",
+            " M scripts/run_model_bakeoff.py\n",
+        )
+    )
+    monkeypatch.setattr(
+        bakeoff.subprocess,
+        "check_output",
+        lambda *args, **kwargs: next(outputs),
+    )
+    with pytest.raises(RuntimeError, match="clean tracked worktree"):
+        verified_release_git_head()
+
+    outputs = iter(
+        (
+            "a" * 40 + "\n",
+            "main\n",
+            "origin\n",
+            "refs/heads/main\n",
+            "a" * 40 + "\n",
+            "",
+            f"{'b' * 40}\trefs/heads/main\n",
+        )
+    )
+    monkeypatch.setattr(
+        bakeoff.subprocess,
+        "check_output",
+        lambda *args, **kwargs: next(outputs),
+    )
+    with pytest.raises(RuntimeError, match="live remote branch"):
         verified_release_git_head()
 
 

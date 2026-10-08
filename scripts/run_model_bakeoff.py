@@ -63,6 +63,7 @@ from src.pipeline.selection_policy import (  # noqa: E402
 CRITICAL_EXIT_WAITING_FOR_BLIND = 3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
+GIT_CHECK_TIMEOUT_SECONDS = 30.0
 MAX_DEPLOYMENT_MEASUREMENT_BYTES = 10_000_000
 MAX_QUANTIZATION_PARITY_EVIDENCE_BYTES = 1_000_000
 MAX_IDENTITY_EVIDENCE_BYTES = 1_000_000
@@ -101,32 +102,77 @@ TRAIN_STAGE_MAX_ATTEMPTS = 3
 
 
 def verified_release_git_head(project_root: Path = ROOT) -> str:
-    """Require one clean tracked checkout whose HEAD is present on its upstream."""
+    """Require a clean checkout whose HEAD matches tracking and live remote refs."""
     try:
         head = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=project_root,
             text=True,
             stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
+        ).strip()
+        branch = subprocess.check_output(
+            ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
+        ).strip()
+        remote = subprocess.check_output(
+            ["git", "config", "--get", f"branch.{branch}.remote"],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
+        ).strip()
+        merge_ref = subprocess.check_output(
+            ["git", "config", "--get", f"branch.{branch}.merge"],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
         ).strip()
         upstream = subprocess.check_output(
             ["git", "rev-parse", "@{upstream}"],
             cwd=project_root,
             text=True,
             stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
         ).strip()
         tracked_status = subprocess.check_output(
             ["git", "status", "--porcelain", "--untracked-files=no"],
             cwd=project_root,
             text=True,
             stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
         ).strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError("Final backup requires a tracked Git checkout with upstream") from exc
     if not GIT_COMMIT_RE.fullmatch(head) or head != upstream:
         raise RuntimeError("Final backup requires local HEAD to match its upstream")
     if tracked_status:
         raise RuntimeError("Final backup requires a clean tracked worktree")
+    if not branch or not remote or remote == "." or not merge_ref.startswith("refs/heads/"):
+        raise RuntimeError("Final backup requires a named branch with a remote upstream")
+    try:
+        remote_output = subprocess.check_output(
+            ["git", "ls-remote", "--exit-code", remote, merge_ref],
+            cwd=project_root,
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=GIT_CHECK_TIMEOUT_SECONDS,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Final backup could not verify the live remote branch") from exc
+    remote_lines = remote_output.splitlines()
+    remote_fields = remote_lines[0].split() if len(remote_lines) == 1 else []
+    if (
+        len(remote_fields) != 2
+        or remote_fields[1] != merge_ref
+        or not GIT_COMMIT_RE.fullmatch(remote_fields[0])
+        or remote_fields[0] != head
+    ):
+        raise RuntimeError("Final backup requires local HEAD to match the live remote branch")
     return head
 
 
