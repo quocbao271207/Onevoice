@@ -102,6 +102,106 @@ def test_runtime_entrypoints_recheck_component_readiness(monkeypatch):
         pipeline.run_interactive()
 
 
+def test_pipeline_runtime_operations_share_one_critical_section(monkeypatch):
+    class ExpectedStop(Exception):
+        pass
+
+    class TrackingLock:
+        def __init__(self):
+            self.depth = 0
+            self.entries = 0
+            self.max_depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            self.entries += 1
+            self.max_depth = max(self.max_depth, self.depth)
+            return self
+
+        def __exit__(self, *_exc_info):
+            self.depth -= 1
+
+    pipeline = fake_pipeline()
+    lock = TrackingLock()
+    pipeline._runtime_lock = lock
+
+    def stop_while_locked(*_args, **_kwargs):
+        assert lock.depth == 1
+        raise ExpectedStop
+
+    monkeypatch.setattr(pipeline, "get_status", stop_while_locked)
+    with pytest.raises(ExpectedStop):
+        pipeline.load()
+    with pytest.raises(ExpectedStop):
+        pipeline.translate_text("Stable.", "en", "vi")
+    with pytest.raises(ExpectedStop):
+        pipeline.translate_speech(
+            np.zeros(160, dtype=np.float32),
+            source_lang="en",
+            target_lang="vi",
+        )
+
+    def stop_after_nested_stats(*_args, **_kwargs):
+        assert lock.depth == 1
+        pipeline.get_performance_stats()
+        assert lock.depth == 1
+        raise ExpectedStop
+
+    monkeypatch.setattr(
+        pipeline.tts_engine,
+        "play_audio",
+        stop_after_nested_stats,
+        raising=False,
+    )
+    with pytest.raises(ExpectedStop):
+        pipeline.play(
+            SimpleNamespace(
+                safety_passed=True,
+                requires_confirmation=False,
+                output_audio=np.zeros(8, dtype=np.float32),
+                output_sample_rate=22_050,
+            )
+        )
+
+    class GuardedHistory(list):
+        def __bool__(self):
+            assert lock.depth == 1
+            return False
+
+    pipeline._latency_history = GuardedHistory()
+    pipeline.get_performance_stats()
+
+    assert lock.entries == 6
+    assert lock.max_depth == 2
+    assert lock.depth == 0
+
+
+def test_interactive_mode_rejects_a_second_live_session():
+    from threading import Lock
+
+    pipeline = fake_pipeline()
+    pipeline._interactive_lock = Lock()
+    assert pipeline._interactive_lock.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            pipeline.run_interactive()
+    finally:
+        pipeline._interactive_lock.release()
+
+
+def test_interactive_session_lock_releases_after_validation_failure(
+    monkeypatch,
+):
+    pipeline = fake_pipeline()
+    monkeypatch.setattr(pipeline, "_require_ready", lambda: None)
+
+    with pytest.raises(ValueError, match="on_result must be callable"):
+        pipeline.run_interactive(on_result=object())
+
+    assert pipeline._interactive_lock.acquire(blocking=False)
+    pipeline._interactive_lock.release()
+
+
 def test_disabled_cache_is_not_required_for_pipeline_readiness():
     pipeline = fake_pipeline(cache_enabled=False)
 

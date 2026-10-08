@@ -22,6 +22,8 @@ import logging
 import time
 import yaml
 import numpy as np
+from functools import wraps
+from threading import Lock, RLock
 from typing import Callable, Optional, Dict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +36,32 @@ from .flash_cache import CachedPhrase, FlashCache
 from .safety_guard import safety_issue_codes, validate_translation
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized_runtime(method):
+    """Serialize operations that share models, counters, or the audio sink."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._runtime_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def _exclusive_interactive_session(method):
+    """Allow only one microphone session without blocking status queries."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if not self._interactive_lock.acquire(blocking=False):
+            raise RuntimeError("Interactive microphone session is already active")
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._interactive_lock.release()
+
+    return wrapped
 
 MAX_PIPELINE_CONFIG_BYTES = 1_000_000
 ALLOWED_PIPELINE_CONFIG_SECTIONS = {
@@ -214,6 +242,8 @@ class MediVoicePipeline:
         Args:
             config_path: Path to pipeline_config.yaml
         """
+        self._runtime_lock = RLock()
+        self._interactive_lock = Lock()
         self.config = self._load_config(config_path)
 
         # Initialize pipeline stages
@@ -491,6 +521,7 @@ class MediVoicePipeline:
             terminology,
         )
 
+    @_serialized_runtime
     def load(self):
         """
         Load all pipeline components.
@@ -597,6 +628,7 @@ class MediVoicePipeline:
             + ", ".join(failed_components)
         )
 
+    @_serialized_runtime
     def translate_speech(
         self,
         audio: np.ndarray,
@@ -877,6 +909,7 @@ class MediVoicePipeline:
 
         return result
 
+    @_serialized_runtime
     def play(self, result: PipelineResult):
         """Play the translated audio output."""
         if result.safety_passed is not True:
@@ -892,6 +925,7 @@ class MediVoicePipeline:
         else:
             logger.warning("No audio to play.")
 
+    @_serialized_runtime
     def translate_text(
         self,
         text: str,
@@ -944,6 +978,7 @@ class MediVoicePipeline:
             result.translated_text = ""
         return result
 
+    @_exclusive_interactive_session
     def run_interactive(
         self,
         on_result: Optional[Callable[[PipelineResult], None]] = None,
@@ -970,6 +1005,7 @@ class MediVoicePipeline:
             if result.output_audio is not None:
                 self.play(result)
 
+    @_serialized_runtime
     def get_performance_stats(self) -> Dict:
         """Get pipeline performance statistics."""
         stats = {
