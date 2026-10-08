@@ -289,6 +289,71 @@ def test_placeholder_blind_lock_cannot_be_opened():
         verify_lock(root / "data/eval/blind_test_v2.lock.json")
 
 
+def test_blind_adapter_manifest_rejects_root_and_nested_links(tmp_path: Path):
+    target = tmp_path / "adapter-target"
+    target.mkdir()
+    (target / "adapter_config.json").write_text("{}", encoding="utf-8")
+    linked_root = tmp_path / "adapter-link"
+    try:
+        linked_root.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="symlink or junction"):
+        adapter_tree_manifest(linked_root)
+
+    nested_target = tmp_path / "weights.bin"
+    nested_target.write_bytes(b"weights")
+    (target / "linked-weights.bin").symlink_to(nested_target)
+    with pytest.raises(ValueError, match="symlinks or junctions"):
+        adapter_tree_manifest(target)
+
+
+def test_blind_adapter_manifest_enforces_file_and_byte_caps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr(blind, "MAX_BLIND_ADAPTER_FILES", 1)
+    with pytest.raises(ValueError, match="exceeds 1 files"):
+        adapter_tree_manifest(adapter)
+
+    monkeypatch.setattr(blind, "MAX_BLIND_ADAPTER_FILES", 10)
+    monkeypatch.setattr(blind, "MAX_BLIND_ADAPTER_TREE_BYTES", 1)
+    with pytest.raises(ValueError, match="exceeds 1 total bytes"):
+        adapter_tree_manifest(adapter)
+
+
+def test_blind_adapter_manifest_rejects_file_change_between_tree_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    weights = adapter / "adapter_model.safetensors"
+    weights.write_bytes(b"original-weights")
+    real_digest = blind.sha256_stable_regular_file
+    hashed_weights = False
+
+    def mutate_after_first_hash(path, **kwargs):
+        nonlocal hashed_weights
+        result = real_digest(path, **kwargs)
+        if Path(path) == weights and not hashed_weights:
+            hashed_weights = True
+            weights.write_bytes(b"modified-weights")
+        return result
+
+    monkeypatch.setattr(blind, "sha256_stable_regular_file", mutate_after_first_hash)
+
+    with pytest.raises(RuntimeError, match="changed while hashing"):
+        adapter_tree_manifest(adapter)
+
+
 def test_blind_winner_is_bound_to_selection_and_exact_adapter_tree(tmp_path: Path):
     adapter = tmp_path / "adapter"
     adapter.mkdir()

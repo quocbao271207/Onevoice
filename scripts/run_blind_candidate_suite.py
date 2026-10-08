@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.data.quality import fingerprint_text, normalize_text  # noqa: E402
 from src.pipeline.evidence_paths import (  # noqa: E402
+    is_link_or_junction,
     resolve_regular_file,
     resolve_regular_file_under,
 )
@@ -35,7 +37,10 @@ from src.pipeline.selection_policy import (  # noqa: E402
     selection_identity,
     selection_policy_record,
 )
-from src.utils.bounded_file import read_stable_regular_file  # noqa: E402
+from src.utils.bounded_file import (  # noqa: E402
+    read_stable_regular_file,
+    sha256_stable_regular_file,
+)
 
 
 MAX_BLIND_REPORT_BYTES = 50_000_000
@@ -44,6 +49,11 @@ MAX_BLIND_LOCK_BYTES = 5_000_000
 MAX_BLIND_MANIFEST_BYTES = 250_000_000
 MAX_BLIND_MANIFEST_LINE_BYTES = 2_000_000
 MAX_ACCURACY_CONFIG_BYTES = 1_000_000
+MAX_BLIND_ADAPTER_FILES = 10_000
+MAX_BLIND_ADAPTER_DIRECTORIES = 10_000
+MAX_BLIND_ADAPTER_ENTRIES = 20_000
+MAX_BLIND_ADAPTER_FILE_BYTES = 8_000_000_000
+MAX_BLIND_ADAPTER_TREE_BYTES = 16_000_000_000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 BLIND_LOCK_ALLOWED_FIELDS = frozenset(
     {
@@ -130,31 +140,146 @@ def _parse_json_mapping(payload: bytes, *, label: str) -> dict[str, Any]:
     return parsed
 
 
+def _filesystem_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        getattr(metadata, "st_file_attributes", 0),
+    )
+
+
+def _enumerate_adapter_files(adapter: Path) -> tuple[Path, list[Path]]:
+    lexical = Path(os.path.abspath(adapter))
+    if is_link_or_junction(lexical):
+        raise ValueError(f"Blind adapter cannot be a symlink or junction: {lexical}")
+    try:
+        root_metadata = lexical.lstat()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Blind adapter is missing: {lexical}")
+    except OSError:
+        raise ValueError("Failed to inspect blind adapter") from None
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError(f"Blind adapter must be a directory: {lexical}")
+    root = lexical.resolve(strict=True)
+    try:
+        lexical_after_resolve = lexical.lstat()
+        resolved_metadata = root.lstat()
+    except OSError:
+        raise RuntimeError("Blind adapter root changed while resolving") from None
+    if (
+        is_link_or_junction(lexical)
+        or _filesystem_identity(root_metadata)
+        != _filesystem_identity(lexical_after_resolve)
+        or _filesystem_identity(root_metadata)
+        != _filesystem_identity(resolved_metadata)
+    ):
+        raise RuntimeError("Blind adapter root changed while resolving")
+    pending = [root]
+    files: list[Path] = []
+    directory_count = 0
+    entry_count = 0
+    while pending:
+        directory = pending.pop()
+        if is_link_or_junction(directory):
+            raise ValueError(
+                f"Blind adapter cannot contain symlinks or junctions: {directory}"
+            )
+        directory_count += 1
+        if directory_count > MAX_BLIND_ADAPTER_DIRECTORIES:
+            raise ValueError(
+                "Blind adapter exceeds "
+                f"{MAX_BLIND_ADAPTER_DIRECTORIES} directories"
+            )
+        try:
+            before = directory.lstat()
+            if not stat.S_ISDIR(before.st_mode):
+                raise ValueError(f"Blind adapter entry must be a directory: {directory}")
+            children = []
+            for child in directory.iterdir():
+                entry_count += 1
+                if entry_count > MAX_BLIND_ADAPTER_ENTRIES:
+                    raise ValueError(
+                        f"Blind adapter exceeds {MAX_BLIND_ADAPTER_ENTRIES} entries"
+                    )
+                children.append(child)
+            children.sort(key=lambda child: child.name)
+            after = directory.lstat()
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError(f"Failed to enumerate blind adapter: {directory}") from None
+        if _filesystem_identity(before) != _filesystem_identity(after):
+            raise RuntimeError(f"Blind adapter directory changed while reading: {directory}")
+        for child in children:
+            if is_link_or_junction(child):
+                raise ValueError(
+                    f"Blind adapter cannot contain symlinks or junctions: {child}"
+                )
+            try:
+                metadata = child.lstat()
+            except OSError:
+                raise RuntimeError(
+                    f"Blind adapter entry changed while reading: {child}"
+                ) from None
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(child)
+            elif stat.S_ISREG(metadata.st_mode):
+                files.append(child)
+                if len(files) > MAX_BLIND_ADAPTER_FILES:
+                    raise ValueError(
+                        f"Blind adapter exceeds {MAX_BLIND_ADAPTER_FILES} files"
+                    )
+            else:
+                raise ValueError(f"Blind adapter contains a special file: {child}")
+    files.sort(key=lambda path: path.relative_to(root).as_posix())
+    return root, files
+
+
 def adapter_tree_manifest(adapter: Path) -> dict[str, Any]:
-    adapter = adapter.resolve()
-    if not (adapter / "adapter_config.json").is_file():
+    adapter, paths = _enumerate_adapter_files(adapter)
+    relative_paths = [path.relative_to(adapter).as_posix() for path in paths]
+    if "adapter_config.json" not in relative_paths:
         raise FileNotFoundError(f"Blind adapter is incomplete: {adapter}")
     files = []
-    for path in sorted(adapter.rglob("*")):
-        if path.is_symlink():
-            raise ValueError(f"Blind adapter cannot contain symlinks: {path}")
-        if path.is_file():
-            files.append(
-                {
-                    "path": path.relative_to(adapter).as_posix(),
-                    "bytes": path.stat().st_size,
-                    "sha256": sha256(path),
-                }
+    total_bytes = 0
+    for path, relative in zip(paths, relative_paths, strict=True):
+        digest, size = sha256_stable_regular_file(
+            path,
+            maximum_bytes=MAX_BLIND_ADAPTER_FILE_BYTES,
+            label=f"Blind adapter file {relative}",
+        )
+        total_bytes += size
+        if total_bytes > MAX_BLIND_ADAPTER_TREE_BYTES:
+            raise ValueError(
+                f"Blind adapter exceeds {MAX_BLIND_ADAPTER_TREE_BYTES} total bytes"
             )
-    if not files:
-        raise ValueError(f"Blind adapter is empty: {adapter}")
+        files.append({"path": relative, "bytes": size, "sha256": digest})
+    _, verified_paths = _enumerate_adapter_files(adapter)
+    verified_relative = [
+        path.relative_to(adapter).as_posix() for path in verified_paths
+    ]
+    if verified_relative != relative_paths:
+        raise RuntimeError("Blind adapter tree changed while hashing")
+    for path, record in zip(verified_paths, files, strict=True):
+        digest, size = sha256_stable_regular_file(
+            path,
+            maximum_bytes=MAX_BLIND_ADAPTER_FILE_BYTES,
+            label=f"Blind adapter file {record['path']}",
+        )
+        if digest != record["sha256"] or size != record["bytes"]:
+            raise RuntimeError(
+                f"Blind adapter file changed while hashing: {record['path']}"
+            )
     digest = hashlib.sha256(
         json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return {
         "root": str(adapter),
         "file_count": len(files),
-        "bytes": sum(int(item["bytes"]) for item in files),
+        "bytes": total_bytes,
         "manifest_sha256": digest,
         "files": files,
     }

@@ -1,10 +1,14 @@
-"""Read small runtime configuration files through one fail-closed boundary."""
+"""Read or hash bounded regular files through one fail-closed boundary."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from pathlib import Path
+
+
+_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 def _is_link_or_reparse(file_stat: os.stat_result) -> bool:
@@ -26,13 +30,7 @@ def _file_identity(file_stat: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def read_stable_regular_file(
-    path: str | Path,
-    *,
-    maximum_bytes: int,
-    label: str,
-) -> bytes:
-    """Read one unchanged regular file without following a final symlink."""
+def _validate_arguments(*, maximum_bytes: int, label: str) -> None:
     if (
         isinstance(maximum_bytes, bool)
         or not isinstance(maximum_bytes, int)
@@ -41,19 +39,43 @@ def read_stable_regular_file(
         raise ValueError("maximum_bytes must be a positive integer")
     if not isinstance(label, str) or not label:
         raise ValueError("label must be a non-empty string")
-    candidate = Path(path)
+
+
+def _inspect_regular_file(
+    candidate: Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> os.stat_result:
     try:
-        before = candidate.lstat()
+        inspected = candidate.lstat()
     except FileNotFoundError:
         raise FileNotFoundError(f"{label} does not exist: {candidate}")
     except OSError:
         raise ValueError(f"Failed to inspect {label.lower()}") from None
-    if _is_link_or_reparse(before):
+    if _is_link_or_reparse(inspected):
         raise ValueError(f"{label} must not be a symlink or junction")
-    if not stat.S_ISREG(before.st_mode):
+    if not stat.S_ISREG(inspected.st_mode):
         raise ValueError(f"{label} must be a regular file")
-    if before.st_size < 1 or before.st_size > maximum_bytes:
+    if inspected.st_size < 1 or inspected.st_size > maximum_bytes:
         raise ValueError(f"{label} size is outside 1..{maximum_bytes} bytes")
+    return inspected
+
+
+def read_stable_regular_file(
+    path: str | Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> bytes:
+    """Read one unchanged regular file without following a final symlink."""
+    _validate_arguments(maximum_bytes=maximum_bytes, label=label)
+    candidate = Path(path)
+    before = _inspect_regular_file(
+        candidate,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor_number: int | None = None
@@ -94,3 +116,69 @@ def read_stable_regular_file(
     ):
         raise RuntimeError(f"{label} changed while reading")
     return payload
+
+
+def sha256_stable_regular_file(
+    path: str | Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> tuple[str, int]:
+    """Hash one bounded regular file twice without materializing it in memory."""
+    _validate_arguments(maximum_bytes=maximum_bytes, label=label)
+    candidate = Path(path)
+    before = _inspect_regular_file(
+        candidate,
+        maximum_bytes=maximum_bytes,
+        label=label,
+    )
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor_number: int | None = None
+    try:
+        descriptor_number = os.open(candidate, flags)
+        handle = os.fdopen(descriptor_number, "rb")
+        descriptor_number = None
+        with handle:
+            descriptor_before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(descriptor_before.st_mode):
+                raise ValueError(f"{label} must be a regular file")
+            digests: list[str] = []
+            sizes: list[int] = []
+            descriptor_after_reads: list[os.stat_result] = []
+            for _ in range(2):
+                digest = hashlib.sha256()
+                size = 0
+                while chunk := handle.read(_HASH_CHUNK_BYTES):
+                    size += len(chunk)
+                    if size > maximum_bytes:
+                        raise ValueError(f"{label} exceeds {maximum_bytes} bytes")
+                    digest.update(chunk)
+                digests.append(digest.hexdigest())
+                sizes.append(size)
+                descriptor_after_reads.append(os.fstat(handle.fileno()))
+                handle.seek(0)
+        after = candidate.lstat()
+    except ValueError:
+        raise
+    except OSError:
+        raise ValueError(f"Failed to hash {label.lower()}") from None
+    finally:
+        if descriptor_number is not None:
+            try:
+                os.close(descriptor_number)
+            except OSError:
+                pass
+
+    if (
+        sizes != [before.st_size, before.st_size]
+        or digests[0] != digests[1]
+        or _is_link_or_reparse(after)
+        or _file_identity(before) != _file_identity(descriptor_before)
+        or any(
+            _file_identity(before) != _file_identity(observed)
+            for observed in descriptor_after_reads
+        )
+        or _file_identity(before) != _file_identity(after)
+    ):
+        raise RuntimeError(f"{label} changed while hashing")
+    return digests[0], sizes[0]
