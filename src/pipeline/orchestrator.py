@@ -35,6 +35,130 @@ from .safety_guard import validate_translation
 
 logger = logging.getLogger(__name__)
 
+MAX_PIPELINE_CONFIG_BYTES = 1_000_000
+ALLOWED_PIPELINE_CONFIG_SECTIONS = {
+    "pipeline",
+    "runtime",
+    "audio",
+    "asr",
+    "mt",
+    "tts",
+    "flash_cache",
+    "performance_targets",
+}
+REQUIRED_PIPELINE_CONFIG_SECTIONS = ALLOWED_PIPELINE_CONFIG_SECTIONS - {
+    "performance_targets"
+}
+PIPELINE_CONFIG_KEYS = {
+    "pipeline": {"mode", "streaming", "language_pairs"},
+    "runtime": {"allow_base_model_fallback"},
+    "audio": {
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "chunk_duration_ms",
+        "vad_threshold",
+        "silence_duration_ms",
+    },
+    "asr": {"max_input_duration_seconds", "max_new_tokens", "vi", "en"},
+    "mt": {
+        "model_name",
+        "model_path",
+        "quantization",
+        "max_source_tokens",
+        "max_source_characters",
+        "max_new_tokens",
+        "num_beams",
+        "speculative_decoding",
+        "medical_lexicon_path",
+        "temperature",
+    },
+    "tts": {
+        "output_sample_rate",
+        "max_text_characters",
+        "max_duration_seconds",
+        "vi",
+        "en",
+    },
+    "flash_cache": {
+        "enabled",
+        "cache_path",
+        "fuzzy_matching",
+        "max_response_ms",
+    },
+    "performance_targets": {
+        "status",
+        "total_latency_ms",
+        "rtf",
+        "asr_wer_vi",
+        "mt_bleu",
+        "mt_comet",
+        "tts_mos",
+        "required_reporting",
+    },
+}
+REQUIRED_PIPELINE_CONFIG_KEYS = {
+    "pipeline": PIPELINE_CONFIG_KEYS["pipeline"],
+    "runtime": PIPELINE_CONFIG_KEYS["runtime"],
+    "audio": PIPELINE_CONFIG_KEYS["audio"],
+    "asr": PIPELINE_CONFIG_KEYS["asr"],
+    "mt": {
+        "model_path",
+        "max_source_tokens",
+        "max_source_characters",
+        "max_new_tokens",
+        "num_beams",
+        "speculative_decoding",
+        "medical_lexicon_path",
+        "temperature",
+    },
+    "tts": PIPELINE_CONFIG_KEYS["tts"],
+    "flash_cache": {"enabled", "cache_path", "fuzzy_matching"},
+}
+ASR_LANGUAGE_CONFIG_KEYS = {
+    "model_name",
+    "model_path",
+    "quantization",
+    "max_length",
+    "language",
+    "task",
+}
+TTS_LANGUAGE_CONFIG_KEYS = {"engine", "model_path", "speaker_id", "sample_rate"}
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
 
 @dataclass
 class PipelineResult:
@@ -90,17 +214,20 @@ class MediVoicePipeline:
         self.config = self._load_config(config_path)
 
         # Initialize pipeline stages
+        audio_settings = self.config.get("audio", {})
         audio_cfg = AudioConfig(
-            sample_rate=self.config.get("audio", {}).get("sample_rate", 16000),
-            chunk_duration_ms=self.config.get("audio", {}).get("chunk_duration_ms", 500),
-            vad_threshold=self.config.get("audio", {}).get("vad_threshold", 0.5),
-            silence_duration_ms=self.config.get("audio", {}).get("silence_duration_ms", 800),
+            sample_rate=audio_settings.get("sample_rate", 16000),
+            bit_depth=audio_settings.get("bit_depth", 16),
+            channels=audio_settings.get("channels", 1),
+            chunk_duration_ms=audio_settings.get("chunk_duration_ms", 500),
+            vad_threshold=audio_settings.get("vad_threshold", 0.5),
+            silence_duration_ms=audio_settings.get("silence_duration_ms", 800),
         )
 
         self.audio_frontend = AudioFrontend(config=audio_cfg)
 
         runtime_cfg = self.config.get("runtime", {})
-        allow_base_fallback = bool(runtime_cfg.get("allow_base_model_fallback", False))
+        allow_base_fallback = runtime_cfg.get("allow_base_model_fallback", False)
 
         asr_cfg = self.config.get("asr", {})
         self.asr_engine = ASREngine(
@@ -142,9 +269,10 @@ class MediVoicePipeline:
         )
 
         flash_cfg = self.config.get("flash_cache", {})
+        self.flash_cache_enabled = flash_cfg.get("enabled", True)
         self.flash_cache = FlashCache(
             cache_path=flash_cfg.get("cache_path"),
-            allow_fuzzy=bool(flash_cfg.get("fuzzy_matching", False)),
+            allow_fuzzy=flash_cfg.get("fuzzy_matching", False),
         )
 
         self._is_loaded = False
@@ -156,14 +284,151 @@ class MediVoicePipeline:
 
     def _load_config(self, config_path: Optional[str]) -> dict:
         """Load pipeline configuration from YAML file."""
-        if config_path and Path(config_path).exists():
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            logger.info(f"Pipeline config loaded from: {config_path}")
-            return config
-        else:
+        if config_path is None:
             logger.warning("No config file found. Using defaults.")
             return {}
+        path = Path(config_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Pipeline config does not exist: {path}")
+        if path.stat().st_size > MAX_PIPELINE_CONFIG_BYTES:
+            raise ValueError(
+                f"Pipeline config exceeds {MAX_PIPELINE_CONFIG_BYTES} bytes: {path}"
+            )
+        try:
+            with path.open(encoding="utf-8") as handle:
+                config = yaml.load(handle, Loader=_UniqueKeySafeLoader)
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise ValueError(f"Invalid pipeline config {path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError("Pipeline config root must be a mapping")
+        self._validate_config(config)
+        logger.info("Pipeline config loaded from: %s", path)
+        return config
+
+    @staticmethod
+    def _require_mapping(config: dict, section: str) -> dict:
+        value = config.get(section)
+        if not isinstance(value, dict):
+            raise ValueError(f"Pipeline config section {section} must be a mapping")
+        return value
+
+    @staticmethod
+    def _validate_keys(
+        value: dict,
+        context: str,
+        allowed: set[str],
+        required: set[str] | frozenset[str] = frozenset(),
+    ) -> None:
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"{context} has unknown keys: {sorted(unknown)}")
+        missing = required - set(value)
+        if missing:
+            raise ValueError(f"{context} is missing required keys: {sorted(missing)}")
+
+    @classmethod
+    def _validate_config(cls, config: dict) -> None:
+        sections = set(config)
+        unknown = sections - ALLOWED_PIPELINE_CONFIG_SECTIONS
+        if unknown:
+            raise ValueError(
+                f"Pipeline config has unknown top-level sections: {sorted(unknown)}"
+            )
+        missing = REQUIRED_PIPELINE_CONFIG_SECTIONS - sections
+        if missing:
+            raise ValueError(
+                f"Pipeline config is missing required sections: {sorted(missing)}"
+            )
+        for section in sections:
+            section_config = cls._require_mapping(config, section)
+            cls._validate_keys(
+                section_config,
+                section,
+                PIPELINE_CONFIG_KEYS[section],
+                REQUIRED_PIPELINE_CONFIG_KEYS.get(section, frozenset()),
+            )
+
+        pipeline_cfg = cls._require_mapping(config, "pipeline")
+        if pipeline_cfg.get("mode") != "cascaded":
+            raise ValueError("pipeline.mode must be 'cascaded'")
+        streaming = pipeline_cfg.get("streaming")
+        if type(streaming) is not bool:
+            raise ValueError("pipeline.streaming must be a boolean")
+        if streaming:
+            raise ValueError("pipeline.streaming=true is not implemented")
+        language_pairs = pipeline_cfg.get("language_pairs")
+        if not isinstance(language_pairs, list) or any(
+            not isinstance(pair, dict)
+            or set(pair) != {"source", "target"}
+            for pair in language_pairs or []
+        ):
+            raise ValueError("pipeline.language_pairs must contain source/target mappings")
+        directions = {
+            (pair["source"], pair["target"])
+            for pair in language_pairs
+        }
+        if directions != {("vi", "en"), ("en", "vi")} or len(language_pairs) != 2:
+            raise ValueError(
+                "pipeline.language_pairs must contain exactly vi_to_en and en_to_vi"
+            )
+
+        runtime_cfg = cls._require_mapping(config, "runtime")
+        flash_cfg = cls._require_mapping(config, "flash_cache")
+        boolean_fields = (
+            (runtime_cfg, "allow_base_model_fallback", "runtime"),
+            (flash_cfg, "enabled", "flash_cache"),
+            (flash_cfg, "fuzzy_matching", "flash_cache"),
+        )
+        for section_config, key, section in boolean_fields:
+            if type(section_config.get(key)) is not bool:
+                raise ValueError(f"{section}.{key} must be a boolean")
+        if flash_cfg["fuzzy_matching"]:
+            raise ValueError("flash_cache.fuzzy_matching=true is not supported")
+
+        cache_path = flash_cfg.get("cache_path")
+        if cache_path is not None and (
+            not isinstance(cache_path, str) or not cache_path.strip()
+        ):
+            raise ValueError("flash_cache.cache_path must be null or a non-empty string")
+
+        asr_cfg = cls._require_mapping(config, "asr")
+        tts_cfg = cls._require_mapping(config, "tts")
+        for section, section_config in (("asr", asr_cfg), ("tts", tts_cfg)):
+            for language in ("vi", "en"):
+                language_config = section_config.get(language)
+                if not isinstance(language_config, dict):
+                    raise ValueError(f"{section}.{language} must be a mapping")
+                cls._validate_keys(
+                    language_config,
+                    f"{section}.{language}",
+                    (
+                        ASR_LANGUAGE_CONFIG_KEYS
+                        if section == "asr"
+                        else TTS_LANGUAGE_CONFIG_KEYS
+                    ),
+                    {"model_path"},
+                )
+                model_path = language_config.get("model_path")
+                if not isinstance(model_path, str) or not model_path.strip():
+                    raise ValueError(
+                        f"{section}.{language}.model_path must be a non-empty string"
+                    )
+        mt_cfg = cls._require_mapping(config, "mt")
+        model_path = mt_cfg.get("model_path")
+        if not isinstance(model_path, str) or not model_path.strip():
+            raise ValueError("mt.model_path must be a non-empty string")
+        lexicon_path = mt_cfg.get("medical_lexicon_path")
+        if lexicon_path is not None and (
+            not isinstance(lexicon_path, str) or not lexicon_path.strip()
+        ):
+            raise ValueError(
+                "mt.medical_lexicon_path must be null or a non-empty string"
+            )
+        speculative_decoding = mt_cfg["speculative_decoding"]
+        if type(speculative_decoding) is not bool:
+            raise ValueError("mt.speculative_decoding must be a boolean")
+        if speculative_decoding:
+            raise ValueError("mt.speculative_decoding=true is not implemented")
 
     @staticmethod
     def _resolve_target_language(source_lang: str, target_lang: Optional[str]) -> str:
@@ -234,8 +499,11 @@ class MediVoicePipeline:
         logger.info("[4/5] Loading TTS Engine...")
         self.tts_engine.load()
 
-        logger.info("[5/5] Loading Flash Cache (Emergency Phrases)...")
-        self.flash_cache.load()
+        if self.flash_cache_enabled:
+            logger.info("[5/5] Loading Flash Cache (Emergency Phrases)...")
+            self.flash_cache.load()
+        else:
+            logger.info("[5/5] Flash Cache disabled by configuration")
 
         self._is_loaded = True
         load_time = time.perf_counter() - start
@@ -333,7 +601,11 @@ class MediVoicePipeline:
 
         # ===== STAGE 2.5: Flash Cache Check =====
         stage_start = time.perf_counter()
-        cached = self.flash_cache.lookup(asr_result.text, asr_result.language)
+        cached = (
+            self.flash_cache.lookup(asr_result.text, asr_result.language)
+            if self.flash_cache_enabled
+            else None
+        )
         latency_breakdown["cache_lookup_ms"] = (time.perf_counter() - stage_start) * 1000
 
         if cached:
@@ -510,7 +782,11 @@ class MediVoicePipeline:
         )
 
         # Check flash cache first
-        cached = self.flash_cache.lookup(text, source_lang)
+        cached = (
+            self.flash_cache.lookup(text, source_lang)
+            if self.flash_cache_enabled
+            else None
+        )
         if cached:
             self._validate_cached_direction(cached, source_lang, target_lang)
             result = MTResult(

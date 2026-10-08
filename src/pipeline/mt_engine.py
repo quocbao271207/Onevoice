@@ -12,8 +12,10 @@ first-token timing and device latency are not reported until instrumented.
 """
 
 import logging
+import math
 import time
 import json
+from numbers import Real
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +46,17 @@ NLLB_LANG_CODES = {"vi": "vie_Latn", "en": "eng_Latn"}
 NLLB_BASE_REVISION = "f8d333a098d19b4fd9a8b18f94170487ad3f821d"
 DEFAULT_MAX_SOURCE_TOKENS = 256
 DEFAULT_MAX_SOURCE_CHARACTERS = 4096
+MAX_MEDICAL_LEXICON_BYTES = 1_000_000
+MEDICAL_LEXICON_DIRECTIONS = {"vi_to_en", "en_to_vi"}
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Medical lexicon contains duplicate key {key!r}")
+        result[key] = value
+    return result
 
 
 def validate_mt_source_text(
@@ -73,7 +86,7 @@ class MedicalLexicon:
         self.vi_to_en: Dict[str, str] = {}
         self.en_to_vi: Dict[str, str] = {}
         self._load_default_terms()
-        if lexicon_path and Path(lexicon_path).exists():
+        if lexicon_path is not None:
             self._load_from_file(lexicon_path)
 
     def _load_default_terms(self):
@@ -125,15 +138,62 @@ class MedicalLexicon:
         self.en_to_vi = {v: k for k, v in critical_terms.items()}
 
     def _load_from_file(self, path: str):
-        """Load additional terms from JSON file."""
+        """Validate and atomically load additional terms from a JSON file."""
+        lexicon_path = Path(path)
+        if not lexicon_path.is_file():
+            raise FileNotFoundError(f"Configured medical lexicon does not exist: {path}")
+        if lexicon_path.stat().st_size > MAX_MEDICAL_LEXICON_BYTES:
+            raise ValueError(
+                "Medical lexicon exceeds "
+                f"{MAX_MEDICAL_LEXICON_BYTES} bytes: {lexicon_path}"
+            )
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                self.vi_to_en.update(data.get("vi_to_en", {}))
-                self.en_to_vi.update(data.get("en_to_vi", {}))
-            logger.info(f"Loaded {len(data)} additional medical terms from {path}")
-        except Exception as e:
-            logger.warning(f"Failed to load medical lexicon: {e}")
+            data = json.loads(
+                lexicon_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_unique_json_object,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid medical lexicon {lexicon_path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Medical lexicon root must be an object")
+        unknown = set(data) - MEDICAL_LEXICON_DIRECTIONS
+        if unknown:
+            raise ValueError(
+                f"Medical lexicon has unknown sections: {sorted(unknown)}"
+            )
+
+        validated = {}
+        for direction in MEDICAL_LEXICON_DIRECTIONS:
+            terms = data.get(direction, {})
+            if not isinstance(terms, dict):
+                raise ValueError(f"Medical lexicon {direction} must be an object")
+            clean_terms = {}
+            for source, target in terms.items():
+                if not isinstance(source, str) or not source.strip():
+                    raise ValueError(
+                        f"Medical lexicon {direction} keys must be non-empty strings"
+                    )
+                if not isinstance(target, str) or not target.strip():
+                    raise ValueError(
+                        f"Medical lexicon {direction} values must be non-empty strings"
+                    )
+                clean_terms[source] = target
+            validated[direction] = clean_terms
+        if not any(validated.values()):
+            raise ValueError("Medical lexicon must contain at least one term")
+
+        vi_to_en = dict(self.vi_to_en)
+        en_to_vi = dict(self.en_to_vi)
+        vi_to_en.update(validated["vi_to_en"])
+        en_to_vi.update(validated["en_to_vi"])
+        self.vi_to_en = vi_to_en
+        self.en_to_vi = en_to_vi
+        loaded_count = sum(len(terms) for terms in validated.values())
+        logger.info(
+            "Loaded %d additional medical terms from %s",
+            loaded_count,
+            lexicon_path,
+        )
 
     def post_process(self, text: str, direction: str) -> str:
         """
@@ -176,13 +236,22 @@ class MTEngine:
             raise ValueError("max_source_tokens must be at least 1")
         if max_source_characters < 1:
             raise ValueError("max_source_characters must be at least 1")
+        if (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, Real)
+            or not math.isfinite(float(temperature))
+            or float(temperature) != 0.0
+        ):
+            raise ValueError(
+                "temperature must be 0 because MT decoding is deterministic"
+            )
         self.model_path = model_path
         self.device = device
         self.max_new_tokens = max_new_tokens
         self.max_source_tokens = max_source_tokens
         self.max_source_characters = max_source_characters
         self.num_beams = num_beams
-        self.temperature = temperature
+        self.temperature = 0.0
         self.allow_base_fallback = allow_base_fallback
         self.lexicon = MedicalLexicon(lexicon_path)
         self.model = None

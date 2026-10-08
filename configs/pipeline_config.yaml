@@ -53,7 +53,7 @@ mt:
   num_beams: 1             # Selected on locked validation; beam-4 was slower and less accurate
   speculative_decoding: false
   medical_lexicon_path: null # Built-in reviewed critical terms; no missing-file placeholder
-  temperature: 0.1          # Low temp for deterministic medical translation
+  temperature: 0.0          # Greedy/beam decoding is deterministic; sampling is disabled
 
 tts:
   output_sample_rate: 22050
