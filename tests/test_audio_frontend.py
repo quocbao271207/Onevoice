@@ -323,3 +323,96 @@ def test_microphone_stream_requires_ready_frontend_and_sounddevice(monkeypatch):
     block_import(monkeypatch, "sounddevice")
     with pytest.raises(RuntimeError, match="sounddevice"):
         next(frontend.stream_from_microphone())
+
+
+def test_pipeline_does_not_denoise_an_already_processed_stream_segment(
+    monkeypatch,
+):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    segment = np.zeros(1_600, dtype=np.float32)
+
+    def unexpected_denoise(*_args, **_kwargs):
+        raise AssertionError("A streamed segment must not be denoised twice")
+
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        unexpected_denoise,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="",
+            language="vi",
+            confidence=0.0,
+            latency_ms=1.0,
+        ),
+    )
+
+    result = pipeline.translate_speech(
+        segment,
+        source_lang="vi",
+        audio_frontend_applied=True,
+    )
+
+    assert result.safety_issues == ["empty_asr_transcript"]
+
+
+def test_pipeline_rejects_invalid_preprocessed_audio_contract():
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    segment = np.zeros(1_600, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        pipeline.translate_speech(
+            segment,
+            audio_frontend_applied="true",
+        )
+    with pytest.raises(ValueError, match="sample_rate must match"):
+        pipeline.translate_speech(
+            segment,
+            sample_rate=8_000,
+            audio_frontend_applied=True,
+        )
+    with pytest.raises(ValueError, match="on_result must be callable"):
+        pipeline.run_interactive(on_result=object())
+
+
+def test_interactive_pipeline_surfaces_result_before_playback(monkeypatch):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    segment = np.zeros(1_600, dtype=np.float32)
+    result = SimpleNamespace(output_audio=np.zeros(8, dtype=np.float32))
+    events = []
+
+    monkeypatch.setattr(
+        pipeline.audio_frontend,
+        "stream_from_microphone",
+        lambda: iter((segment,)),
+    )
+
+    def fake_translate(audio, **kwargs):
+        assert np.array_equal(audio, segment)
+        assert kwargs["audio_frontend_applied"] is True
+        assert kwargs["sample_rate"] == pipeline.audio_frontend.config.sample_rate
+        events.append("translate")
+        return result
+
+    monkeypatch.setattr(pipeline, "translate_speech", fake_translate)
+    monkeypatch.setattr(
+        pipeline,
+        "play",
+        lambda observed: events.append(("play", observed)),
+    )
+
+    pipeline.run_interactive(
+        on_result=lambda observed: events.append(("result", observed))
+    )
+
+    assert events == [
+        "translate",
+        ("result", result),
+        ("play", result),
+    ]

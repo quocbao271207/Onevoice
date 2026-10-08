@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from demo.demo_cli import format_translation_for_display, load_audio_file
+from demo.demo_cli import (
+    format_translation_for_display,
+    load_audio_file,
+    print_speech_result,
+    run_interactive,
+)
 
 
 def test_cli_never_displays_candidate_that_failed_safety_gate():
@@ -34,6 +39,36 @@ def test_cli_displays_only_safety_passed_translation():
     )
 
     assert format_translation_for_display(result) == "Bản dịch an toàn"
+
+
+def test_interactive_cli_displays_blocked_result_before_clean_shutdown(capsys):
+    unsafe_result = SimpleNamespace(
+        asr_language="vi",
+        asr_text="Cho bệnh nhân thuốc",
+        target_language="en",
+        translated_text="PATIENT_SECRET_UNSAFE_OUTPUT",
+        safety_passed=False,
+        safety_issues=["negation_mismatch"],
+        total_latency_ms=25.0,
+        overall_rtf=0.25,
+        asr_confidence=0.5,
+        from_cache=False,
+        requires_confirmation=False,
+    )
+
+    class FakePipeline:
+        def run_interactive(self, *, on_result):
+            assert on_result is print_speech_result
+            on_result(unsafe_result)
+            raise KeyboardInterrupt
+
+    run_interactive(FakePipeline())
+
+    output = capsys.readouterr().out
+    assert "Cho bệnh nhân thuốc" in output
+    assert "BLOCKED BY CLINICAL SAFETY GATE" in output
+    assert "PATIENT_SECRET_UNSAFE_OUTPUT" not in output
+    assert "Goodbye" in output
 
 
 def test_cli_audio_preflight_rejects_overlength_before_decode(

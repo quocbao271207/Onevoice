@@ -76,6 +76,27 @@ def print_confirmation_warning(result) -> None:
         print("  ⚠️  Clinical action requires explicit confirmation before playback")
 
 
+def print_speech_result(result) -> None:
+    """Display a speech result before any interactive audio playback."""
+    print(f"\n{'─'*60}")
+    print(f"  🎤 Input ({result.asr_language.upper()}): {result.asr_text}")
+    print(
+        f"  🌐 Output ({result.target_language.upper()}): "
+        f"{format_translation_for_display(result)}"
+    )
+    print(
+        f"  ⏱️  Latency: {result.total_latency_ms:.0f}ms "
+        f"(RTF={result.overall_rtf:.2f})"
+    )
+    print(
+        "  📊 ASR token-probability proxy (uncalibrated): "
+        f"{result.asr_confidence:.2%}"
+    )
+    print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
+    print_confirmation_warning(result)
+    print(f"{'─'*60}\n")
+
+
 def load_audio_file(
     input_path: str | Path,
     *,
@@ -180,7 +201,7 @@ def run_interactive(pipeline):
     print("   Press Ctrl+C to stop\n")
 
     try:
-        pipeline.run_interactive()
+        pipeline.run_interactive(on_result=print_speech_result)
     except KeyboardInterrupt:
         print("\n\n👋 Goodbye!")
 
@@ -202,17 +223,7 @@ def run_file_translation(pipeline, input_path: str, source_lang: str = None):
         sample_rate=sr,
     )
 
-    print(f"\n{'─'*60}")
-    print(f"  🎤 Input ({result.asr_language.upper()}): {result.asr_text}")
-    print(
-        f"  🌐 Output ({result.target_language.upper()}): "
-        f"{format_translation_for_display(result)}"
-    )
-    print(f"  ⏱️  Latency: {result.total_latency_ms:.0f}ms (RTF={result.overall_rtf:.2f})")
-    print(f"  📊 ASR token-probability proxy (uncalibrated): {result.asr_confidence:.2%}")
-    print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
-    print_confirmation_warning(result)
-    print(f"{'─'*60}\n")
+    print_speech_result(result)
 
     # Play audio if available
     if result.output_audio is not None:

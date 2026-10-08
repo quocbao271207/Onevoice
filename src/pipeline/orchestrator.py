@@ -22,7 +22,7 @@ import logging
 import time
 import yaml
 import numpy as np
-from typing import Optional, Dict
+from typing import Callable, Optional, Dict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -537,6 +537,7 @@ class MediVoicePipeline:
         target_lang: Optional[str] = None,
         sample_rate: int = 16000,
         skip_tts: bool = False,
+        audio_frontend_applied: bool = False,
     ) -> PipelineResult:
         """
         Complete speech-to-speech translation pipeline.
@@ -549,12 +550,23 @@ class MediVoicePipeline:
             target_lang: Target language. Auto-determined if None.
             sample_rate: Input audio sample rate
             skip_tts: If True, skip TTS synthesis (text-only output)
+            audio_frontend_applied: True only for segments emitted by this
+                pipeline's AudioFrontend, which have already been denoised.
 
         Returns:
             PipelineResult with all stage outputs and latency breakdown
         """
         if not self._is_loaded:
             raise RuntimeError("Pipeline not loaded. Call load() first.")
+        if type(audio_frontend_applied) is not bool:
+            raise ValueError("audio_frontend_applied must be a boolean")
+        if (
+            audio_frontend_applied
+            and sample_rate != self.audio_frontend.config.sample_rate
+        ):
+            raise ValueError(
+                "Preprocessed audio sample_rate must match AudioFrontend"
+            )
 
         if source_lang is not None:
             self._resolve_target_language(source_lang, target_lang)
@@ -569,11 +581,18 @@ class MediVoicePipeline:
         latency_breakdown = {}
 
         # ===== STAGE 1: Audio Frontend (Denoise) =====
-        stage_start = time.perf_counter()
-        # In streaming mode, audio_frontend would chunk and denoise
-        # For batch mode, we just denoise the full segment
-        clean_audio = self.audio_frontend.denoiser.suppress(audio, sample_rate)
-        latency_breakdown["audio_frontend_ms"] = (time.perf_counter() - stage_start) * 1000
+        if audio_frontend_applied:
+            clean_audio = audio
+            latency_breakdown["audio_frontend_ms"] = 0.0
+        else:
+            stage_start = time.perf_counter()
+            clean_audio = self.audio_frontend.denoiser.suppress(
+                audio,
+                sample_rate,
+            )
+            latency_breakdown["audio_frontend_ms"] = (
+                time.perf_counter() - stage_start
+            ) * 1000
 
         source_audio_duration = len(audio) / sample_rate
 
@@ -852,24 +871,32 @@ class MediVoicePipeline:
             result.translated_text = ""
         return result
 
-    def run_interactive(self):
+    def run_interactive(
+        self,
+        on_result: Optional[Callable[[PipelineResult], None]] = None,
+    ) -> None:
         """
         Run the pipeline in interactive mode with microphone input.
         Press Ctrl+C to stop.
         """
         if not self._is_loaded:
             raise RuntimeError("Pipeline not loaded. Call load() first.")
+        if on_result is not None and not callable(on_result):
+            raise ValueError("on_result must be callable")
 
         logger.info("\n🎤 MediVoice Edge — Interactive Mode")
         logger.info("Speak into the microphone. Press Ctrl+C to stop.\n")
 
-        try:
-            for speech_segment in self.audio_frontend.stream_from_microphone():
-                result = self.translate_speech(speech_segment)
-                if result.output_audio is not None:
-                    self.play(result)
-        except KeyboardInterrupt:
-            logger.info("\nInteractive mode stopped.")
+        for speech_segment in self.audio_frontend.stream_from_microphone():
+            result = self.translate_speech(
+                speech_segment,
+                sample_rate=self.audio_frontend.config.sample_rate,
+                audio_frontend_applied=True,
+            )
+            if on_result is not None:
+                on_result(result)
+            if result.output_audio is not None:
+                self.play(result)
 
     def get_performance_stats(self) -> Dict:
         """Get pipeline performance statistics."""
