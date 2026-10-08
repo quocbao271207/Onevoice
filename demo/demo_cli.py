@@ -27,6 +27,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.pipeline.safety_guard import safety_issue_codes
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -49,6 +51,19 @@ BANNER = r"""
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """
+
+
+def format_translation_for_display(result) -> str:
+    """Never display a candidate that failed the clinical safety gate."""
+    if not result.safety_passed:
+        codes = ", ".join(safety_issue_codes(result.safety_issues)) or "unknown"
+        return f"[BLOCKED BY CLINICAL SAFETY GATE: {codes}]"
+    return result.translated_text
+
+
+def print_confirmation_warning(result) -> None:
+    if result.requires_confirmation:
+        print("  ⚠️  Clinical action requires explicit confirmation before playback")
 
 
 def run_interactive(pipeline):
@@ -84,10 +99,14 @@ def run_file_translation(pipeline, input_path: str, source_lang: str = None):
 
     print(f"\n{'─'*60}")
     print(f"  🎤 Input ({result.asr_language.upper()}): {result.asr_text}")
-    print(f"  🌐 Output ({result.target_language.upper()}): {result.translated_text}")
+    print(
+        f"  🌐 Output ({result.target_language.upper()}): "
+        f"{format_translation_for_display(result)}"
+    )
     print(f"  ⏱️  Latency: {result.total_latency_ms:.0f}ms (RTF={result.overall_rtf:.2f})")
     print(f"  📊 Confidence: {result.asr_confidence:.2%}")
     print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
+    print_confirmation_warning(result)
     print(f"{'─'*60}\n")
 
     # Play audio if available
@@ -105,9 +124,10 @@ def run_text_translation(pipeline, text: str, source_lang: str):
     result = pipeline.translate_text(text, source_lang)
 
     target_lang = "EN" if source_lang == "vi" else "VI"
-    print(f"  🌐 Output ({target_lang}): {result.translated_text}")
+    print(f"  🌐 Output ({target_lang}): {format_translation_for_display(result)}")
     print(f"  ⏱️  Latency: {result.latency_ms:.0f}ms")
     print(f"  💾 From Cache: {'Yes ⚡' if result.from_cache else 'No'}")
+    print_confirmation_warning(result)
 
 
 def run_benchmark(pipeline, num_samples: int = 10):
@@ -139,7 +159,8 @@ def run_benchmark(pipeline, num_samples: int = 10):
         result = pipeline.translate_text(phrase, "vi")
         latencies.append(result.latency_ms)
         cache_tag = "⚡" if result.from_cache else "🧠"
-        print(f"    {cache_tag} [{result.latency_ms:6.0f}ms] {phrase[:40]}... → {result.translated_text[:40]}...")
+        display = format_translation_for_display(result)
+        print(f"    {cache_tag} [{result.latency_ms:6.0f}ms] {phrase[:40]}... → {display[:80]}...")
 
     # Test EN → VI
     print("\n  Testing English → Vietnamese:")
@@ -147,7 +168,8 @@ def run_benchmark(pipeline, num_samples: int = 10):
         result = pipeline.translate_text(phrase, "en")
         latencies.append(result.latency_ms)
         cache_tag = "⚡" if result.from_cache else "🧠"
-        print(f"    {cache_tag} [{result.latency_ms:6.0f}ms] {phrase[:40]}... → {result.translated_text[:40]}...")
+        display = format_translation_for_display(result)
+        print(f"    {cache_tag} [{result.latency_ms:6.0f}ms] {phrase[:40]}... → {display[:80]}...")
 
     # Summary
     if latencies:

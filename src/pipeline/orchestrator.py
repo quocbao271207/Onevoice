@@ -31,7 +31,7 @@ from .asr_engine import ASREngine, ASRResult, validate_asr_audio_window
 from .mt_engine import MTEngine, MTResult, validate_mt_source_text
 from .tts_engine import TTSEngine, TTSResult, validate_tts_audio
 from .flash_cache import CachedPhrase, FlashCache
-from .safety_guard import validate_translation
+from .safety_guard import safety_issue_codes, validate_translation
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +590,8 @@ class MediVoicePipeline:
                 total_latency_ms=total_latency,
                 overall_rtf=0,
                 latency_breakdown=latency_breakdown,
+                safety_passed=False,
+                safety_issues=["empty_asr_transcript"],
             )
 
         # Determine target language
@@ -620,7 +622,14 @@ class MediVoicePipeline:
             mt_latency = latency_breakdown["cache_lookup_ms"]
             from_cache = True
             requires_confirmation = cached.requires_confirmation
-            logger.info(f"⚡ Flash Cache HIT: \"{asr_result.text}\" → \"{translated_text}\"")
+            logger.info(
+                "Flash cache route selected source_lang=%s target_lang=%s "
+                "source_chars=%d output_chars=%d",
+                asr_result.language,
+                target_lang,
+                len(asr_result.text),
+                len(translated_text),
+            )
 
             # Use pre-synthesized audio if available
             if cached.audio is not None and not skip_tts:
@@ -631,7 +640,11 @@ class MediVoicePipeline:
                     target_lang,
                 )
                 if not safety.safe:
-                    logger.error("Translation safety guard blocked cached TTS: %s", safety.issues)
+                    logger.error(
+                        "Translation safety guard blocked cached output "
+                        "issue_codes=%s",
+                        safety_issue_codes(safety.issues),
+                    )
                     cached_audio = None
                 elif requires_confirmation:
                     logger.warning("Cached clinical action requires confirmation; automatic TTS is suppressed.")
@@ -649,7 +662,7 @@ class MediVoicePipeline:
                     asr_language=asr_result.language,
                     asr_confidence=asr_result.confidence,
                     asr_latency_ms=asr_result.latency_ms,
-                    translated_text=translated_text,
+                    translated_text=(translated_text if safety.safe else ""),
                     target_language=target_lang,
                     mt_latency_ms=mt_latency,
                     from_cache=True,
@@ -692,7 +705,10 @@ class MediVoicePipeline:
             target_lang,
         )
         if not safety.safe:
-            logger.error("Translation safety guard blocked TTS: %s", safety.issues)
+            logger.error(
+                "Translation safety guard blocked output issue_codes=%s",
+                safety_issue_codes(safety.issues),
+            )
 
         if requires_confirmation:
             logger.warning("Cached clinical action requires confirmation; automatic TTS is suppressed.")
@@ -721,7 +737,7 @@ class MediVoicePipeline:
             asr_language=asr_result.language,
             asr_confidence=asr_result.confidence,
             asr_latency_ms=asr_result.latency_ms,
-            translated_text=translated_text,
+            translated_text=(translated_text if safety.safe else ""),
             target_language=target_lang,
             mt_latency_ms=mt_latency,
             from_cache=from_cache,
@@ -738,19 +754,24 @@ class MediVoicePipeline:
         )
 
         # Log performance summary
-        cache_label = "⚡CACHE" if from_cache else "🧠AI"
         logger.info(
-            f"\n{'='*60}\n"
-            f"  [{cache_label}] Translation Complete\n"
-            f"  {asr_result.language.upper()} → {target_lang.upper()}\n"
-            f"  Input:  \"{asr_result.text}\"\n"
-            f"  Output: \"{translated_text}\"\n"
-            f"  Latency: {total_latency:.0f}ms (RTF={overall_rtf:.2f})\n"
-            f"  Breakdown: Frontend={latency_breakdown.get('audio_frontend_ms', 0):.0f}ms | "
-            f"ASR={asr_result.latency_ms:.0f}ms | "
-            f"MT={mt_latency:.0f}ms | "
-            f"TTS={tts_latency:.0f}ms\n"
-            f"{'='*60}"
+            "Translation complete route=%s source_lang=%s target_lang=%s "
+            "source_chars=%d output_chars=%d safety_passed=%s "
+            "requires_confirmation=%s total_latency_ms=%.0f rtf=%.2f "
+            "frontend_ms=%.0f asr_ms=%.0f mt_ms=%.0f tts_ms=%.0f",
+            "cache" if from_cache else "model",
+            asr_result.language,
+            target_lang,
+            len(asr_result.text),
+            len(translated_text),
+            safety.safe,
+            requires_confirmation,
+            total_latency,
+            overall_rtf,
+            latency_breakdown.get("audio_frontend_ms", 0),
+            asr_result.latency_ms,
+            mt_latency,
+            tts_latency,
         )
 
         return result
@@ -811,6 +832,8 @@ class MediVoicePipeline:
         )
         result.safety_passed = safety.safe
         result.safety_issues = safety.issues
+        if not safety.safe:
+            result.translated_text = ""
         return result
 
     def run_interactive(self):

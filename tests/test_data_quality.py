@@ -186,13 +186,76 @@ def test_text_only_pipeline_exposes_swapped_drug_dose_safety_failure(monkeypatch
     )
 
     assert not result.safety_passed
+    assert result.translated_text == ""
     assert any(
         issue.startswith("quantity_binding_mismatch")
         for issue in result.safety_issues
     )
 
 
-def test_mt_engine_direct_api_exposes_clinical_safety_failure():
+def test_speech_pipeline_blocks_unsafe_candidate_and_redacts_logs(
+    monkeypatch,
+    caplog,
+):
+    import numpy as np
+    from types import SimpleNamespace
+
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        lambda audio, _sample_rate: audio,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="PATIENT_SECRET_INPUT Give aspirin 5 mg and warfarin 10 mg.",
+            language="en",
+            confidence=0.9,
+            latency_ms=1.0,
+        ),
+    )
+    monkeypatch.setattr(pipeline.flash_cache, "lookup", lambda *_args: None)
+    monkeypatch.setattr(
+        pipeline.mt_engine,
+        "translate",
+        lambda text, source_lang, target_lang: MTResult(
+            source_text=text,
+            translated_text=(
+                "PATIENT_SECRET_OUTPUT Dùng aspirin 10 mg và warfarin 5 mg."
+            ),
+            source_lang=source_lang,
+            target_lang=target_lang,
+            latency_ms=1.0,
+            first_token_ms=None,
+            tokens_generated=10,
+            from_cache=False,
+        ),
+    )
+
+    def unexpected_tts(*_args, **_kwargs):
+        raise AssertionError("Unsafe translation must stop before TTS")
+
+    monkeypatch.setattr(pipeline.tts_engine, "synthesize", unexpected_tts)
+    caplog.set_level("INFO", logger="src.pipeline.orchestrator")
+
+    result = pipeline.translate_speech(
+        np.zeros(1600, dtype=np.float32),
+        source_lang="en",
+        target_lang="vi",
+    )
+
+    assert not result.safety_passed
+    assert result.translated_text == ""
+    assert result.output_audio is None
+    assert "quantity_binding_mismatch" in caplog.text
+    assert "PATIENT_SECRET_INPUT" not in caplog.text
+    assert "PATIENT_SECRET_OUTPUT" not in caplog.text
+
+
+def test_mt_engine_direct_api_exposes_failure_without_logging_raw_text(caplog):
     class FakeInputs(dict):
         def to(self, _device):
             return self
@@ -221,6 +284,7 @@ def test_mt_engine_direct_api_exposes_clinical_safety_failure():
     engine.tokenizer = FakeTokenizer()
     engine.model = FakeModel()
     engine._is_loaded = True
+    caplog.set_level("INFO", logger="src.pipeline.mt_engine")
 
     result = engine.translate(
         "Give aspirin 5 mg and warfarin 10 mg.",
@@ -229,6 +293,8 @@ def test_mt_engine_direct_api_exposes_clinical_safety_failure():
     )
 
     assert not result.safety_passed
+    assert "Give aspirin 5 mg" not in caplog.text
+    assert "Dùng aspirin 10 mg" not in caplog.text
     assert any(
         issue.startswith("quantity_binding_mismatch")
         for issue in result.safety_issues

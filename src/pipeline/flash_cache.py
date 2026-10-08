@@ -374,8 +374,13 @@ class FlashCache:
         if key in self.cache:
             latency_us = (time.perf_counter() - start_time) * 1_000_000
             logger.info(
-                f"Flash Cache HIT (exact): \"{text}\" → "
-                f"\"{self.cache[key].translated_text}\" ({latency_us:.0f}μs)"
+                "Flash Cache HIT match=exact source_lang=%s target_lang=%s "
+                "source_chars=%d output_chars=%d latency_us=%.0f",
+                source_lang,
+                self.cache[key].target_lang,
+                len(text),
+                len(self.cache[key].translated_text),
+                latency_us,
             )
             return self.cache[key]
 
@@ -402,8 +407,14 @@ class FlashCache:
                 phrase.audio = result.audio
                 phrase.audio_sample_rate = result.sample_rate
                 count += 1
-            except Exception as e:
-                logger.warning(f"Failed to pre-synthesize: {phrase.translated_text}: {e}")
+            except Exception as exc:
+                logger.warning(
+                    "Failed to pre-synthesize cached phrase language=%s "
+                    "output_chars=%d error_type=%s",
+                    phrase.target_lang,
+                    len(phrase.translated_text),
+                    type(exc).__name__,
+                )
 
         logger.info(f"Pre-synthesized audio for {count}/{len(self.cache)} cached phrases")
         return count

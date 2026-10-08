@@ -108,17 +108,20 @@ def test_cache_normalization_preserves_decimal_identity_and_disables_fuzzy():
         FlashCache(allow_fuzzy=True)
 
 
-def test_valid_custom_cache_is_loaded_with_confirmation(tmp_path):
+def test_valid_custom_cache_is_loaded_without_logging_raw_phrase(tmp_path, caplog):
     custom = tmp_path / "custom.json"
     write_cache(custom, [valid_custom_phrase()])
     cache = FlashCache(str(custom))
 
     cache.load()
+    caplog.set_level("INFO", logger="src.pipeline.flash_cache")
     phrase = cache.lookup("Give aspirin 5 mg!", "en")
 
     assert phrase is not None
     assert phrase.target_lang == "vi"
     assert phrase.requires_confirmation
+    assert "Give aspirin 5 mg" not in caplog.text
+    assert "Dùng aspirin 5 mg" not in caplog.text
 
 
 def test_pipeline_rejects_cache_hit_for_wrong_target_language(monkeypatch):

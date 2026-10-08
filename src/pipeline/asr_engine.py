@@ -391,8 +391,13 @@ class ASREngine:
         )
 
         logger.info(
-            f"ASR [{language}]: \"{transcription[:80]}...\" "
-            f"(conf={confidence:.2f}, latency={latency_ms:.0f}ms)"
+            "ASR complete language=%s transcript_chars=%d "
+            "confidence=%.2f latency_ms=%.0f code_switched=%s",
+            language,
+            len(transcription),
+            confidence,
+            latency_ms,
+            is_code_switched,
         )
         return result
 

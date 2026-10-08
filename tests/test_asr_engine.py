@@ -84,8 +84,12 @@ def test_asr_rejects_generation_without_terminal_eos_before_decode():
     assert processor.decode_calls == 0
 
 
-def test_asr_accepts_completed_generation_and_rejects_unknown_language():
+def test_asr_accepts_completed_generation_without_logging_transcript(
+    caplog,
+):
     engine, processor = loaded_engine([2, 10, 1, 0])
+    processor.decoded_text = "PATIENT_SECRET_ASR aspirin."
+    caplog.set_level("INFO", logger="src.pipeline.asr_engine")
 
     result = engine.transcribe(
         np.zeros(1600, dtype=np.float32),
@@ -93,8 +97,9 @@ def test_asr_accepts_completed_generation_and_rejects_unknown_language():
         sample_rate=16000,
     )
 
-    assert result.text == "Dùng aspirin."
+    assert result.text == "PATIENT_SECRET_ASR aspirin."
     assert processor.decode_calls == 1
+    assert "PATIENT_SECRET_ASR" not in caplog.text
     with pytest.raises(ValueError, match="Unsupported ASR language"):
         engine.transcribe(
             np.zeros(1600, dtype=np.float32),
@@ -144,6 +149,44 @@ def test_pipeline_rejects_overlength_audio_before_frontend_dispatch(monkeypatch)
             source_lang="vi",
             sample_rate=16000,
         )
+
+
+def test_pipeline_marks_empty_asr_transcript_as_safety_blocked(monkeypatch):
+    pipeline = MediVoicePipeline(config_path="configs/pipeline_config.yaml")
+    pipeline._is_loaded = True
+    monkeypatch.setattr(
+        pipeline.audio_frontend.denoiser,
+        "suppress",
+        lambda audio, _sample_rate: audio,
+    )
+    monkeypatch.setattr(
+        pipeline.asr_engine,
+        "transcribe",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            text="   ",
+            language="en",
+            confidence=0.0,
+            latency_ms=1.0,
+        ),
+    )
+
+    def unexpected_downstream(*_args, **_kwargs):
+        raise AssertionError("Empty ASR transcript must stop before cache/MT/TTS")
+
+    monkeypatch.setattr(pipeline.flash_cache, "lookup", unexpected_downstream)
+    monkeypatch.setattr(pipeline.mt_engine, "translate", unexpected_downstream)
+    monkeypatch.setattr(pipeline.tts_engine, "synthesize", unexpected_downstream)
+
+    result = pipeline.translate_speech(
+        np.zeros(1600, dtype=np.float32),
+        source_lang="en",
+        target_lang="vi",
+    )
+
+    assert not result.safety_passed
+    assert result.safety_issues == ["empty_asr_transcript"]
+    assert result.translated_text == ""
+    assert result.output_audio is None
 
 
 def test_pipeline_applies_asr_generation_contract_configuration():

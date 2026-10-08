@@ -371,6 +371,11 @@ class SafetyCheck:
     issues: list[str] = field(default_factory=list)
 
 
+def safety_issue_codes(issues: Sequence[str]) -> tuple[str, ...]:
+    """Return stable issue categories without logging clinical text/details."""
+    return tuple(sorted({issue.partition(":")[0] for issue in issues}))
+
+
 def validate_translation(
     source: str,
     target: str,

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .generation_guard import require_completed_generation
-from .safety_guard import validate_translation
+from .safety_guard import safety_issue_codes, validate_translation
 
 logger = logging.getLogger(__name__)
 
@@ -420,8 +420,16 @@ class MTEngine:
         )
 
         logger.info(
-            f"MT [{source_lang}→{target_lang}]: "
-            f"\"{text[:50]}\" → \"{translated_text[:50]}\" "
-            f"(latency={latency_ms:.0f}ms, tokens={len(generated_tokens)})"
+            "MT complete source_lang=%s target_lang=%s source_chars=%d "
+            "output_chars=%d latency_ms=%.0f tokens=%d safety_passed=%s "
+            "safety_issue_codes=%s",
+            source_lang,
+            target_lang,
+            len(text),
+            len(translated_text),
+            latency_ms,
+            len(generated_tokens),
+            safety.safe,
+            safety_issue_codes(safety.issues),
         )
         return result
