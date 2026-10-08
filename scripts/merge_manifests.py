@@ -75,6 +75,7 @@ def source_records(
             for split in spec.get(split_keys[role], []):
                 for record in read_jsonl(records_dir / f"{name}--{split}.jsonl"):
                     item = dict(record)
+                    item.pop("audio_url", None)
                     item["role"] = role
                     item["merge_policy"] = "official_split"
                     by_role[role].append(item)
@@ -109,6 +110,7 @@ def source_records(
     }
     for record in records:
         item = dict(record)
+        item.pop("audio_url", None)
         group = str(item.get("group") or f"record:{item['id']}").strip().casefold()
         if item.get("source_split") in locked_splits or group in locked_groups:
             role = "test"

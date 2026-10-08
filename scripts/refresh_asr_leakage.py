@@ -12,7 +12,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.audit_datasets import markdown_report, role_for_split, select_listening_records  # noqa: E402
+from scripts.audit_datasets import (  # noqa: E402
+    durable_asr_record,
+    markdown_report,
+    role_for_split,
+    select_listening_records,
+)
 from src.data.quality import cross_split_leakage, write_json  # noqa: E402
 
 
@@ -36,7 +41,7 @@ def main() -> int:
                 for line in handle:
                     if not line.strip():
                         continue
-                    record = json.loads(line)
+                    record = durable_asr_record(json.loads(line))
                     record["role"] = role_for_split(spec, record["source_split"])
                     records.append(record)
                     rewritten.append(json.dumps(record, ensure_ascii=False))

@@ -8,9 +8,10 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 
 - `project_analysis.md` — nguồn sự thật về kiến trúc, roadmap, trạng thái và quyết định
 - `configs/datasets.yaml` — registry dữ liệu, license, split và vai trò train/eval
-- `scripts/audit_datasets.py` — EDA metadata đầy đủ trước merge
+- `scripts/audit_datasets.py` — EDA metadata đầy đủ trước merge; URL tải ký chỉ tồn tại trong RAM và không được ghi vào record/listening report
 - `scripts/merge_manifests.py` — merge có khóa chống leakage
-- `scripts/materialize_audio.py` — tải audio sau khi EDA được duyệt
+- `scripts/materialize_audio.py` — refresh URL từ đúng Hugging Face datasets-server ngay trước khi tải, chỉ nhận public HTTPS và loại URL khỏi local manifest
+- `scripts/sanitize_asr_report_urls.py` — dry-run mặc định để kiểm artifact EDA cũ; chỉ `--apply` mới loại nguyên tử đúng trường `audio_url`
 - `scripts/qc_local_audio.py` — decode, chuẩn hóa FLAC mono 16 kHz và loại near-silence/CPS bất khả thi
 - `scripts/run_baseline_benchmarks.py` — baseline ASR VI/EN và MT trên tập khóa
 - `scripts/run_asr_candidate_suite.py` — chấm LoRA ASR Việt trên full test, code-switch và clinical audio suite, fail-closed

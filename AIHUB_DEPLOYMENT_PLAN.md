@@ -65,7 +65,7 @@ Ngân sách lập kế hoạch ban đầu, chưa phải kết quả đo:
 - [ ] Xác nhận token từng xuất hiện trong chat đã bị revoke.
 - [x] Không lưu API token trong repository.
 - [x] Dùng cấu hình người dùng của `qai-hub`, không truyền token trong script hoặc log.
-- [ ] Trước khi chia sẻ log, scan và loại token, URL ký tạm thời và dữ liệu nhạy cảm. Backup schema 2 nay tự quét source và đọc lại tar theo streaming, không echo secret và fail-closed; gate vẫn mở vì 25 artifact EDA local bị ignore còn chứa `audio_url` ký tạm thời, phải được tái tạo/sanitize trước final backup.
+- [ ] Trước khi chia sẻ log, scan và loại token, URL ký tạm thời và dữ liệu nhạy cảm. Backup schema 2 nay tự quét source và đọc lại tar theo streaming, không echo secret và fail-closed. Generator mới không còn persist URL; downloader refresh URL từ đúng datasets-server trong RAM, bắt public HTTPS rồi loại trước khi ghi manifest. Dry-run migration xác minh 25/33 artifact EDA local còn 42.106 trường `audio_url`; gate vẫn mở cho tới khi owner chủ động chạy sanitizer `--apply` hoặc tái tạo artifact.
 
 ### Dữ liệu được phép upload
 

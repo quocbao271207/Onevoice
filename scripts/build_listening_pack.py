@@ -11,9 +11,13 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+import yaml
 from scipy.signal import resample_poly
 
-from materialize_audio import download_one
+try:
+    from scripts.materialize_audio import destination_path, download_one, refresh_audio_urls
+except ModuleNotFoundError:  # Direct execution from the scripts directory.
+    from materialize_audio import destination_path, download_one, refresh_audio_urls
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,11 +49,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eda-dir", type=Path, default=ROOT / "data" / "reports" / "eda")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data" / "review" / "listening_pack")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs" / "datasets.yaml")
     parser.add_argument("--per-source", type=int, default=12)
     parser.add_argument("--source", action="append", help="Only build queues for this source key (repeatable).")
     parser.add_argument("--min-duration-s", type=float, default=2.0)
     parser.add_argument("--min-rms", type=float, default=0.003)
     args = parser.parse_args()
+    config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    dataset_specs = config.get("datasets")
+    if not isinstance(dataset_specs, dict):
+        raise ValueError("Dataset config must contain a datasets mapping")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     review_rows = []
     exclusions = []
@@ -58,13 +67,14 @@ def main() -> int:
         if selected_sources and queue_path.stem not in selected_sources:
             continue
         records = [json.loads(line) for line in queue_path.read_text(encoding="utf-8").splitlines() if line]
+        records = refresh_audio_urls(records, dataset_specs)
         accepted = 0
         for record in records:
             if accepted >= args.per_source:
                 break
             local = download_one(record, args.output_dir / "audio")
             original_path = Path(local["audio_path"])
-            review_path = args.output_dir / "playback" / record["source"] / record["source_split"] / f"{record['id']}.wav"
+            review_path = destination_path(record, args.output_dir / "playback")
             audio_stats = make_review_copy(original_path, review_path)
             rejection_reasons = []
             if audio_stats["actual_duration_s"] < args.min_duration_s:

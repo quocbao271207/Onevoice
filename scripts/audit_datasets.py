@@ -131,6 +131,13 @@ def normalize_asr_row(name: str, spec: dict[str, Any], split: str, row: dict[str
     }
 
 
+def durable_asr_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the persistable ASR record without an expiring download capability."""
+    durable = dict(record)
+    durable.pop("audio_url", None)
+    return durable
+
+
 def select_listening_records(records: list[dict[str, Any]], limit: int = 36) -> list[dict[str, Any]]:
     """Deterministic risk + coverage sample for human transcript verification."""
     selected: list[dict[str, Any]] = []
@@ -221,7 +228,7 @@ def audit_asr(name: str, spec: dict[str, Any], output: Path, max_rows: int | Non
         manifest_path = record_dir / f"{name}--{split}.jsonl"
         with manifest_path.open("w", encoding="utf-8") as handle:
             for row in iter_rows(repo_id, config, split, split_limit):
-                record = normalize_asr_row(name, spec, split, row)
+                record = durable_asr_record(normalize_asr_row(name, spec, split, row))
                 flags = profiles[split].add(
                     record["text"],
                     record["duration_s"],
