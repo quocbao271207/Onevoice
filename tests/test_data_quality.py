@@ -561,14 +561,42 @@ def test_merge_locks_test_recording_group_before_train(tmp_path):
     records = tmp_path / "records"
     output = tmp_path / "out"
     records.mkdir()
-    spec = {"priority": 1, "train_splits": ["train"], "validation_splits": [], "test_splits": ["test"]}
-    test = {"role": "test", "text_fingerprint": "test-fp", "group": "same-video", "quality_flags": []}
-    train = {"role": "train", "text_fingerprint": "different-fp", "group": "same-video", "quality_flags": []}
-    (records / "sample--test.jsonl").write_text(json.dumps(test) + "\n", encoding="utf-8")
-    (records / "sample--train.jsonl").write_text(json.dumps(train) + "\n", encoding="utf-8")
+    spec = {
+        "priority": 1,
+        "train_splits": ["train"],
+        "validation_splits": ["validation"],
+        "test_splits": ["test"],
+    }
+
+    def row(record_id, role, fingerprint, group):
+        return {
+            "id": record_id,
+            "source": "sample",
+            "role": role,
+            "task": "asr",
+            "text_fingerprint": fingerprint,
+            "group": group,
+            "quality_flags": [],
+        }
+
+    test = row("test", "test", "test-fp", "same-video")
+    validation = row("validation", "validation", "validation-fp", "validation-video")
+    train = [
+        row("drop", "train", "different-fp", "same-video"),
+        row("keep", "train", "keep-fp", "train-video"),
+    ]
+    for split, rows in (
+        ("test", [test]),
+        ("validation", [validation]),
+        ("train", train),
+    ):
+        (records / f"sample--{split}.jsonl").write_text(
+            "\n".join(json.dumps(item) for item in rows) + "\n",
+            encoding="utf-8",
+        )
 
     result = merge_task("asr", [("sample", spec)], records, output)
-    assert result["kept"] == {"test": 1}
+    assert result["kept"] == {"test": 1, "validation": 1, "train": 1}
     assert result["dropped"] == {"group_overlap_with_higher_role": 1}
 
 

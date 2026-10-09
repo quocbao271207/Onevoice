@@ -238,21 +238,28 @@ def test_merge_strips_legacy_audio_urls(tmp_path: Path):
     records_dir = tmp_path / "records"
     output_dir = tmp_path / "merged"
     records_dir.mkdir()
-    record = audit_datasets.normalize_asr_row("sample", asr_spec(), "train", source_row())
-    (records_dir / "sample--train.jsonl").write_text(
-        json.dumps(record, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    spec = asr_spec()
+    spec["validation_splits"] = ["validation"]
+    spec["test_splits"] = ["test"]
+    for index, split in enumerate(("train", "validation", "test"), start=1):
+        upstream = source_row()
+        upstream["native_id"] = f"native-{index}"
+        upstream["text"] = f"Bệnh nhân đau ngực {index}"
+        record = audit_datasets.normalize_asr_row("sample", spec, split, upstream)
+        (records_dir / f"sample--{split}.jsonl").write_text(
+            json.dumps(record, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     result = merge_task(
         "asr",
-        [("sample", asr_spec())],
+        [("sample", spec)],
         records_dir,
         output_dir,
     )
 
     merged = json.loads((output_dir / "asr--train.jsonl").read_text(encoding="utf-8"))
-    assert result["kept"] == {"train": 1}
+    assert result["kept"] == {"test": 1, "validation": 1, "train": 1}
     assert "audio_url" not in merged
 
 
