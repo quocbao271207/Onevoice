@@ -1074,6 +1074,63 @@ def test_resume_skips_identical_completed_stage_and_rejects_changed_command(tmp_
         run_stage("stage", command + ["changed"], state_path, state, log, [output])
 
 
+def test_completed_training_resume_suffix_requires_immutable_output_evidence(
+    tmp_path: Path,
+):
+    output = tmp_path / "training-output"
+    output.mkdir()
+    (output / "summary.json").write_text(
+        '{"status":"complete"}', encoding="utf-8"
+    )
+    base_command = [
+        sys.executable,
+        str(ROOT / "scripts" / "run_gpu_rounds.py"),
+        "--task",
+        "mt",
+        "--config",
+        str(tmp_path / "runtime.yaml"),
+        "--output-root",
+        str(tmp_path / "runs"),
+    ]
+    stored_command = [
+        *base_command,
+        "--round-name",
+        "pilot",
+        "--resume-from-checkpoint",
+        str(tmp_path / "checkpoint-100"),
+    ]
+    state = {
+        "stages": {
+            "train": {
+                "status": "complete",
+                "command": stored_command,
+                "command_sha256": bakeoff.command_digest(stored_command),
+                "output_evidence": bakeoff.output_evidence([output]),
+            }
+        }
+    }
+
+    run_stage(
+        "train",
+        base_command,
+        tmp_path / "state.json",
+        state,
+        tmp_path / "train.log",
+        [output],
+    )
+
+    state["stages"]["train"].pop("output_evidence")
+    with pytest.raises(ValueError, match="output evidence missing"):
+        run_stage(
+            "train",
+            base_command,
+            tmp_path / "state.json",
+            state,
+            tmp_path / "train.log",
+            [output],
+        )
+
+
 def test_all_stage_launches_reject_a_stale_loaded_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

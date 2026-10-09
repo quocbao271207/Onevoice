@@ -481,6 +481,33 @@ def resume_scoring_command_compatible(
     )
 
 
+def completed_training_resume_command_compatible(
+    previous_command: Any,
+    current_command: list[str],
+) -> bool:
+    """Allow a completed training stage to drop its historical resume suffix.
+
+    A recovered attempt records the verified checkpoint that seeded it. Once
+    its immutable output evidence is complete, a fresh runner reconstructs the
+    base training command without those recovery-only flags. Accept only that
+    exact suffix; ``run_stage`` still verifies the output fingerprint.
+    """
+    if not isinstance(previous_command, list) or not all(
+        isinstance(item, str) for item in previous_command
+    ):
+        return False
+    if not any(Path(item).name == "run_gpu_rounds.py" for item in current_command):
+        return False
+    if len(previous_command) != len(current_command) + 4:
+        return False
+    suffix = previous_command[-4:]
+    if suffix[0] != "--round-name" or suffix[2] != "--resume-from-checkpoint":
+        return False
+    if not suffix[1] or not suffix[3]:
+        return False
+    return previous_command[:-4] == current_command
+
+
 def resolved_command_executable(command_token: str) -> Path | None:
     """Resolve a command executable using the same working directory as stages."""
     executable = Path(command_token)
@@ -2392,17 +2419,27 @@ def run_stage(
                 )
             )
         )
+        completed_training_recovery = (
+            command_changed
+            and completed_training_resume_command_compatible(
+                previous.get("command"), command
+            )
+        )
         if command_changed and not (
-            recovery_only_upgrade or immutable_command_compatibility
+            recovery_only_upgrade
+            or immutable_command_compatibility
+            or completed_training_recovery
         ):
             raise ValueError(f"Cannot resume {name}: command changed")
         current_evidence = output_evidence(expected_outputs)
         recorded_evidence = previous.get("output_evidence")
-        if immutable_command_compatibility and recorded_evidence is None:
+        if (
+            immutable_command_compatibility or completed_training_recovery
+        ) and recorded_evidence is None:
             raise ValueError(f"Cannot resume {name}: output evidence missing")
         if recorded_evidence is not None and recorded_evidence != current_evidence:
             raise ValueError(f"Cannot resume {name}: output evidence changed")
-        if immutable_command_compatibility:
+        if immutable_command_compatibility or completed_training_recovery:
             return
         if not recovery_only_upgrade:
             return
