@@ -47,6 +47,7 @@ from scripts.run_asr_candidate_suite import candidate_checks as asr_candidate_ch
 from scripts.run_asr_candidate_suite import validate_locked_inputs as validate_asr_locked_inputs
 from scripts.run_mt_candidate_suite import validate_locked_inputs as validate_mt_locked_inputs
 from scripts.run_mt_candidate_suite import candidate_checks as mt_candidate_checks
+from src.pipeline.generation_guard import GenerationContractError
 
 
 @pytest.mark.parametrize("suite", [asr_suite, mt_suite])
@@ -642,6 +643,58 @@ def test_resume_scoring_skips_model_loading_and_inference(
     assert report["samples"] == 1
     assert report["scoring_resumed"] is True
     assert report["decoding"]["scoring_resumed_from_checkpoint"] is True
+
+
+def test_canonical_selection_records_generation_contract_failure_as_ineligible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    manifest = tmp_path / "data" / "eval" / "mt_selection_dev.jsonl"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text('{"id":"pair"}\n', encoding="utf-8")
+    output_dir = tmp_path / "reports"
+
+    monkeypatch.setattr(benchmark, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        benchmark,
+        "validate_bakeoff_runner_generation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        benchmark,
+        "run_mt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            GenerationContractError("pair did not produce EOS")
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_baseline_benchmarks.py",
+            "--task",
+            "mt",
+            "--manifest",
+            str(manifest),
+            "--samples",
+            "0",
+            "--name",
+            "selection",
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+
+    assert benchmark.main() == 0
+    report = json.loads((output_dir / "selection.json").read_text(encoding="utf-8"))
+    assert report["status"] == "ineligible_generation_contract"
+    assert report["decoding"] == {
+        "generation_complete": False,
+        "failure_type": "generation_contract",
+        "failure": "pair did not produce EOS",
+    }
+    assert report["predictions"] is None
+    assert report["prediction_provenance"] is None
 
 
 def test_fullscale_mt_scoring_smoke_is_bound_to_locked_manifest():

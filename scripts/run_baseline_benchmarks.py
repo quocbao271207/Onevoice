@@ -35,7 +35,10 @@ from src.pipeline.audio_frontend import validate_audio_input  # noqa: E402
 from src.pipeline.durable_file import write_durable_bytes  # noqa: E402
 from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.evidence_paths import is_link_or_junction  # noqa: E402
-from src.pipeline.generation_guard import require_completed_generation  # noqa: E402
+from src.pipeline.generation_guard import (  # noqa: E402
+    GenerationContractError,
+    require_completed_generation,
+)
 from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
 from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
 from src.training.mt_model_adapter import (  # noqa: E402
@@ -225,6 +228,31 @@ def validate_bakeoff_runner_generation(
             "Stale or unbound bake-off runner generation; canonical selection "
             "inference is blocked before model loading"
         )
+
+
+def is_canonical_selection_manifest(path: Path) -> bool:
+    canonical = {
+        (ROOT / relative).resolve() for relative in CANONICAL_SELECTION_MANIFESTS
+    }
+    return path.resolve() in canonical
+
+
+def generation_contract_failure_report(
+    args: argparse.Namespace,
+    failure: GenerationContractError,
+) -> dict[str, Any]:
+    """Record an ineligible selection candidate without weakening EOS checks."""
+    return {
+        "status": "ineligible_generation_contract",
+        "samples": 0,
+        "categories": {},
+        "directions": {} if args.task == "mt" else None,
+        "decoding": {
+            "generation_complete": False,
+            "failure_type": "generation_contract",
+            "failure": str(failure),
+        },
+    }
 
 
 def source_balanced_sample(rows: list[dict[str, Any]], size: int, seed: int) -> list[dict[str, Any]]:
@@ -892,19 +920,30 @@ def main() -> int:
         else None
     )
     if checkpoint is None:
-        predictions, report = (
-            run_asr(
-                args,
-                prediction_path=prediction_path,
-                checkpoint_specification=checkpoint_specification,
+        try:
+            predictions, report = (
+                run_asr(
+                    args,
+                    prediction_path=prediction_path,
+                    checkpoint_specification=checkpoint_specification,
+                )
+                if args.task == "asr"
+                else run_mt(
+                    args,
+                    prediction_path=prediction_path,
+                    checkpoint_specification=checkpoint_specification,
+                )
             )
-            if args.task == "asr"
-            else run_mt(
-                args,
-                prediction_path=prediction_path,
-                checkpoint_specification=checkpoint_specification,
+        except GenerationContractError as exc:
+            if not is_canonical_selection_manifest(args.manifest):
+                raise
+            predictions = []
+            report = generation_contract_failure_report(args, exc)
+            print(
+                "[ineligible] canonical selection generation contract failed; "
+                "recording a fail-closed report",
+                flush=True,
             )
-        )
         report_device = resolve_device(args.device)
         scoring_resumed = False
     else:
@@ -930,8 +969,12 @@ def main() -> int:
             "gpu_memory_fraction": args.gpu_memory_fraction if report_device == "cuda" else None,
             "manifest": str(args.manifest),
             "seed": args.seed,
-            "predictions": str(prediction_path),
-            "prediction_provenance": str(prediction_provenance_path(prediction_path)),
+            "predictions": str(prediction_path) if prediction_path.is_file() else None,
+            "prediction_provenance": (
+                str(prediction_provenance_path(prediction_path))
+                if prediction_provenance_path(prediction_path).is_file()
+                else None
+            ),
             "scoring_resumed": scoring_resumed,
         }
     )

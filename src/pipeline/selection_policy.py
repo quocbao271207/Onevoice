@@ -54,6 +54,7 @@ def selection_identity(comparison: dict[str, Any]) -> dict[str, Any]:
                 "adapter_manifest_sha256": winner.get("adapter_manifest_sha256"),
                 "direction": winner.get("direction"),
                 "profile": winner.get("profile"),
+                "decision": winner.get("decision"),
             }
             for key, winner in sorted(task_winners.items())
         }

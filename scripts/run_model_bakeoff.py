@@ -3024,6 +3024,23 @@ def strongest_eligible_challenger(
     )
 
 
+def selection_safety_blockers(results: dict[str, Any]) -> list[dict[str, str]]:
+    """Describe task directions that have no safety-eligible selection winner."""
+    blockers = []
+    for task in ("mt", "asr"):
+        winners = results.get(task, {}).get("winners", {})
+        for direction, winner in sorted(winners.items()):
+            if winner.get("decision") == "no_safety_eligible_winner":
+                blockers.append(
+                    {
+                        "task": task,
+                        "direction": str(direction),
+                        "reason": "no_safety_eligible_winner",
+                    }
+                )
+    return blockers
+
+
 def run_task_bakeoff(
     *,
     task: str,
@@ -3270,10 +3287,9 @@ def run_task_bakeoff(
             raise ValueError(
                 f"Candidate A evidence is invalid for {task}/{direction or 'vi'}"
             )
-        if not baseline_score["clinical_safety_pass"] and not ranked:
-            raise RuntimeError(
-                f"No safety-eligible winner for {task}/{direction or 'vi'}"
-            )
+        no_safety_eligible_winner = (
+            not baseline_score["clinical_safety_pass"] and not ranked
+        )
         winner = {
             "candidate_id": candidate_a["id"],
             "adapter": str(candidate_a_adapter),
@@ -3282,7 +3298,11 @@ def run_task_bakeoff(
             ],
             "direction": direction,
             "score": baseline_score,
-            "decision": "candidate_a_retained",
+            "decision": (
+                "no_safety_eligible_winner"
+                if no_safety_eligible_winner
+                else "candidate_a_retained"
+            ),
             "profile": None,
         }
         challenger = strongest_eligible_challenger(ranked, baseline_score)
@@ -3461,6 +3481,8 @@ def main() -> int:
         state_path=state_path,
         state=state,
     )
+    results = {"mt": mt_result, "asr": asr_result}
+    selection_blockers = selection_safety_blockers(results)
     comparison = {
         "version": 1,
         "updated_at": utc_now(),
@@ -3473,7 +3495,8 @@ def main() -> int:
         "selection_policy": selection_policy_record(config),
         "research_license_approvals": sorted(approvals),
         "license_decisions": report["licenses"],
-        "results": {"mt": mt_result, "asr": asr_result},
+        "results": results,
+        "selection_blockers": selection_blockers,
         "blind_test_v2": "pending",
     }
     comparison_path = ROOT / "data/reports/model_bakeoff/comparison.json"
@@ -3512,6 +3535,31 @@ def main() -> int:
         comparison,
         maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
     )
+
+    if selection_blockers:
+        state["stage"] = "selection_blocked"
+        state["execution_status"] = "blocked_no_safety_eligible_winner"
+        state["promotion_allowed"] = False
+        state["selection_comparison"] = str(selection_snapshot_path)
+        state["selection_blockers"] = selection_blockers
+        atomic_json(state_path, state)
+        print(
+            json.dumps(
+                {
+                    **report,
+                    "state": str(state_path),
+                    "selection_comparison": str(selection_snapshot_path),
+                    "selection_blockers": selection_blockers,
+                    "note": (
+                        "Selection finished, but at least one task direction has "
+                        "no safety-eligible winner; blind v2 remains unopened."
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
 
     blind_lock_path = ROOT / config["data"]["blind_test_v2_lock"]
     blind_lock = read_json_mapping(

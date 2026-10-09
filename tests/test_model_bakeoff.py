@@ -794,6 +794,75 @@ def test_candidate_a_mt_is_benchmarked_per_direction(monkeypatch, tmp_path: Path
     assert result["winners"]["vi_to_en"]["decision"] == "candidate_a_retained"
 
 
+def test_bakeoff_records_no_safety_eligible_winner_without_stopping_other_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+
+    def unsafe_report(**_kwargs):
+        return {
+            "directions": {
+                "en_to_vi": {
+                    "sacrebleu": 30.0,
+                    "sacrebleu_bootstrap_95ci": [29.0, 31.0],
+                    "chrf2": 50.0,
+                    "chrf2_bootstrap_95ci": [49.0, 51.0],
+                },
+                "vi_to_en": {
+                    "sacrebleu": 30.0,
+                    "sacrebleu_bootstrap_95ci": [29.0, 31.0],
+                    "chrf2": 50.0,
+                    "chrf2_bootstrap_95ci": [49.0, 51.0],
+                },
+            },
+            "categories": {"dose": {"samples": 1, "safety_failure_rate": 1.0}},
+        }
+
+    monkeypatch.setattr(bakeoff, "benchmark_unit", unsafe_report)
+    data = {
+        "candidates": {
+            "mt": [
+                {
+                    "id": "candidate-a",
+                    "role": "candidate_a",
+                    "directions": ["en_to_vi", "vi_to_en"],
+                }
+            ]
+        },
+        "promotion_gate": {"critical_slices": ["dose"], "policy_slices": []},
+        "successive_halving": {"semifinal": {"keep": 2}},
+    }
+
+    result = bakeoff.run_task_bakeoff(
+        task="mt",
+        config=data,
+        research_approvals=set(),
+        frozen={"adapters": {"mt": {"root": str(adapter)}}},
+        python=sys.executable,
+        state_dir=tmp_path,
+        state_path=tmp_path / "state.json",
+        state={"stages": {}},
+    )
+
+    assert result["winners"]["en_to_vi"]["decision"] == "no_safety_eligible_winner"
+    assert result["winners"]["vi_to_en"]["decision"] == "no_safety_eligible_winner"
+    assert bakeoff.selection_safety_blockers({"mt": result, "asr": {}}) == [
+        {
+            "task": "mt",
+            "direction": "en_to_vi",
+            "reason": "no_safety_eligible_winner",
+        },
+        {
+            "task": "mt",
+            "direction": "vi_to_en",
+            "reason": "no_safety_eligible_winner",
+        },
+    ]
+
+
 def test_mt_multi_metric_winner_rejects_significant_bleu_regression():
     required = ["dose"]
 
@@ -938,6 +1007,12 @@ def test_selection_identity_ignores_later_blind_results_but_binds_winners():
     finalized["results"]["mt"]["winners"]["en_to_vi"]["candidate_id"] = "other"
     assert selection_identity(finalized) != selection_identity(comparison)
     assert selection_identity_sha256(finalized) != selection_identity_sha256(comparison)
+
+    finalized = json.loads(json.dumps(comparison))
+    finalized["results"]["mt"]["winners"]["en_to_vi"]["decision"] = (
+        "no_safety_eligible_winner"
+    )
+    assert selection_identity(finalized) != selection_identity(comparison)
 
     finalized = json.loads(json.dumps(comparison))
     finalized["selection_policy"]["winner_rule"] = "legacy_single_metric"
