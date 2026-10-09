@@ -12,6 +12,7 @@ Prototype dịch giọng nói y tế Việt ↔ Anh hướng tới chạy on-dev
 - `scripts/preflight_project.py` — data/GPU readiness từ strict stable JSON/JSONL/YAML; inventory khóa unique ID/path/hash, mọi audio được no-link stable-hash hai lượt và report publish crash-durable
 - `scripts/build_audio_inventory.py` — tạo inventory xác định từ ba manifest strict/bounded/no-link; audio identity dùng stable hash+size, duplicate bị chặn trước publish và inventory/summary được ghi crash-durable
 - `scripts/merge_manifests.py` — merge có khóa chống leakage; dataset/exclusion config strict/bounded/no-link
+- `scripts/validate_manifests.py` — strict-parse sáu manifest với byte/line/row cap và no-link guard; kiểm schema/role/task/ID/fingerprint/duration cùng leakage nội và chéo split, bind exact bytes/SHA-256 rồi publish report crash-durable
 - `scripts/materialize_audio.py` — đọc dataset registry strict/bounded/no-link, refresh URL từ đúng Hugging Face datasets-server ngay trước khi tải, chỉ nhận public HTTPS và loại URL khỏi local manifest
 - `scripts/sanitize_asr_report_urls.py` — dry-run mặc định để kiểm artifact EDA cũ; chỉ `--apply` mới loại nguyên tử đúng trường `audio_url`
 - `scripts/qc_local_audio.py` — decode, chuẩn hóa FLAC mono 16 kHz và loại near-silence/CPS bất khả thi
