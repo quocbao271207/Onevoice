@@ -426,3 +426,101 @@ def test_mt_bootstrap_precomputed_statistics_match_full_rescoring():
     assert actual["chrf2_bootstrap_95ci"] == pytest.approx(
         [np.quantile(expected_chrf, 0.025), np.quantile(expected_chrf, 0.975)]
     )
+
+
+def test_refined_safety_guard_accepts_valid_clinical_paraphrases():
+    # Frequency and modifier units
+    check_freq = validate_translation(
+        "Take 1 double-strength tablet orally twice a day for 10 days.",
+        "Uống 1 viên thuốc có độ mạnh gấp đôi 2 lần / ngày trong 10 ngày.",
+        "en",
+        "vi",
+    )
+    assert check_freq.safe, check_freq.issues
+
+    # English named months to Vietnamese numbered months
+    check_months = validate_translation(
+        "Study was conducted from January 2021 to December 2021.",
+        "Nghiên cứu được tiến hành từ tháng 1 năm 2021 đến tháng 12 năm 2021.",
+        "en",
+        "vi",
+    )
+    assert check_months.safe, check_months.issues
+
+    # Hyphenated duration
+    check_hyphen = validate_translation(
+        "Evaluation at the 90-day follow-up.",
+        "Đánh giá khi theo dõi 90 ngày.",
+        "en",
+        "vi",
+    )
+    assert check_hyphen.safe, check_hyphen.issues
+
+    # Intervening consecutive modifier
+    check_consec = validate_translation(
+        "Treated daily for 60 consecutive days.",
+        "Điều trị hàng ngày trong 60 ngày liên tiếp.",
+        "en",
+        "vi",
+    )
+    assert check_consec.safe, check_consec.issues
+
+    # Modal and implicit negations
+    check_cannot = validate_translation(
+        "It is toxic and cannot be used in humans.",
+        "Thuốc có độc tính và không thể được sử dụng ở người.",
+        "en",
+        "vi",
+    )
+    assert check_cannot.safe, check_cannot.issues
+
+    check_unavail = validate_translation(
+        "Perform MRI or, if unavailable, CT.",
+        "Chụp MRI hoặc, nếu không có, chụp CT.",
+        "en",
+        "vi",
+    )
+    assert check_unavail.safe, check_unavail.issues
+
+    check_irrev = validate_translation(
+        "2 cases BAV III irreversibly.",
+        "2 trường hợp BAV III không hồi phục.",
+        "en",
+        "vi",
+    )
+    assert check_irrev.safe, check_irrev.issues
+
+
+def test_refined_asr_safety_accepts_vietnamese_spoken_number_and_percent_variants():
+    report = score_asr(
+        [
+            {
+                "id": "asr-number-spoken",
+                "reference": "quá 12 giờ",
+                "hypothesis": "quá mười hai giờ",
+                "categories": ["number"],
+                "safety_expectations": {"number": [["12"]]},
+            },
+            {
+                "id": "asr-year-spoken",
+                "reference": "từ năm 1990",
+                "hypothesis": "từ năm một chín chín mươi",
+                "categories": ["number"],
+                "safety_expectations": {"number": [["1990"]]},
+            },
+            {
+                "id": "asr-dose-percent",
+                "reference": "kéo dài tuổi thọ đến 30%",
+                "hypothesis": "kéo dài tuổi thọ đến 30% đặc biệt",
+                "categories": ["dose", "unit"],
+                "safety_expectations": {
+                    "dose": [["30"], ["%"]],
+                    "unit": [["%"]],
+                },
+            },
+        ]
+    )
+    assert report["categories"]["number"]["safety_failure_rate"] == 0.0
+    assert report["categories"]["dose"]["safety_failure_rate"] == 0.0
+    assert report["categories"]["unit"]["safety_failure_rate"] == 0.0
+

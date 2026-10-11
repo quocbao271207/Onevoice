@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -37,10 +38,70 @@ ASR_CRITICAL_CATEGORIES = {
 }
 
 
+def _normalize_phrase_for_matching(text: str) -> str:
+    norm = normalize_for_wer(text)
+    norm = re.sub(r"([%°])", r" \1 ", norm)
+    return re.sub(r"\s+", " ", norm).strip()
+
+
+def vietnamese_number_variants(phrase: str) -> list[str]:
+    phrase_clean = phrase.strip().replace(",", ".")
+    variants = [phrase]
+    try:
+        val = int(phrase_clean)
+    except ValueError:
+        return variants
+
+    digits = {
+        0: "không", 1: "một", 2: "hai", 3: "ba", 4: "bốn",
+        5: "năm", 6: "sáu", 7: "bảy", 8: "tám", 9: "chín",
+    }
+    tens = {
+        2: "hai mươi", 3: "ba mươi", 4: "bốn mươi", 5: "năm mươi",
+        6: "sáu mươi", 7: "bảy mươi", 8: "tám mươi", 9: "chín mươi",
+    }
+    if 0 <= val <= 9:
+        variants.append(digits[val])
+        if val == 4:
+            variants.append("tư")
+    elif val == 10:
+        variants.append("mười")
+    elif 11 <= val <= 19:
+        u = val - 10
+        u_str = "lăm" if u == 5 else digits[u]
+        variants.append(f"mười {u_str}")
+    elif 20 <= val <= 99:
+        t = val // 10
+        u = val % 10
+        if u == 0:
+            variants.append(tens[t])
+        elif u == 1:
+            variants.append(f"{tens[t]} mốt")
+            variants.append(f"{digits[t]} mốt")
+        elif u == 4:
+            variants.append(f"{tens[t]} bốn")
+            variants.append(f"{tens[t]} tư")
+        elif u == 5:
+            variants.append(f"{tens[t]} lăm")
+        else:
+            variants.append(f"{tens[t]} {digits[u]}")
+    elif 1900 <= val <= 2099:
+        d_words = [digits[int(c)] for c in str(val)]
+        variants.append(" ".join(d_words))
+        c1, c2, c3, c4 = [int(c) for c in str(val)]
+        if c3 >= 2 and c4 == 0:
+            variants.append(f"{digits[c1]} {digits[c2]} {tens[c3]}")
+    return list(dict.fromkeys(variants))
+
+
 def _contains_normalized_phrase(text: str, phrase: str) -> bool:
-    normalized_text = f" {normalize_for_wer(text)} "
-    normalized_phrase = normalize_for_wer(phrase)
-    return bool(normalized_phrase) and f" {normalized_phrase} " in normalized_text
+    normalized_text = f" {_normalize_phrase_for_matching(text)} "
+    candidates = vietnamese_number_variants(phrase)
+    for cand in candidates:
+        normalized_cand = _normalize_phrase_for_matching(cand)
+        if bool(normalized_cand) and f" {normalized_cand} " in normalized_text:
+            return True
+    return False
 
 
 def score_asr_safety(rows: list[dict[str, Any]]) -> dict[str, Any]:

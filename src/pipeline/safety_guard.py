@@ -13,32 +13,60 @@ from typing import Mapping
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,]\s*\d+)?(?!\w)")
 COMPACT_IDENTIFIER_RE = re.compile(r"(?i)\b([a-z]+)(\d+)\b")
 SPACED_IDENTIFIER_RE = re.compile(r"(?i)\b([BT])\s+(\d+)\b")
-HYPHENATED_IDENTIFIER_RE = re.compile(r"\b([A-Z]{2,})-(\d+)\b")
+HYPHENATED_IDENTIFIER_RE = re.compile(r"(?i)\b([a-z]{2,})-(\d+)\b")
 QUANTITY_RE = re.compile(
-    r"(?i)(?<!\w)(\d+(?:[.,]\s*\d+)?)\s*"
+    r"(?i)(?<!\w)(\d+(?:[.,]\s*\d+)?)"
+    r"(?:[\s-]*|\s+(?:(?:\d+|double|extra|single)[-\s]strength|consecutive|additional|more)\s+)"
     r"(mcg/kg/min|µg/kg/min|mg/kg/hour|mg/kg/giờ|mg/kg/h|units/kg/hour|units/kg/h|đơn vị/kg/giờ|đơn vị/kg/h|"
     r"mmol/l|mg/kg|mcg/kg|µg/kg|ml/hour|ml/giờ|ml/h|l/min|"
     r"milligrams?|micrograms?|grams?|kilograms?|milliliters?|liters?|"
     r"mg|mcg|µg|g|kg|ml|l|mmhg|bpm|iu|units?|đơn vị|%|°c|độ c|"
     r"tablets?|viên|hours?|hrs?|giờ|days?|ngày)(?!\w)"
 )
-VI_NEGATION_RE = re.compile(r"(?i)\b(?:không được|không có|không phải|không|chưa|chẳng|đừng)\b")
+VI_NEGATION_RE = re.compile(r"(?i)\b(?:không được|không thể|không có|không phải|không|chưa|chẳng|đừng)\b")
 EN_NEGATION_RE = re.compile(
     r"(?i)\b(?:does not|do not|did not|is not|are not|was not|were not|"
-    r"doesn't|don't|didn't|isn't|aren't|wasn't|weren't|no|not|never|without)\b"
+    r"doesn't|don't|didn't|isn't|aren't|wasn't|weren't|"
+    r"cannot|can't|could not|couldn't|should not|shouldn't|would not|wouldn't|"
+    r"will not|won't|must not|mustn't|need not|needn't|"
+    r"has not|hasn't|have not|haven't|had not|hadn't|"
+    r"neither|nor|none|nobody|nothing|nowhere|"
+    r"no|not|never|without)\b"
 )
-VI_IMPLICIT_NEGATION_RE = re.compile(r"(?i)\b(?:bất|vô|thiếu|âm tính)\w*\b")
+VI_IMPLICIT_NEGATION_RE = re.compile(
+    r"(?i)\b(?:bất\s*(?:thường|động|tỉnh|lực|hoạt|ổn|khả|tương thích|toàn)|"
+    r"vô\s*(?:niệu|khuẩn|căn|hiệu|cảm|thức)|"
+    r"âm tính)\b"
+)
 EN_IMPLICIT_NEGATION_RE = re.compile(
-    r"(?i)\b(?:unequal|uneven|absent|absence|negative|impossible|unable|lack|lacking)\b"
+    r"(?i)\b(?:unequal|uneven|absent|absence|negative|impossible|unable|lack|lacking|"
+    r"unavailable|irreversible|irreversibly|inoperable|incurable|intractable|intolerant|"
+    r"unresponsive|unremarkable|unstable|undetectable|uncontrolled|"
+    r"noninvasive|non-invasive|nonresponsive|non-responsive|asymptomatic|afebrile)\b"
 )
 NUMBER_WORDS = {
     "vi": {
-        "một": "1", "hai": "2", "ba": "3", "bốn": "4", "tư": "4",
-        "năm": "5", "sáu": "6", "bảy": "7", "tám": "8", "chín": "9", "mười": "10",
+        "không": "0", "một": "1", "mốt": "1", "hai": "2", "ba": "3", "bốn": "4", "tư": "4",
+        "năm": "5", "lăm": "5", "nhăm": "5", "sáu": "6", "bảy": "7", "tám": "8", "chín": "9", "mười": "10",
+        "mười một": "11", "mười hai": "12",
+        "hai mươi": "20", "ba mươi": "30",
     },
     "en": {
-        "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
         "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14", "fifteen": "15",
+        "sixteen": "16", "seventeen": "17", "eighteen": "18", "nineteen": "19",
+        "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50",
+        "sixty": "60", "seventy": "70", "eighty": "80", "ninety": "90",
+        "hundred": "100", "thousand": "1000",
+        "once": "1", "twice": "2", "thrice": "3",
+        "single": "1", "double": "2", "triple": "3",
+        "january": "1", "february": "2", "march": "3", "april": "4",
+        "june": "6", "july": "7", "august": "8", "september": "9",
+        "october": "10", "november": "11", "december": "12",
+        "jan": "1", "feb": "2", "mar": "3", "apr": "4",
+        "jun": "6", "jul": "7", "aug": "8", "sep": "9", "sept": "9",
+        "oct": "10", "nov": "11", "dec": "12",
     },
 }
 
@@ -83,7 +111,10 @@ UNIT_ALIASES = {
 
 
 def _canonical_number(value: str) -> str:
-    return unicodedata.normalize("NFKC", value).replace(" ", "").replace(",", ".")
+    normalized = unicodedata.normalize("NFKC", value).replace(" ", "").replace(",", ".")
+    if re.fullmatch(r"\d+", normalized):
+        return str(int(normalized))
+    return normalized
 
 
 def _normalized_identifiers(text: str) -> str:
@@ -95,10 +126,13 @@ def _normalized_identifiers(text: str) -> str:
 
 def extract_identifiers(text: str) -> list[str]:
     normalized = _normalized_identifiers(text)
-    return [
-        f"{prefix.casefold()}{digits}"
-        for prefix, digits in COMPACT_IDENTIFIER_RE.findall(normalized)
-    ]
+    identifiers: list[str] = []
+    for prefix, digits in COMPACT_IDENTIFIER_RE.findall(normalized):
+        prefix_lower = prefix.casefold()
+        if prefix_lower in ("thg", "th") and 1 <= int(digits) <= 12:
+            continue
+        identifiers.append(f"{prefix_lower}{digits}")
+    return identifiers
 
 
 def extract_numbers(text: str, language: str | None = None) -> list[str]:
