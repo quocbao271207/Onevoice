@@ -7,10 +7,9 @@ if p.exists():
     comp_file = Path(d.get("selection_comparison", ""))
     if comp_file.exists():
         comp = json.loads(comp_file.read_text(encoding="utf-8"))
-        print("Comparison keys:", list(comp.keys()))
-        print("MT summary:", comp.get("mt", {}).get("winner"))
-        print("ASR summary:", comp.get("asr", {}).get("winner"))
-        print("Overall summary:", comp.get("summary"))
+        print("Status:", comp.get("status"))
+        print("Selection blockers:", json.dumps(comp.get("selection_blockers"), indent=2))
+        print("Results keys:", list(comp.get("results", {}).keys()))
     else:
         print("Comparison file does not exist:", comp_file)
 else:
