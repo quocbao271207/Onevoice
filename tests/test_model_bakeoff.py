@@ -2730,3 +2730,88 @@ def test_deployment_draft_rejects_legacy_template_without_sensor_fields(
     assert "winner:mt/en_to_vi:temperature_sensor_missing" in failures
     assert "winner:mt/en_to_vi:parity_evidence_path_missing" in failures
     assert "winner:mt/en_to_vi:measurement_evidence_path_missing" in failures
+
+
+def _stale_whisper_report(tmp_path, *, version=None, failure=None):
+    report_path = tmp_path / "selection.json"
+    decoding = {
+        "generation_complete": False,
+        "failure_type": "generation_contract",
+        "failure": failure
+        or "ASR benchmark source abc did not produce EOS; refusing potentially truncated output",
+    }
+    if version is not None:
+        decoding["generation_contract_version"] = version
+    report_path.write_text(
+        json.dumps({"status": "ineligible_generation_contract", "decoding": decoding}),
+        encoding="utf-8",
+    )
+    state = {
+        "stages": {
+            "asr_x_selection": {
+                "status": "complete",
+                "attempt": 1,
+                "command_sha256": "old",
+                "output_evidence": bakeoff.output_evidence([report_path]),
+            }
+        }
+    }
+    return report_path, state
+
+
+def test_reopen_supersedes_v1_whisper_eos_ineligible_report(tmp_path):
+    report_path, state = _stale_whisper_report(tmp_path)
+    state_path = tmp_path / "state.json"
+
+    assert bakeoff.reopen_stale_generation_contract_stage(
+        stage="asr_x_selection",
+        task="asr",
+        report_path=report_path,
+        state=state,
+        state_path=state_path,
+    )
+
+    stage = state["stages"]["asr_x_selection"]
+    assert stage["status"] == bakeoff.SUPERSEDED_GENERATION_CONTRACT_STATUS
+    assert not report_path.exists()
+    archive = tmp_path / "selection.generation-contract-v1.json"
+    assert archive.is_file()
+    assert stage["attempt_history"][-1]["archived_report"] == str(archive.resolve())
+    assert json.loads(state_path.read_text(encoding="utf-8")) == state
+
+
+@pytest.mark.parametrize(
+    "task,version,failure",
+    [
+        ("mt", None, None),
+        ("asr", 2, None),
+        ("asr", None, "ASR benchmark source abc produced tokens after EOS"),
+    ],
+)
+def test_reopen_keeps_authoritative_ineligible_reports(tmp_path, task, version, failure):
+    report_path, state = _stale_whisper_report(tmp_path, version=version, failure=failure)
+
+    assert not bakeoff.reopen_stale_generation_contract_stage(
+        stage="asr_x_selection",
+        task=task,
+        report_path=report_path,
+        state=state,
+        state_path=tmp_path / "state.json",
+    )
+    assert state["stages"]["asr_x_selection"]["status"] == "complete"
+    assert report_path.is_file()
+
+
+def test_reopen_refuses_tampered_v1_report(tmp_path):
+    report_path, state = _stale_whisper_report(tmp_path)
+    report_path.write_text(report_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="output evidence changed"):
+        bakeoff.reopen_stale_generation_contract_stage(
+            stage="asr_x_selection",
+            task="asr",
+            report_path=report_path,
+            state=state,
+            state_path=tmp_path / "state.json",
+        )
+    assert report_path.is_file()

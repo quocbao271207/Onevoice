@@ -22,7 +22,7 @@ from typing import Optional, Dict
 from dataclasses import dataclass
 
 from .audio_frontend import validate_audio_input
-from .generation_guard import require_completed_generation
+from .generation_guard import require_completed_whisper_batch
 
 logger = logging.getLogger(__name__)
 
@@ -407,11 +407,16 @@ class ASREngine:
             outputs = model.generate(input_features, **generate_kwargs)
 
         # Step 5: Decode tokens to text
-        require_completed_generation(
-            outputs.sequences[0],
+        require_completed_whisper_batch(
+            outputs.sequences[:1],
             processor.tokenizer.eos_token_id,
             pad_token_id=processor.tokenizer.pad_token_id,
-            context="ASR generation",
+            generation_steps=len(outputs.scores) if getattr(outputs, "scores", None) else None,
+            max_new_tokens=self.max_new_tokens,
+            max_target_positions=getattr(
+                getattr(model, "config", None), "max_target_positions", None
+            ),
+            contexts=["ASR generation"],
         )
         transcription = processor.batch_decode(
             outputs.sequences, skip_special_tokens=True

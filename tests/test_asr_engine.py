@@ -109,6 +109,33 @@ def test_asr_accepts_completed_generation_without_logging_transcript(
         )
 
 
+def test_asr_accepts_whisper_sequence_whose_eos_was_stripped_by_generate():
+    class StrippedWhisperModel(FakeModel):
+        config = SimpleNamespace(max_target_positions=448)
+
+        def generate(self, *_args, **_kwargs):
+            # pad == EOS in Whisper; generate() strips it from the longest row.
+            return SimpleNamespace(
+                sequences=self.sequence,
+                scores=[torch.zeros((1, 4), dtype=torch.float32)] * 2,
+            )
+
+        def compute_transition_scores(self, *_args, **_kwargs):
+            return torch.zeros((1, 2), dtype=torch.float32)
+
+    engine, processor = loaded_engine([2, 10, 11])
+    engine.models = {"vi": StrippedWhisperModel([2, 10, 11])}
+
+    result = engine.transcribe(
+        np.zeros(1600, dtype=np.float32),
+        language="vi",
+        sample_rate=16000,
+    )
+
+    assert processor.decode_calls == 1
+    assert result.text == "Dùng aspirin."
+
+
 def test_asr_rejects_nonfinite_confidence_proxy():
     class NonfiniteConfidenceModel(FakeModel):
         def generate(self, *_args, **_kwargs):

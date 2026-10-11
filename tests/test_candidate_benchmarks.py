@@ -270,6 +270,75 @@ def test_asr_benchmark_rejects_generation_without_eos():
         )
 
 
+# Real PhoWhisper-small output on transformers 4.46.3: pad == EOS == 50257 and
+# generate() strips trailing pads, so the longest row loses its genuine EOS.
+WHISPER_EOS = 50257
+WHISPER_STRIPPED_BATCH = torch.tensor(
+    [
+        [50258, 50278, 50359, 50363, 128, 2431, 13901, 13, WHISPER_EOS, WHISPER_EOS],
+        [50258, 50278, 50359, 50363, 74, 392, 24280, 3684, 24322, 13],
+    ]
+)
+
+
+def test_asr_benchmark_accepts_whisper_rows_when_loop_ended_before_cap():
+    validate_asr_batch_generation_completed(
+        WHISPER_STRIPPED_BATCH,
+        [{"id": "short"}, {"id": "longest-eos-stripped"}],
+        eos_token_id=WHISPER_EOS,
+        pad_token_id=WHISPER_EOS,
+        generation_steps=7,
+        max_new_tokens=225,
+        max_target_positions=448,
+    )
+
+
+def test_asr_benchmark_rejects_whisper_batch_that_reached_length_cap():
+    with pytest.raises(RuntimeError, match="longest-eos-stripped.*did not produce EOS"):
+        validate_asr_batch_generation_completed(
+            WHISPER_STRIPPED_BATCH,
+            [{"id": "short"}, {"id": "longest-eos-stripped"}],
+            eos_token_id=WHISPER_EOS,
+            pad_token_id=WHISPER_EOS,
+            generation_steps=225,
+            max_new_tokens=225,
+            max_target_positions=448,
+        )
+
+
+def test_asr_benchmark_rejects_whisper_batch_at_decoder_position_limit():
+    with pytest.raises(RuntimeError, match="did not produce EOS"):
+        validate_asr_batch_generation_completed(
+            WHISPER_STRIPPED_BATCH,
+            [{"id": "short"}, {"id": "longest-eos-stripped"}],
+            eos_token_id=WHISPER_EOS,
+            pad_token_id=WHISPER_EOS,
+            generation_steps=6,
+            max_new_tokens=225,
+            max_target_positions=10,
+        )
+
+
+def test_asr_benchmark_without_step_evidence_stays_token_strict():
+    with pytest.raises(RuntimeError, match="did not produce EOS"):
+        validate_asr_batch_generation_completed(
+            WHISPER_STRIPPED_BATCH,
+            [{"id": "short"}, {"id": "longest-eos-stripped"}],
+            eos_token_id=WHISPER_EOS,
+            pad_token_id=WHISPER_EOS,
+        )
+
+
+def test_generation_step_counter_counts_without_stopping():
+    from src.pipeline.generation_guard import GenerationStepCounter
+
+    counter = GenerationStepCounter()
+    ids = torch.zeros((3, 4), dtype=torch.long)
+    for _ in range(5):
+        assert not counter(ids, None).any()
+    assert counter.steps == 5
+
+
 def test_source_balanced_sample_can_take_full_manifest():
     rows = [
         {"id": "a", "source": "one"},
@@ -692,6 +761,7 @@ def test_canonical_selection_records_generation_contract_failure_as_ineligible(
         "generation_complete": False,
         "failure_type": "generation_contract",
         "failure": "pair did not produce EOS",
+        "generation_contract_version": 2,
     }
     assert report["predictions"] is None
     assert report["prediction_provenance"] is None

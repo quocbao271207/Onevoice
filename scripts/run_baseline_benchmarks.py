@@ -36,8 +36,11 @@ from src.pipeline.durable_file import write_durable_bytes  # noqa: E402
 from src.pipeline.durable_json import write_durable_json  # noqa: E402
 from src.pipeline.evidence_paths import is_link_or_junction  # noqa: E402
 from src.pipeline.generation_guard import (  # noqa: E402
+    GENERATION_CONTRACT_VERSION,
     GenerationContractError,
+    GenerationStepCounter,
     require_completed_generation,
+    require_completed_whisper_batch,
 )
 from src.pipeline.stable_json import read_stable_json_mapping  # noqa: E402
 from src.pipeline.stable_jsonl import read_stable_jsonl_mappings  # noqa: E402
@@ -166,17 +169,29 @@ def validate_asr_batch_generation_completed(
     *,
     eos_token_id: Any,
     pad_token_id: Any = None,
+    generation_steps: int | None = None,
+    max_new_tokens: int = DEFAULT_ASR_MAX_NEW_TOKENS,
+    max_target_positions: int | None = None,
 ) -> None:
-    """Reject an ASR batch if any transcript stopped before generated EOS."""
+    """Reject an ASR batch if any transcript stopped before generated EOS.
+
+    Whisper strips its pad token (which equals EOS) from returned rows, so
+    completion is proven from the decoding step count; see
+    ``require_completed_whisper_batch``.
+    """
     if len(generated) != len(rows):
         raise RuntimeError("ASR generated batch size does not match source rows")
-    for row, generated_tokens in zip(rows, generated):
-        require_completed_generation(
-            generated_tokens,
-            eos_token_id,
-            pad_token_id=pad_token_id,
-            context=f"ASR benchmark source {row.get('id', '<missing-id>')}",
-        )
+    require_completed_whisper_batch(
+        generated,
+        eos_token_id,
+        pad_token_id=pad_token_id,
+        generation_steps=generation_steps,
+        max_new_tokens=max_new_tokens,
+        max_target_positions=max_target_positions,
+        contexts=[
+            f"ASR benchmark source {row.get('id', '<missing-id>')}" for row in rows
+        ],
+    )
 
 
 def validate_mt_batch_generation_completed(
@@ -251,6 +266,7 @@ def generation_contract_failure_report(
             "generation_complete": False,
             "failure_type": "generation_contract",
             "failure": str(failure),
+            "generation_contract_version": GENERATION_CONTRACT_VERSION,
         },
     }
 
@@ -699,8 +715,12 @@ def run_asr(
             }
             if prompt_ids is not None:
                 generation_kwargs["prompt_ids"] = prompt_ids
+            from transformers import StoppingCriteriaList
+
+            step_counter = GenerationStepCounter()
             generated = model.generate(
                 prepare_asr_input_features(features.input_features, model, device),
+                stopping_criteria=StoppingCriteriaList([step_counter]),
                 **generation_kwargs,
             )
             validate_asr_batch_generation_completed(
@@ -708,6 +728,9 @@ def run_asr(
                 chunk,
                 eos_token_id=processor.tokenizer.eos_token_id,
                 pad_token_id=processor.tokenizer.pad_token_id,
+                generation_steps=step_counter.steps,
+                max_new_tokens=DEFAULT_ASR_MAX_NEW_TOKENS,
+                max_target_positions=getattr(model.config, "max_target_positions", None),
             )
             hypotheses = processor.tokenizer.batch_decode(generated, skip_special_tokens=True)
             for row, hypothesis in zip(chunk, hypotheses):
@@ -731,6 +754,7 @@ def run_asr(
         "prompt": args.asr_prompt,
         "generation_seconds": round(generation_seconds, 3),
         "samples_per_second": round(len(predictions) / generation_seconds, 6),
+        "generation_contract_version": GENERATION_CONTRACT_VERSION,
     }
     if prediction_path is not None:
         write_prediction_checkpoint(

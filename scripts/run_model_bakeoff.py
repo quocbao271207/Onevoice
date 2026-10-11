@@ -2391,6 +2391,91 @@ def multi_metric_stronger(
     return improvement
 
 
+STALE_WHISPER_EOS_FAILURE_SUFFIX = (
+    "did not produce EOS; refusing potentially truncated output"
+)
+SUPERSEDED_GENERATION_CONTRACT_STATUS = "superseded_generation_contract_v1"
+
+
+def reopen_stale_generation_contract_stage(
+    *,
+    stage: str,
+    task: str,
+    report_path: Path,
+    state: dict[str, Any],
+    state_path: Path,
+) -> bool:
+    """Reopen an ASR selection invalidated only by the v1 Whisper EOS check.
+
+    Generation contract v1 checked returned tokens for EOS, but Whisper's
+    ``generate()`` strips trailing pad tokens and Whisper uses pad == EOS, so
+    every batch's longest row was rejected regardless of completion. Only
+    reports that (a) are complete stages, (b) are ``ineligible_generation_contract``
+    with no recorded contract version, and (c) failed with the EOS message
+    are reopened. The original report is archived next to the new one and the
+    supersession is recorded in ``attempt_history``; v2+ ineligible reports
+    remain authoritative.
+    """
+    if task != "asr":
+        return False
+    previous = state.get("stages", {}).get(stage)
+    if not isinstance(previous, dict) or previous.get("status") != "complete":
+        return False
+    if not report_path.is_file() or report_path.is_symlink():
+        return False
+    report = read_json_mapping(
+        report_path,
+        maximum_bytes=MAX_BAKEOFF_REPORT_BYTES,
+        label=f"{stage} selection report",
+    )
+    decoding = report.get("decoding")
+    if (
+        report.get("status") != "ineligible_generation_contract"
+        or not isinstance(decoding, dict)
+        or decoding.get("failure_type") != "generation_contract"
+        or "generation_contract_version" in decoding
+        or not str(decoding.get("failure", "")).endswith(
+            STALE_WHISPER_EOS_FAILURE_SUFFIX
+        )
+    ):
+        return False
+    current_evidence = output_evidence([report_path])
+    recorded_evidence = previous.get("output_evidence")
+    if recorded_evidence is not None and recorded_evidence != current_evidence:
+        raise ValueError(f"Cannot reopen {stage}: output evidence changed")
+    archive = report_path.with_name(
+        f"{report_path.stem}.generation-contract-v1{report_path.suffix}"
+    )
+    if archive.exists() or archive.is_symlink():
+        raise ValueError(f"Cannot reopen {stage}: archive already exists: {archive}")
+    os.replace(report_path, archive)
+    history = previous.get("attempt_history", [])
+    if not isinstance(history, list):
+        raise ValueError(f"Stage {stage} has invalid attempt history")
+    previous["attempt_history"] = [
+        *history,
+        {
+            "attempt": previous.get("attempt", 1),
+            "status": SUPERSEDED_GENERATION_CONTRACT_STATUS,
+            "return_code": previous.get("return_code"),
+            "started_at": previous.get("started_at"),
+            "completed_at": previous.get("completed_at"),
+            "command_sha256": previous.get("command_sha256"),
+            "log": previous.get("log"),
+            "superseded_at": utc_now(),
+            "superseded_reason": (
+                "Whisper generate() strips pad==EOS; v1 token-only EOS check "
+                "rejected completed generations"
+            ),
+            "archived_report": str(archive.resolve()),
+            "archived_report_evidence": current_evidence,
+        },
+    ]
+    previous["status"] = SUPERSEDED_GENERATION_CONTRACT_STATUS
+    atomic_json(state_path, state)
+    return True
+
+
 def run_stage(
     name: str,
     command: list[str],
@@ -2876,6 +2961,13 @@ def benchmark_unit(
         direction,
     )
     stage = f"{task}_{unit['unit_id']}_{label}_selection"
+    reopen_stale_generation_contract_stage(
+        stage=stage,
+        task=task,
+        report_path=report_path,
+        state=state,
+        state_path=state_path,
+    )
     run_stage(
         stage,
         command,
