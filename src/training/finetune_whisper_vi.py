@@ -125,6 +125,22 @@ def augment_waveform(audio: np.ndarray, rng: np.random.Generator, config: ASRTra
     return np.clip(value, -1.0, 1.0).astype(np.float32)
 
 
+def strip_decoder_start_token(label_ids: Any, decoder_start_token_id: int | None) -> Any:
+    """Drop a leading <|startoftranscript|> that the model would prepend again.
+
+    The Whisper tokenizer prefixes ``decoder_start_token_id`` to every label and
+    ``WhisperForConditionalGeneration`` shift-rights labels by prepending it
+    once more. Whisper's ``bos_token_id`` is ``<|endoftext|>`` (50257), so the
+    previous bos-based check never matched and training saw a duplicated SOT,
+    misaligned with the ``[SOT, lang, task, notimestamps]`` inference prompt.
+    """
+    if decoder_start_token_id is None or label_ids.shape[-1] == 0:
+        return label_ids
+    if (label_ids[:, 0] == int(decoder_start_token_id)).all().cpu().item():
+        return label_ids[:, 1:]
+    return label_ids
+
+
 def load_manifest(path: str | Path) -> list[dict[str, Any]]:
     file_path = Path(path)
     if not file_path.exists():
@@ -337,9 +353,9 @@ def train(config: ASRTrainingConfig) -> None:
                 return_tensors="pt",
             )
             label_ids = label_batch["input_ids"].masked_fill(label_batch.attention_mask.ne(1), -100)
-            if (label_ids[:, 0] == processor.tokenizer.bos_token_id).all().cpu().item():
-                label_ids = label_ids[:, 1:]
-            batch["labels"] = label_ids
+            batch["labels"] = strip_decoder_start_token(
+                label_ids, model.config.decoder_start_token_id
+            )
             return batch
 
     wer_metric = evaluate.load("wer")

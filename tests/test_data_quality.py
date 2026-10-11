@@ -1301,3 +1301,16 @@ def test_asr_augmentation_is_deterministic_finite_and_nonempty():
     assert np.max(np.abs(first)) <= 1.0
     assert np.array_equal(first, second)
     assert not np.array_equal(first[: min(len(first), len(audio))], audio[: min(len(first), len(audio))])
+
+
+def test_whisper_labels_strip_decoder_start_not_bos():
+    import torch
+
+    from src.training.finetune_whisper_vi import strip_decoder_start_token
+
+    # Real PhoWhisper tokenizer output: SOT=50258, bos=eos=pad=50257.
+    labels = torch.tensor([[50258, 50278, 50359, 50363, 87, 259, 50257]])
+    stripped = strip_decoder_start_token(labels, 50258)
+    assert stripped.tolist() == [[50278, 50359, 50363, 87, 259, 50257]]
+    assert strip_decoder_start_token(stripped, 50258).tolist() == stripped.tolist()
+    assert strip_decoder_start_token(labels, None).tolist() == labels.tolist()
