@@ -2815,3 +2815,58 @@ def test_reopen_refuses_tampered_v1_report(tmp_path):
             state_path=tmp_path / "state.json",
         )
     assert report_path.is_file()
+
+
+def _training_commands(tmp_path):
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    base = [
+        "/runner/scripts/run_gpu_rounds.py",
+        "--task",
+        "mt",
+        "--config",
+        "/cfg.yaml",
+        "--output-root",
+        "/out",
+    ]
+    previous = [str(tmp_path) + "/./python", *base, "--round-name", "pilot",
+                "--resume-from-checkpoint", "/out/checkpoint-100"]
+    current = [str(python), *base]
+    return previous, current
+
+
+def test_completed_training_recovery_accepts_interpreter_alias(tmp_path):
+    previous, current = _training_commands(tmp_path)
+    assert previous[0] != current[0]
+
+    assert bakeoff.completed_training_resume_command_compatible(previous, current)
+
+
+def test_completed_training_recovery_rejects_different_interpreter(tmp_path):
+    previous, current = _training_commands(tmp_path)
+    other = tmp_path / "other-python"
+    other.write_text("", encoding="utf-8")
+    current[0] = str(other)
+
+    assert not bakeoff.completed_training_resume_command_compatible(previous, current)
+
+
+def test_resume_audit_models_completed_training_recovery_suffix(tmp_path):
+    previous, current = _training_commands(tmp_path)
+    output = tmp_path / "out.txt"
+    output.write_text("adapter", encoding="utf-8")
+    state = {
+        "stages": {
+            "mt_x_pilot_r32_train": {
+                "status": "complete",
+                "command": previous,
+                "command_sha256": bakeoff.command_digest(previous),
+                "output_evidence": bakeoff.output_evidence([output]),
+            }
+        }
+    }
+
+    audit = bakeoff.audit_completed_stage_resume(state, current[0])
+
+    assert audit["status"] == "pass", audit["failures"]
+    assert audit["stages"][0]["command_compatibility"] == "completed_training_recovery"

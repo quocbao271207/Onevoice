@@ -505,7 +505,10 @@ def completed_training_resume_command_compatible(
         return False
     if not suffix[1] or not suffix[3]:
         return False
-    return previous_command[:-4] == current_command
+    base = previous_command[:-4]
+    if base == current_command:
+        return True
+    return interpreter_alias_only_command_change(base, current_command)
 
 
 def resolved_command_executable(command_token: str) -> Path | None:
@@ -676,6 +679,17 @@ def audit_completed_stage_resume(
                         )
                     else:
                         current_command[runner_index] = LOADED_RUNNER_SHA256
+            is_training = any(
+                Path(item).name == "run_gpu_rounds.py" for item in current_command
+            )
+            if (
+                is_training
+                and len(current_command) > 4
+                and current_command[-4] == "--round-name"
+                and current_command[-2] == "--resume-from-checkpoint"
+            ):
+                # train_unit rebuilds a completed stage without its recovery suffix.
+                current_command = current_command[:-4]
             if not stage_failures:
                 if stored_command == current_command:
                     compatibility = "exact"
@@ -689,6 +703,11 @@ def audit_completed_stage_resume(
                     current_command,
                 ):
                     compatibility = "runner_generation"
+                elif completed_training_resume_command_compatible(
+                    stored_command,
+                    current_command,
+                ):
+                    compatibility = "completed_training_recovery"
                 else:
                     stage_failures.append(
                         "current execution identity is not resume-compatible"
